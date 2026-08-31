@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img">
+  <title>IPbind</title>
+  <desc>Node hub: a central interface linked to four network nodes.</desc>
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="#223142"/>
+  <g stroke="#5ec7c0" stroke-width="15" stroke-linecap="round">
+    <line x1="256" y1="256" x2="256" y2="106"/>
+    <line x1="256" y1="256" x2="406" y2="256"/>
+    <line x1="256" y1="256" x2="256" y2="406"/>
+    <line x1="256" y1="256" x2="106" y2="256"/>
+  </g>
+  <g fill="#5ec7c0">
+    <circle cx="256" cy="106" r="32"/>
+    <circle cx="406" cy="256" r="32"/>
+    <circle cx="256" cy="406" r="32"/>
+    <circle cx="106" cy="256" r="32"/>
+  </g>
+  <circle cx="256" cy="256" r="54" fill="#ffffff"/>
+</svg>
