@@ -10,19 +10,8 @@ One-click static IP binder for air-gapped equipment. A compiled .NET WinForms to
 
 Current version: **2.2.102**.
 
-## Build locally
+## Download
 
-Any Windows 10/11 box with .NET Framework (it is already installed). No Visual
-Studio, SDK, or internet required.
+[**Download IPbind.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
-```
-
-The build stamps `$Version` from `Build-Exe.ps1` into `Version.cs` (generated,
-not committed) and produces `IPbind.exe` in this folder.
-
-## CI
-
-Every push, pull request, and manual `workflow_dispatch` builds `IPbind.exe` on
-a Windows runner and uploads it as an Actions artifact named `IPbind`.
+GitHub Actions rebuilds this download on every push to `main`.
