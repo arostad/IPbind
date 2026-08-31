@@ -1,9 +1,12 @@
 # IPbind
 
-One-click static IP binder for air-gapped equipment. A compiled .NET WinForms
-tool that binds a set of static IPv4 addresses (no gateway, no DNS) onto one
-chosen LAN interface so you can reach gear that lives on different `/24`
-subnets, then revert that interface to DHCP with one click.
+<img src="icons/png/IPbind-256.png" width="180" align="left" alt="IPbind">
+
+<br><br>
+
+One-click static IP binder for air-gapped equipment. A compiled .NET WinForms tool that binds a set of static IPv4 addresses (no gateway, no DNS) onto one chosen LAN interface so you can reach gear that lives on different `/24` subnets, then revert that interface to DHCP with one click.
+
+<br clear="all">
 
 Current version: **2.2.102**.
 
