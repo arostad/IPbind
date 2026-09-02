@@ -1,5 +1,5 @@
 // IPbind - Static IP Binder for accessing air-gapped industrial automation systems
-// Author: Andy Rostad <andrew.rostad@bnsf.com>
+// Author: Andy Rostad
 //
 // A genuine compiled .NET WinForms application (no ps2exe / no embedded PowerShell).
 // Binds multiple static IPv4 addresses (no gateway/DNS) to a chosen LAN interface for
@@ -24,7 +24,7 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Binds multiple static IPv4 addresses to a LAN interface (no gateway/DNS) so air-gapped automation equipment on different IP ranges is reachable, with one-click DHCP revert. Local network configuration only - makes no network or internet calls.")]
 [assembly: AssemblyProduct("IPbind")]
 [assembly: AssemblyCompany("Andy Rostad")]
-[assembly: AssemblyCopyright("Andy Rostad - andrew.rostad@bnsf.com")]
+[assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
 // AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion and the
 // BuildInfo.Version string are generated fresh on every compile into Version.cs.
 
@@ -51,8 +51,6 @@ namespace IPbind
     class MainForm : Form
     {
         static readonly string AppVersion = BuildInfo.Version;
-        const string AuthorLine = "Andy Rostad - andrew.rostad@bnsf.com";
-        const string Email = "andrew.rostad@bnsf.com";
 
         static readonly string[] DefaultIPs = new string[] {
             "10.255.255.98/24", "10.255.128.98/24", "192.168.0.98/24",
@@ -831,20 +829,24 @@ namespace IPbind
             Controls.Add(console);
 
             LinkLabel footer = new LinkLabel();
-            string footerText = "Created by " + AuthorLine;
+            const string director = "Andy Rostad";
+            const string source = "Source";
+            const string license = "Released under the MIT License";
+            string footerText = "App carefully directed by " + director + "  |  " + source + "  |  " + license;
             footer.Text = footerText;
             footer.Font = UiFont(8F, FontStyle.Regular);
             footer.AutoSize = false;
             footer.TextAlign = ContentAlignment.MiddleLeft;
-            footer.Location = P(20, 778);
-            footer.Size = Z(380, 20);
+            footer.Location = P(20, 772);
+            footer.Size = Z(460, 36);
             footer.ForeColor = Color.FromArgb(120, 120, 120);
             footer.LinkColor = Color.FromArgb(25, 90, 160);
-            int emailIdx = footerText.IndexOf(Email);
-            if (emailIdx >= 0) footer.LinkArea = new LinkArea(emailIdx, Email.Length);
-            footer.LinkClicked += delegate
+            footer.Links.Add(footerText.IndexOf(director), director.Length, "https://github.com/arostad");
+            footer.Links.Add(footerText.IndexOf(source), source.Length, "https://github.com/arostad/IPbind");
+            footer.Links.Add(footerText.IndexOf(license), license.Length, "https://github.com/arostad/IPbind/blob/main/LICENSE");
+            footer.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
             {
-                try { Process.Start("mailto:" + Email); } catch { }
+                try { Process.Start((string)e.Link.LinkData); } catch { }
             };
             Controls.Add(footer);
 
@@ -853,8 +855,8 @@ namespace IPbind
             lblVersion.Font = UiFont(8F, FontStyle.Regular);
             lblVersion.AutoSize = false;
             lblVersion.TextAlign = ContentAlignment.MiddleRight;
-            lblVersion.Location = P(408, 778);
-            lblVersion.Size = Z(160, 20);
+            lblVersion.Location = P(488, 778);
+            lblVersion.Size = Z(80, 20);
             lblVersion.ForeColor = Color.FromArgb(120, 120, 120);
             Controls.Add(lblVersion);
 
