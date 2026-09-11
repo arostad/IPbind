@@ -21,11 +21,26 @@ jobs:
           Remove-Item -ErrorAction SilentlyContinue .\IPbind.exe
           powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
 
-      - name: Upload IPbind.exe
+      - name: Write release metadata
+        shell: pwsh
+        run: |
+          $script = Get-Content -Raw .\Build-Exe.ps1
+          $versionMatch = [regex]::Match($script, "(?m)^\`$Version\s*=\s*'([^']+)'")
+          if (-not $versionMatch.Success) {
+            throw 'Could not read $Version from Build-Exe.ps1.'
+          }
+          Set-Content -Path .\version.txt -Value $versionMatch.Groups[1].Value -NoNewline
+          $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
+
+      - name: Upload release files
         uses: actions/upload-artifact@v4
         with:
           name: IPbind
-          path: IPbind.exe
+          path: |
+            IPbind.exe
+            IPbind.exe.sha256
+            version.txt
           if-no-files-found: error
 
   release:
@@ -49,5 +64,8 @@ jobs:
           body: |
             Windows build of IPbind.
             This file is replaced on every push to main.
-          files: release/IPbind.exe
+          files: |
+            release/IPbind.exe
+            release/IPbind.exe.sha256
+            release/version.txt
           make_latest: true

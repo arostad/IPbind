@@ -1,10 +1,9 @@
 // IPbind - Static IP Binder for accessing air-gapped industrial automation systems
-// Author: Andy Rostad <andrew.rostad@bnsf.com>
-//
 // A genuine compiled .NET WinForms application (no ps2exe / no embedded PowerShell).
 // Binds multiple static IPv4 addresses (no gateway/DNS) to a chosen LAN interface for
 // reaching air-gapped equipment web GUIs across different IP ranges, with one-click
-// DHCP revert. Local network configuration only - makes no network or internet calls.
+// DHCP revert. Local network configuration is the app's purpose; update checks are the
+// only intentional outbound internet traffic.
 //
 // DPI handling: the layout is scaled explicitly in code from the real device DPI read
 // at startup, so it renders correctly at any Windows scaling (100/125/150/175%) without
@@ -15,16 +14,22 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Static IP Binder for accessing air-gapped automation equipment spread across multiple IP ranges")]
-[assembly: AssemblyDescription("Binds multiple static IPv4 addresses to a LAN interface (no gateway/DNS) so air-gapped automation equipment on different IP ranges is reachable, with one-click DHCP revert. Local network configuration only - makes no network or internet calls.")]
+[assembly: AssemblyDescription("Binds multiple static IPv4 addresses to a LAN interface (no gateway/DNS) so air-gapped automation equipment on different IP ranges is reachable, with one-click DHCP revert.")]
 [assembly: AssemblyProduct("IPbind")]
 [assembly: AssemblyCompany("Andy Rostad")]
-[assembly: AssemblyCopyright("Andy Rostad - andrew.rostad@bnsf.com")]
+[assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
 // AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion and the
 // BuildInfo.Version string are generated fresh on every compile into Version.cs.
 
@@ -48,11 +53,594 @@ namespace IPbind
         public string Status;
     }
 
+    sealed class UpdateInfo
+    {
+        public string RemoteVersion;
+        public bool IsNewer;
+        public string Error;
+    }
+
+    static class UpdateChecker
+    {
+        const string WorkerVersionUrl =
+            "https://ipbind-update-pings.andy-s-account-376.workers.dev/version.txt";
+        const string VersionUrl =
+            "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
+        const string ExeUrl =
+            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe";
+        const string ChecksumUrl =
+            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe.sha256";
+        const string ExeFileName = "IPbind.exe";
+        const long MinExeBytes = 20L * 1024L;
+        const long MaxExeBytes = 500L * 1024L * 1024L;
+        const int MaxRedirects = 5;
+
+        static readonly HashSet<string> TrustedDownloadHosts =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "ipbind-update-pings.andy-s-account-376.workers.dev",
+                "github.com",
+                "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com"
+            };
+
+        static readonly HttpClient Http = CreateClient();
+        static readonly Regex ChecksumPattern = new Regex(
+            @"\A(?<hash>[0-9a-fA-F]{64})  IPbind\.exe[ \t]*(?:\r?\n)?\z",
+            RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        static HttpClient CreateClient()
+        {
+            HttpClient client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+            client.Timeout = TimeSpan.FromMinutes(15);
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("IPbind");
+            client.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue
+            {
+                NoCache = true,
+                NoStore = true
+            };
+            client.DefaultRequestHeaders.Pragma.ParseAdd("no-cache");
+            return client;
+        }
+
+        static string FreshUrl(string url)
+        {
+            string separator = url.IndexOf('?') >= 0 ? "&" : "?";
+            long unixMilliseconds =
+                (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+            return url + separator + "t=" + unixMilliseconds;
+        }
+
+        static HttpResponseMessage GetTrusted(string url)
+        {
+            Uri current = new Uri(FreshUrl(url), UriKind.Absolute);
+            for (int redirect = 0; ; redirect++)
+            {
+                EnsureTrustedUri(current);
+                HttpResponseMessage response = Http.GetAsync(
+                    current, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+                if (!IsRedirect(response.StatusCode)) return response;
+
+                if (redirect >= MaxRedirects)
+                {
+                    response.Dispose();
+                    throw new HttpRequestException("The download used too many redirects.");
+                }
+
+                Uri location = response.Headers.Location;
+                response.Dispose();
+                if (location == null)
+                    throw new HttpRequestException("The download redirect had no destination.");
+                current = location.IsAbsoluteUri ? location : new Uri(current, location);
+            }
+        }
+
+        static void EnsureTrustedUri(Uri uri)
+        {
+            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                || !TrustedDownloadHosts.Contains(uri.IdnHost)
+                || !string.IsNullOrEmpty(uri.UserInfo))
+            {
+                throw new HttpRequestException(
+                    "The download was redirected to an untrusted location.");
+            }
+        }
+
+        static bool IsRedirect(HttpStatusCode status)
+        {
+            int code = (int)status;
+            return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+        }
+
+        static string ReadChecksum()
+        {
+            using (HttpResponseMessage response = GetTrusted(ChecksumUrl))
+            {
+                response.EnsureSuccessStatusCode();
+                using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                using (StreamReader reader = new StreamReader(
+                    input, Encoding.ASCII, false))
+                {
+                    char[] buffer = new char[1025];
+                    int count = reader.ReadBlock(buffer, 0, buffer.Length);
+                    if (count > 1024)
+                        throw new InvalidOperationException(
+                            "The update checksum was not readable.");
+
+                    Match match = ChecksumPattern.Match(new string(buffer, 0, count));
+                    if (!match.Success)
+                        throw new InvalidOperationException(
+                            "The update checksum was not readable.");
+                    return match.Groups["hash"].Value.ToUpperInvariant();
+                }
+            }
+        }
+
+        static void DownloadExe(string destination)
+        {
+            using (HttpResponseMessage response = GetTrusted(ExeUrl))
+            {
+                response.EnsureSuccessStatusCode();
+                long? contentLength = response.Content.Headers.ContentLength;
+                if (contentLength.HasValue && contentLength.Value > MaxExeBytes)
+                    throw new InvalidOperationException(
+                        "The update download was unexpectedly large.");
+
+                using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                using (FileStream output = new FileStream(
+                    destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    byte[] buffer = new byte[81920];
+                    long total = 0;
+                    int read;
+                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        total += read;
+                        if (total > MaxExeBytes)
+                            throw new InvalidOperationException(
+                                "The update download was unexpectedly large.");
+                        output.Write(buffer, 0, read);
+                    }
+                }
+            }
+        }
+
+        static string Sha256(string path)
+        {
+            using (Stream input = File.OpenRead(path))
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] bytes = sha.ComputeHash(input);
+                StringBuilder text = new StringBuilder(bytes.Length * 2);
+                foreach (byte b in bytes) text.Append(b.ToString("X2"));
+                return text.ToString();
+            }
+        }
+
+        static string LocalUpdateDirectory()
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "IPbind");
+        }
+
+        static bool LooksLikeSingleFileExtractPath(string path)
+        {
+            string full = Path.GetFullPath(path);
+            string temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (!full.StartsWith(
+                    temp + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(full, temp, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            return full.IndexOf(
+                Path.DirectorySeparatorChar + ".net" + Path.DirectorySeparatorChar,
+                StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static string ResolveInstalledExe()
+        {
+            string processPath = Application.ExecutablePath;
+            if (!string.IsNullOrEmpty(processPath) && !LooksLikeSingleFileExtractPath(processPath))
+                return Path.GetFullPath(processPath);
+
+            return Path.GetFullPath(Path.Combine(LocalUpdateDirectory(), ExeFileName));
+        }
+
+        static string ChooseStagingDirectory(string installDirectory)
+        {
+            string probe = Path.Combine(
+                installDirectory, ".IPbind-write-" + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                Directory.CreateDirectory(installDirectory);
+                using (new FileStream(
+                    probe, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+                File.Delete(probe);
+                return installDirectory;
+            }
+            catch
+            {
+                try { File.Delete(probe); } catch { }
+                string fallback = LocalUpdateDirectory();
+                Directory.CreateDirectory(fallback);
+                return fallback;
+            }
+        }
+
+        static string DownloadVerifiedExe(string installDirectory, out string expectedHash)
+        {
+            expectedHash = ReadChecksum();
+            string stagingDirectory = ChooseStagingDirectory(installDirectory);
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                string pending = Path.Combine(
+                    stagingDirectory, ExeFileName + "." + Guid.NewGuid().ToString("N") + ".new");
+                try
+                {
+                    DownloadExe(pending);
+                    long size = new FileInfo(pending).Length;
+                    if (size < MinExeBytes)
+                        throw new InvalidOperationException("Download failed.");
+                    if (string.Equals(
+                        Sha256(pending), expectedHash, StringComparison.OrdinalIgnoreCase))
+                        return pending;
+
+                    try { File.Delete(pending); } catch { }
+                    if (attempt == 1)
+                        throw new InvalidOperationException(
+                            "The downloaded update failed its integrity check.");
+                }
+                catch
+                {
+                    try { File.Delete(pending); } catch { }
+                    throw;
+                }
+            }
+
+            throw new InvalidOperationException(
+                "The downloaded update failed its integrity check.");
+        }
+
+        public static UpdateInfo Check()
+        {
+            string remoteText;
+            Version remote;
+            string error;
+            if (TryReadVersion(WorkerVersionUrl, out remoteText, out remote, out error)
+                || TryReadVersion(VersionUrl, out remoteText, out remote, out error))
+            {
+                Version current;
+                if (!Version.TryParse(BuildInfo.Version, out current))
+                    current = new Version(0, 0);
+                return new UpdateInfo
+                {
+                    RemoteVersion = remoteText,
+                    IsNewer = remote.CompareTo(current) > 0,
+                    Error = null
+                };
+            }
+
+            return new UpdateInfo
+            {
+                RemoteVersion = remoteText,
+                IsNewer = false,
+                Error = error
+            };
+        }
+
+        static bool TryReadVersion(
+            string url, out string remoteText, out Version remote, out string error)
+        {
+            remoteText = "";
+            remote = new Version(0, 0);
+            error = "";
+            try
+            {
+                using (HttpResponseMessage response = GetTrusted(url))
+                {
+                    response.EnsureSuccessStatusCode();
+                    string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    if (string.IsNullOrWhiteSpace(body))
+                    {
+                        error = "Could not read the latest version.";
+                        return false;
+                    }
+
+                    string[] lines = body.Trim().Split(new char[] { '\n', '\r' });
+                    remoteText = lines[0].Trim();
+                    Version parsed;
+                    if (!Version.TryParse(remoteText, out parsed))
+                    {
+                        error = "Latest version string was not readable.";
+                        return false;
+                    }
+
+                    remote = parsed;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        static string QuoteArgument(string value)
+        {
+            return "\"" + value.Replace("\"", "\\\"") + "\"";
+        }
+
+        public static void DownloadAndRestart()
+        {
+            string exe = ResolveInstalledExe();
+            string directory = Path.GetDirectoryName(exe);
+            if (string.IsNullOrEmpty(directory))
+                throw new InvalidOperationException("Could not resolve the install directory.");
+            Directory.CreateDirectory(directory);
+
+            string expectedHash;
+            string pending = DownloadVerifiedExe(directory, out expectedHash);
+            string errorFile = Path.Combine(directory, "update-error.txt");
+            string script = Path.Combine(
+                ChooseStagingDirectory(directory),
+                ".IPbind-update-" + Guid.NewGuid().ToString("N") + ".ps1");
+            string scriptText = @"
+$ErrorActionPreference = ""Stop""
+$pending = $env:IPBIND_UPDATE_PENDING
+$exe = $env:IPBIND_UPDATE_EXE
+$expectedHash = $env:IPBIND_UPDATE_SHA256
+$errorFile = $env:IPBIND_UPDATE_ERROR
+try {
+    $process = Get-Process -Id ([int]$env:IPBIND_UPDATE_PID) -ErrorAction SilentlyContinue
+    if ($process) { $process.WaitForExit() }
+    if ((Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw ""The downloaded update failed its integrity check.""
+    }
+    $length = (Get-Item -LiteralPath $pending).Length
+    if ($length -lt 20480 -or $length -gt 524288000) {
+        throw ""The downloaded update has an unexpected size.""
+    }
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        try {
+            Move-Item -LiteralPath $pending -Destination $exe -Force
+            break
+        } catch {
+            if ($attempt -eq 7) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not (Test-Path -LiteralPath $exe)) {
+        throw ""The updated executable is missing.""
+    }
+    Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+    Start-Process -FilePath $exe
+} catch {
+    ""Update failed: $($_.Exception.Message)"" | Set-Content -LiteralPath $errorFile
+    if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe }
+} finally {
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+";
+            using (FileStream stream = new FileStream(
+                script, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(true)))
+                writer.Write(scriptText);
+
+            ProcessStartInfo start = new ProcessStartInfo();
+            start.FileName = "powershell.exe";
+            start.Arguments =
+                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + QuoteArgument(script);
+            start.CreateNoWindow = true;
+            start.UseShellExecute = false;
+            start.EnvironmentVariables["IPBIND_UPDATE_PENDING"] = pending;
+            start.EnvironmentVariables["IPBIND_UPDATE_EXE"] = exe;
+            start.EnvironmentVariables["IPBIND_UPDATE_SHA256"] = expectedHash;
+            start.EnvironmentVariables["IPBIND_UPDATE_ERROR"] = errorFile;
+            start.EnvironmentVariables["IPBIND_UPDATE_PID"] =
+                Process.GetCurrentProcess().Id.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture);
+            try
+            {
+                if (Process.Start(start) == null)
+                    throw new InvalidOperationException("Could not start the update helper.");
+            }
+            catch
+            {
+                try { File.Delete(script); } catch { }
+                try { File.Delete(pending); } catch { }
+                throw;
+            }
+        }
+    }
+
+    sealed class AboutForm : Form
+    {
+        readonly Button checkButton;
+        readonly Label statusLabel;
+        UpdateInfo availableUpdate;
+
+        public AboutForm(Form owner, bool dark)
+        {
+            Text = "About IPbind";
+            Font = new Font("Segoe UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(430, 330);
+            try { Icon = owner.Icon; } catch { }
+
+            Label title = MakeLabel("IPbind", 18F, FontStyle.Bold, 24, 20, 382, 34);
+            Label version = MakeLabel(
+                "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
+            Label tagline = MakeLabel(
+                "One-click static IP binder for air-gapped equipment",
+                9F, FontStyle.Regular, 24, 88, 382, 36);
+
+            LinkLabel directed = MakeLink(
+                "App carefully directed by Andy Rostad",
+                "Andy Rostad", "https://github.com/arostad", 24, 136, 382, 22);
+            LinkLabel source = MakeLink(
+                "Source", "Source", "https://github.com/arostad/IPbind", 24, 166, 382, 22);
+            LinkLabel license = MakeLink(
+                "Released under the MIT License", "MIT License",
+                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 196, 382, 22);
+
+            checkButton = new Button();
+            checkButton.Text = "Check for updates";
+            checkButton.Location = new Point(140, 232);
+            checkButton.Size = new Size(150, 30);
+            checkButton.Click += CheckUpdates;
+
+            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 270, 382, 42);
+
+            Controls.Add(title);
+            Controls.Add(version);
+            Controls.Add(tagline);
+            Controls.Add(directed);
+            Controls.Add(source);
+            Controls.Add(license);
+            Controls.Add(checkButton);
+            Controls.Add(statusLabel);
+
+            if (dark)
+            {
+                BackColor = Color.FromArgb(32, 32, 32);
+                ForeColor = Color.FromArgb(230, 230, 230);
+                foreach (Control control in Controls)
+                {
+                    control.ForeColor = ForeColor;
+                    LinkLabel link = control as LinkLabel;
+                    if (link != null)
+                    {
+                        link.LinkColor = Color.FromArgb(90, 160, 240);
+                        link.ActiveLinkColor = Color.FromArgb(130, 185, 255);
+                    }
+                }
+                checkButton.FlatStyle = FlatStyle.Flat;
+                checkButton.BackColor = Color.FromArgb(50, 50, 50);
+                checkButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
+            }
+        }
+
+        static Label MakeLabel(
+            string text, float size, FontStyle style, int x, int y, int width, int height)
+        {
+            Label label = new Label();
+            label.Text = text;
+            label.Font = new Font("Segoe UI", size, style);
+            label.Location = new Point(x, y);
+            label.Size = new Size(width, height);
+            label.TextAlign = ContentAlignment.MiddleCenter;
+            return label;
+        }
+
+        static LinkLabel MakeLink(
+            string text, string linkedText, string url, int x, int y, int width, int height)
+        {
+            LinkLabel label = new LinkLabel();
+            label.Text = text;
+            label.Location = new Point(x, y);
+            label.Size = new Size(width, height);
+            label.TextAlign = ContentAlignment.MiddleCenter;
+            label.LinkColor = Color.FromArgb(25, 90, 160);
+            int start = text.IndexOf(linkedText, StringComparison.Ordinal);
+            label.LinkArea = new LinkArea(start, linkedText.Length);
+            label.Links[0].LinkData = url;
+            label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
+            {
+                try
+                {
+                    ProcessStartInfo info = new ProcessStartInfo((string)e.Link.LinkData);
+                    info.UseShellExecute = true;
+                    Process.Start(info);
+                }
+                catch { }
+            };
+            return label;
+        }
+
+        void CheckUpdates(object sender, EventArgs e)
+        {
+            checkButton.Enabled = false;
+            statusLabel.Text = "Checking...";
+            Thread thread = new Thread(delegate()
+            {
+                UpdateInfo info;
+                try { info = UpdateChecker.Check(); }
+                catch (Exception ex)
+                {
+                    info = new UpdateInfo { Error = ex.Message, IsNewer = false };
+                }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed) return;
+                        checkButton.Enabled = true;
+                        if (!info.IsNewer)
+                        {
+                            statusLabel.Text = string.IsNullOrEmpty(info.Error)
+                                ? "You're on the latest version (" + BuildInfo.Version + ")."
+                                : info.Error;
+                            return;
+                        }
+
+                        availableUpdate = info;
+                        statusLabel.Text =
+                            "Version " + info.RemoteVersion + " is available.";
+                        checkButton.Text = "Update now";
+                        checkButton.Click -= CheckUpdates;
+                        checkButton.Click += UpdateNow;
+                    });
+                }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        void UpdateNow(object sender, EventArgs e)
+        {
+            if (availableUpdate == null) return;
+            checkButton.Enabled = false;
+            statusLabel.Text = "Downloading. The app will restart when it is ready.";
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    UpdateChecker.DownloadAndRestart();
+                    try { BeginInvoke((MethodInvoker)delegate { Application.Exit(); }); }
+                    catch { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (IsDisposed) return;
+                            statusLabel.Text = ex.Message;
+                            checkButton.Enabled = true;
+                        });
+                    }
+                    catch { }
+                }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+    }
+
     class MainForm : Form
     {
         static readonly string AppVersion = BuildInfo.Version;
-        const string AuthorLine = "Andy Rostad - andrew.rostad@bnsf.com";
-        const string Email = "andrew.rostad@bnsf.com";
 
         static readonly string[] DefaultIPs = new string[] {
             "10.255.255.98/24", "10.255.128.98/24", "192.168.0.98/24",
@@ -830,23 +1418,14 @@ namespace IPbind
             console.ForeColor = Color.FromArgb(210, 210, 210);
             Controls.Add(console);
 
-            LinkLabel footer = new LinkLabel();
-            string footerText = "Created by " + AuthorLine;
-            footer.Text = footerText;
-            footer.Font = UiFont(8F, FontStyle.Regular);
-            footer.AutoSize = false;
-            footer.TextAlign = ContentAlignment.MiddleLeft;
-            footer.Location = P(20, 778);
-            footer.Size = Z(380, 20);
-            footer.ForeColor = Color.FromArgb(120, 120, 120);
-            footer.LinkColor = Color.FromArgb(25, 90, 160);
-            int emailIdx = footerText.IndexOf(Email);
-            if (emailIdx >= 0) footer.LinkArea = new LinkArea(emailIdx, Email.Length);
-            footer.LinkClicked += delegate
+            Button btnAbout = MakeButton("About", 20, 774, 96, 26);
+            btnAbout.Font = UiFont(8F, FontStyle.Regular);
+            btnAbout.Click += delegate
             {
-                try { Process.Start("mailto:" + Email); } catch { }
+                using (AboutForm about = new AboutForm(this, dark))
+                    about.ShowDialog(this);
             };
-            Controls.Add(footer);
+            Controls.Add(btnAbout);
 
             Label lblVersion = new Label();
             lblVersion.Text = "v" + AppVersion;
