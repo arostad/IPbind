@@ -666,7 +666,12 @@ try {
         TextBox console;
         Label lblStatus;
         Button btnBind, btnDhcp;
+        Panel updateBanner;
+        Label lblUpdateBanner;
+        Button btnUpdateNow, btnUpdateLater;
         bool dark;
+        bool launchUpdateCheckStarted;
+        bool updateDismissed;
         Color BgCol, PanelCol, FgCol, SubCol, BorderCol, InputCol;
         readonly List<Adapter> adapters = new List<Adapter>();
 
@@ -1113,6 +1118,76 @@ try {
             }
         }
 
+        void CheckForUpdatesOnLaunch()
+        {
+            if (launchUpdateCheckStarted) return;
+            launchUpdateCheckStarted = true;
+            Thread thread = new Thread(delegate()
+            {
+                UpdateInfo info;
+                try { info = UpdateChecker.Check(); }
+                catch { return; }
+                if (!info.IsNewer) return;
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed || updateDismissed) return;
+                        lblUpdateBanner.Text =
+                            "Version " + info.RemoteVersion + " is available.";
+                        console.Size = Z(548, 256);
+                        updateBanner.Visible = true;
+                        updateBanner.BringToFront();
+                    });
+                }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        void InstallUpdateFromBanner(object sender, EventArgs e)
+        {
+            btnUpdateNow.Enabled = false;
+            btnUpdateLater.Enabled = false;
+            btnUpdateNow.Text = "Updating...";
+            lblUpdateBanner.Text = "Downloading update; IPbind will restart.";
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    UpdateChecker.DownloadAndRestart();
+                    try { BeginInvoke((MethodInvoker)delegate { Application.Exit(); }); }
+                    catch { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (IsDisposed) return;
+                            lblUpdateBanner.Text = ex.Message;
+                            btnUpdateNow.Text = "Update";
+                            btnUpdateNow.Enabled = true;
+                            btnUpdateLater.Enabled = true;
+                        });
+                    }
+                    catch { }
+                }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        void DismissUpdateBanner(object sender, EventArgs e)
+        {
+            updateDismissed = true;
+            updateBanner.Visible = false;
+            console.Size = Z(548, 296);
+        }
+
         Button MakeButton(string text, int x, int y, int w, int h)
         {
             Button b = new Button();
@@ -1174,9 +1249,12 @@ try {
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            if (!dark) return;
-            try { SetPreferredAppMode(1); } catch { }   // AllowDark (best-effort, Win10 1903+)
-            DarkenScrollbars(this.Controls);
+            if (dark)
+            {
+                try { SetPreferredAppMode(1); } catch { }   // AllowDark (best-effort, Win10 1903+)
+                DarkenScrollbars(this.Controls);
+            }
+            CheckForUpdatesOnLaunch();
         }
 
         // Give scrollable controls dark scrollbars. WinForms paints scrollbars with the OS
@@ -1218,6 +1296,11 @@ try {
                 if (c == console) { /* already dark and readable - leave it */ }
                 else if (c == btnBind || c == btnDhcp) { /* accent buttons keep their color */ }
                 else if (c == lblStatus) { c.ForeColor = FgCol; } // live color set in SetBusy/EndBusy
+                else if (c is Panel)
+                {
+                    c.BackColor = PanelCol;
+                    c.ForeColor = FgCol;
+                }
                 else if (c is Button)
                 {
                     Button b = (Button)c;
@@ -1417,6 +1500,29 @@ try {
             console.BackColor = Color.FromArgb(18, 18, 18);
             console.ForeColor = Color.FromArgb(210, 210, 210);
             Controls.Add(console);
+
+            updateBanner = new Panel();
+            updateBanner.Location = P(20, 730);
+            updateBanner.Size = Z(548, 38);
+            updateBanner.BorderStyle = BorderStyle.FixedSingle;
+            updateBanner.BackColor = Color.FromArgb(245, 247, 250);
+            updateBanner.Visible = false;
+
+            lblUpdateBanner = new Label();
+            lblUpdateBanner.Location = P(8, 6);
+            lblUpdateBanner.Size = Z(326, 24);
+            lblUpdateBanner.TextAlign = ContentAlignment.MiddleLeft;
+            lblUpdateBanner.AutoEllipsis = true;
+            updateBanner.Controls.Add(lblUpdateBanner);
+
+            btnUpdateNow = MakeButton("Update", 340, 5, 96, 26);
+            btnUpdateNow.Click += InstallUpdateFromBanner;
+            updateBanner.Controls.Add(btnUpdateNow);
+
+            btnUpdateLater = MakeButton("Later", 442, 5, 96, 26);
+            btnUpdateLater.Click += DismissUpdateBanner;
+            updateBanner.Controls.Add(btnUpdateLater);
+            Controls.Add(updateBanner);
 
             Button btnAbout = MakeButton("About", 20, 774, 96, 26);
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
