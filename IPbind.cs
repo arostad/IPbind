@@ -669,9 +669,15 @@ try {
         Panel updateBanner;
         Label lblUpdateBanner;
         Button btnUpdateNow, btnUpdateLater;
+        Button btnAbout;
+        Label lblVersion;
         bool dark;
         bool launchUpdateCheckStarted;
         bool updateDismissed;
+        bool shown;
+        bool fittingWorkingArea;
+        int consoleHeightReduction;
+        Rectangle fittedWorkingArea = Rectangle.Empty;
         Color BgCol, PanelCol, FgCol, SubCol, BorderCol, InputCol;
         readonly List<Adapter> adapters = new List<Adapter>();
 
@@ -1136,8 +1142,8 @@ try {
                         if (IsDisposed || updateDismissed) return;
                         lblUpdateBanner.Text =
                             "Version " + info.RemoteVersion + " is available.";
-                        console.Size = Z(548, 256);
                         updateBanner.Visible = true;
+                        ApplyFlexibleLayout();
                         updateBanner.BringToFront();
                     });
                 }
@@ -1185,7 +1191,7 @@ try {
         {
             updateDismissed = true;
             updateBanner.Visible = false;
-            console.Size = Z(548, 296);
+            ApplyFlexibleLayout();
         }
 
         Button MakeButton(string text, int x, int y, int w, int h)
@@ -1249,12 +1255,93 @@ try {
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+            shown = true;
+            FitToWorkingArea(true);
             if (dark)
             {
                 try { SetPreferredAppMode(1); } catch { }   // AllowDark (best-effort, Win10 1903+)
                 DarkenScrollbars(this.Controls);
             }
             CheckForUpdatesOnLaunch();
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            if (!shown || fittingWorkingArea) return;
+
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            if (workingArea != fittedWorkingArea)
+                FitToWorkingArea(true);
+        }
+
+        // Keep the footer attached to the flexible console. The console gives up height
+        // first; all controls above it retain their designed size and position.
+        void ApplyFlexibleLayout()
+        {
+            int normalConsoleHeight = Math.Max(U(96), U(296) - consoleHeightReduction);
+            int displayedConsoleHeight =
+                Math.Max(U(56), normalConsoleHeight - (updateBanner.Visible ? U(40) : 0));
+            console.Size = new Size(U(548), displayedConsoleHeight);
+
+            updateBanner.Location =
+                new Point(U(20), console.Top + normalConsoleHeight - U(34));
+            btnAbout.Location = new Point(U(20), U(774) - consoleHeightReduction);
+            lblVersion.Location = new Point(U(408), U(778) - consoleHeightReduction);
+        }
+
+        void FitToWorkingArea(bool center)
+        {
+            if (fittingWorkingArea || !IsHandleCreated) return;
+            fittingWorkingArea = true;
+            try
+            {
+                Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+                fittedWorkingArea = workingArea;
+
+                // WorkingArea excludes the taskbar. Leave a small physical-pixel margin
+                // on every side so borders and taskbar auto-hide affordances remain clear.
+                int margin = Math.Max(8, U(8));
+                int maxOuterWidth = Math.Max(1, workingArea.Width - margin * 2);
+                int maxOuterHeight = Math.Max(1, workingArea.Height - margin * 2);
+                int chromeWidth = Math.Max(0, Width - ClientSize.Width);
+                int chromeHeight = Math.Max(0, Height - ClientSize.Height);
+                int maxClientWidth = Math.Max(1, maxOuterWidth - chromeWidth);
+                int maxClientHeight = Math.Max(1, maxOuterHeight - chromeHeight);
+
+                int designedWidth = U(588);
+                int designedHeight = U(810);
+                int compactHeight = designedHeight - U(200); // leaves a 96px console
+                consoleHeightReduction = Math.Min(
+                    U(200), Math.Max(0, designedHeight - maxClientHeight));
+                int contentHeight = designedHeight - consoleHeightReduction;
+
+                bool needsScrolling =
+                    maxClientWidth < designedWidth || maxClientHeight < compactHeight;
+                AutoScroll = needsScrolling;
+                AutoScrollMinSize = needsScrolling
+                    ? new Size(designedWidth, compactHeight)
+                    : Size.Empty;
+
+                MaximumSize = new Size(maxOuterWidth, maxOuterHeight);
+                ClientSize = new Size(
+                    Math.Min(designedWidth, maxClientWidth),
+                    Math.Min(contentHeight, maxClientHeight));
+                ApplyFlexibleLayout();
+
+                if (center)
+                {
+                    int x = workingArea.Left + (workingArea.Width - Width) / 2;
+                    int y = workingArea.Top + (workingArea.Height - Height) / 2;
+                    Location = new Point(
+                        Math.Max(workingArea.Left + margin, x),
+                        Math.Max(workingArea.Top + margin, y));
+                }
+            }
+            finally
+            {
+                fittingWorkingArea = false;
+            }
         }
 
         // Give scrollable controls dark scrollbars. WinForms paints scrollbars with the OS
@@ -1524,7 +1611,7 @@ try {
             updateBanner.Controls.Add(btnUpdateLater);
             Controls.Add(updateBanner);
 
-            Button btnAbout = MakeButton("About", 20, 774, 96, 26);
+            btnAbout = MakeButton("About", 20, 774, 96, 26);
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
@@ -1533,7 +1620,7 @@ try {
             };
             Controls.Add(btnAbout);
 
-            Label lblVersion = new Label();
+            lblVersion = new Label();
             lblVersion.Text = "v" + AppVersion;
             lblVersion.Font = UiFont(8F, FontStyle.Regular);
             lblVersion.AutoSize = false;
