@@ -22,7 +22,7 @@
 #>
 
 # ==============================================================
-$Version = '2.2.102'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.101'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -77,6 +77,7 @@ $cscArgs = @(
     '/r:System.dll'
     '/r:System.Core.dll'
     '/r:System.Drawing.dll'
+    '/r:System.Net.Http.dll'
     '/r:System.Windows.Forms.dll'
     $src
     $ver
