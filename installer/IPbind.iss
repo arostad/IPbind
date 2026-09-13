@@ -63,7 +63,7 @@ var
 procedure InitializeUninstallProgressForm;
 begin
   RemoveAppDataCheckBox := TNewCheckBox.Create(UninstallProgressForm);
-  RemoveAppDataCheckBox.Parent := UninstallProgressForm;
+  RemoveAppDataCheckBox.Parent := UninstallProgressForm.InstallingPage;
   RemoveAppDataCheckBox.Left := UninstallProgressForm.ProgressBar.Left;
   RemoveAppDataCheckBox.Top :=
     UninstallProgressForm.ProgressBar.Top +
@@ -74,11 +74,6 @@ begin
     'Remove all application data (saved IP lists, settings, and update cache)';
   RemoveAppDataCheckBox.Checked := False;
   RemoveAppDataCheckBox.Visible := not UninstallSilent;
-
-  UninstallProgressForm.ClientHeight :=
-    UninstallProgressForm.ClientHeight + ScaleY(42);
-  UninstallProgressForm.CancelButton.Top :=
-    UninstallProgressForm.CancelButton.Top + ScaleY(42);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
