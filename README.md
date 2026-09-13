@@ -8,7 +8,7 @@ App carefully directed by [Andy Rostad](https://github.com/arostad).  Released u
 
 <br clear="all">
 
-Current version: **2.3.105**.
+Current version: **2.3.106**.
 
 ## Download
 
