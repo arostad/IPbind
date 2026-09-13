@@ -588,7 +588,8 @@ try {
             Label version = MakeLabel(
                 "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
             Label tagline = MakeLabel(
-                "One-click Static IP Binder for easily accessing air-gapped equipment " +
+                "One-click Static IP Binder for easily\r\n" +
+                "accessing air-gapped equipment\r\n" +
                 "spread across multiple IP ranges",
                 9F, FontStyle.Regular, 24, 82, 382, 58);
 
