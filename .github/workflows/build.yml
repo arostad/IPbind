@@ -62,8 +62,9 @@ jobs:
           tag_name: latest
           name: Latest
           body: |
-            Windows build of IPbind.
-            This file is replaced on every push to main.
+            **Portable — IPbind.exe:** primary single-file download, refreshed on every push to main.
+
+            **Installer — IPbind-Setup.exe:** optional per-user installer, refreshed by the manual Build installer workflow.
           files: |
             release/IPbind.exe
             release/IPbind.exe.sha256

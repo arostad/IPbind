@@ -8,7 +8,10 @@ permissions:
 
 jobs:
   installer:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,5 +28,42 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: IPbind-Setup
-          path: dist/IPbind-Setup-*.exe
+          path: |
+            dist/IPbind-Setup-*.exe
+            dist/IPbind-Setup.exe
+            installer-version.txt
           if-no-files-found: error
+
+      - name: Upload installer to Latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload latest .\dist\IPbind-Setup.exe --clobber
+
+      - name: Record published installer version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw .\installer-version.txt).Trim()
+          $readmePath = '.\README.md'
+          $readme = Get-Content -Raw $readmePath
+          $installerLine = "- [**Installer — IPbind-Setup.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe) (v$version)"
+          $updatedReadme = [regex]::Replace(
+            $readme,
+            '(?m)^- \*\*Installer\b.*$',
+            $installerLine
+          )
+          if ($updatedReadme -eq $readme) {
+            throw 'Could not find the Installer download line in README.md.'
+          }
+          Set-Content -LiteralPath $readmePath -Value $updatedReadme -NoNewline
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md installer-version.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 1) {
+            git commit -m "Update published installer version to $version"
+            git push origin "HEAD:${{ github.ref_name }}"
+          } elseif ($LASTEXITCODE -ne 0) {
+            throw "git diff failed with exit code $LASTEXITCODE."
+          }
