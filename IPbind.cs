@@ -1522,16 +1522,18 @@ try {
             Controls.Add(chkAll);
 
             Label lblIPs = new Label();
-            lblIPs.Text = "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
+            lblIPs.Text =
+                "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24).\r\n" +
+                "No gateway or DNS:";
             lblIPs.Location = P(20, 146);
-            lblIPs.Size = Z(520, 32);
+            lblIPs.Size = Z(520, 40);
             Controls.Add(lblIPs);
 
             txtIPs = new TextBox();
             txtIPs.Multiline = true;
             txtIPs.ScrollBars = ScrollBars.Vertical;
-            txtIPs.Location = P(20, 178);
-            txtIPs.Size = Z(520, 157);
+            txtIPs.Location = P(20, 186);
+            txtIPs.Size = Z(520, 149);
             txtIPs.Font = new Font("Consolas", 10F);
             Controls.Add(txtIPs);
 
