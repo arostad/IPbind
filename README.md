@@ -12,10 +12,7 @@ Current version: **2.3.110**.
 
 ## Download
 
-[**Download IPbind.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
+- [**Portable — IPbind.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
+- [**Installer — IPbind-Setup.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
 
-GitHub Actions rebuilds this download on every push to `main`.
-
-### Installer
-
-The portable Latest executable remains the primary download. A per-user Windows installer is available on request through the manual **Build installer** workflow artifact.
+Portable is the primary, single-file download. The matching Installer installs per-user under LocalAppData and does not require administrator access for installation. Both are refreshed together on each main release; IPbind still elevates when run to apply network settings with `netsh`.

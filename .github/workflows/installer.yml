@@ -8,7 +8,10 @@ permissions:
 
 jobs:
   installer:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,9 +24,38 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1
 
-      - name: Upload installer artifact
+      - name: Write release metadata
+        shell: pwsh
+        run: |
+          $script = Get-Content -Raw .\Build-Exe.ps1
+          $versionMatch = [regex]::Match($script, "(?m)^\`$Version\s*=\s*'([^']+)'")
+          if (-not $versionMatch.Success) {
+            throw 'Could not read $Version from Build-Exe.ps1.'
+          }
+          Set-Content -Path .\version.txt -Value $versionMatch.Groups[1].Value -NoNewline
+          $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: IPbind-Setup
-          path: dist/IPbind-Setup-*.exe
+          path: |
+            IPbind.exe
+            IPbind.exe.sha256
+            version.txt
+            dist/IPbind-Setup-*.exe
+            dist/IPbind-Setup.exe
           if-no-files-found: error
+
+      - name: Upload matching downloads to Latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload latest `
+            .\IPbind.exe `
+            .\IPbind.exe.sha256 `
+            .\version.txt `
+            .\dist\IPbind-Setup.exe `
+            --clobber

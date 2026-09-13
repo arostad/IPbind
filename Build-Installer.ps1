@@ -83,8 +83,13 @@ if (-not (Test-Path -LiteralPath $installerPath)) {
     throw "Inno Setup did not produce the expected installer: $installerPath"
 }
 
+$stableInstallerPath = Join-Path $resolvedOutput 'IPbind-Setup.exe'
+Copy-Item -LiteralPath $installerPath -Destination $stableInstallerPath -Force
+
 Write-Host "Done: $installerPath" -ForegroundColor Green
+Write-Host "Stable copy: $stableInstallerPath" -ForegroundColor Green
 [PSCustomObject]@{
     Version = $version
     InstallerPath = $installerPath
+    StableInstallerPath = $stableInstallerPath
 }
