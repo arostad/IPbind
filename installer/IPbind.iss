@@ -45,16 +45,13 @@ RestartApplications=no
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-
 [Files]
 Source: "{#ExePath}"; DestDir: "{app}"; DestName: "IPbind.exe"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{userprograms}\IPbind\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{userprograms}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postinstall skipifsilent
