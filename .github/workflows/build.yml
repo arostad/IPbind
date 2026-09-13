@@ -33,6 +33,16 @@ jobs:
           $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
 
+      - name: Install Inno Setup 6
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build per-user installer
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -ExePath .\IPbind.exe
+
       - name: Upload release files
         uses: actions/upload-artifact@v4
         with:
@@ -41,6 +51,7 @@ jobs:
             IPbind.exe
             IPbind.exe.sha256
             version.txt
+            dist/IPbind-Setup.exe
           if-no-files-found: error
 
   release:
@@ -62,11 +73,14 @@ jobs:
           tag_name: latest
           name: Latest
           body: |
-            **Portable — IPbind.exe:** primary single-file download, refreshed on every push to main.
+            **Portable — IPbind.exe:** primary single-file download.
 
-            **Installer — IPbind-Setup.exe:** optional per-user installer, refreshed by the manual Build installer workflow.
+            **Installer — IPbind-Setup.exe:** matching per-user installer.
+
+            Both downloads are refreshed together on every push to main.
           files: |
             release/IPbind.exe
             release/IPbind.exe.sha256
             release/version.txt
+            release/dist/IPbind-Setup.exe
           make_latest: true

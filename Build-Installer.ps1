@@ -85,7 +85,6 @@ if (-not (Test-Path -LiteralPath $installerPath)) {
 
 $stableInstallerPath = Join-Path $resolvedOutput 'IPbind-Setup.exe'
 Copy-Item -LiteralPath $installerPath -Destination $stableInstallerPath -Force
-Set-Content -LiteralPath (Join-Path $root 'installer-version.txt') -Value $version -NoNewline
 
 Write-Host "Done: $installerPath" -ForegroundColor Green
 Write-Host "Stable copy: $stableInstallerPath" -ForegroundColor Green
