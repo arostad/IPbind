@@ -795,7 +795,7 @@ namespace IPbind
                 9F, FontStyle.Regular, 24, 94, 382, 58);
 
             LinkLabel directed = MakeLink(
-                "App carefully directed by Andy Rostad",
+                "App created by Andy Rostad",
                 "Andy Rostad", "https://github.com/arostad", 24, 166, 382, 22);
             LinkLabel source = MakeLink(
                 "Source", "Source", "https://github.com/arostad/IPbind", 24, 194, 382, 22);
