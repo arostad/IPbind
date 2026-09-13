@@ -1,5 +1,5 @@
 // IPbind - Static IP Binder for accessing air-gapped industrial automation systems
-// A genuine compiled .NET WinForms application (no ps2exe / no embedded PowerShell).
+// A genuine compiled .NET WinForms application (no script wrapper).
 // Binds multiple static IPv4 addresses (no gateway/DNS) to a chosen LAN interface for
 // reaching air-gapped equipment web GUIs across different IP ranges, with one-click
 // DHCP revert. Local network configuration is the app's purpose; update checks are the
@@ -19,14 +19,16 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
 using System.Reflection;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: AssemblyTitle("Static IP Binder for accessing air-gapped automation equipment spread across multiple IP ranges")]
-[assembly: AssemblyDescription("Binds multiple static IPv4 addresses to a LAN interface (no gateway/DNS) so air-gapped automation equipment on different IP ranges is reachable, with one-click DHCP revert.")]
+[assembly: AssemblyTitle("IPbind - Static IP binder for easily accessing air-gapped equipment across multiple IP ranges")]
+[assembly: AssemblyDescription("Easily accesses air-gapped equipment across multiple IP ranges by binding static IPv4 addresses to a LAN interface, with one-click DHCP revert.")]
 [assembly: AssemblyProduct("IPbind")]
 [assembly: AssemblyCompany("Andy Rostad")]
 [assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
@@ -38,11 +40,58 @@ namespace IPbind
     static class Program
     {
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
+            if (UpdateChecker.TryRunApplyUpdate(args)) return;
+            UpdateChecker.BeginHelperCleanup(args);
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+        }
+    }
+
+    static class PrivateFile
+    {
+        static FileSecurity CurrentUserSecurity(FileSystemRights rights)
+        {
+            SecurityIdentifier user = WindowsIdentity.GetCurrent().User;
+            if (user == null)
+                throw new InvalidOperationException("Could not identify the current Windows user.");
+
+            FileSecurity security = new FileSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new FileSystemAccessRule(
+                user, rights, InheritanceFlags.None, PropagationFlags.None,
+                AccessControlType.Allow));
+            return security;
+        }
+
+        public static FileStream Create(string path, FileSystemRights rights)
+        {
+            return new FileStream(
+                path, FileMode.CreateNew, rights, FileShare.None, 4096,
+                FileOptions.None, CurrentUserSecurity(rights));
+        }
+
+        public static void WriteAllText(string path, string contents)
+        {
+            try { File.Delete(path); } catch { }
+            FileSystemRights rights =
+                FileSystemRights.Read | FileSystemRights.Write | FileSystemRights.Modify;
+            using (FileStream stream = Create(path, rights))
+            using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                writer.Write(contents);
+        }
+
+        public static void CopyExecutable(string source, string destination)
+        {
+            FileSystemRights rights = FileSystemRights.Read | FileSystemRights.Write |
+                FileSystemRights.Modify | FileSystemRights.ExecuteFile;
+            using (FileStream input = new FileStream(
+                source, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (FileStream output = Create(destination, rights))
+                input.CopyTo(output);
         }
     }
 
@@ -477,7 +526,204 @@ namespace IPbind
 
         static string QuoteArgument(string value)
         {
-            return "\"" + value.Replace("\"", "\\\"") + "\"";
+            if (value == null) return "\"\"";
+
+            StringBuilder quoted = new StringBuilder();
+            quoted.Append('"');
+            int backslashes = 0;
+            foreach (char c in value)
+            {
+                if (c == '\\')
+                {
+                    backslashes++;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    quoted.Append('\\', backslashes * 2 + 1);
+                    quoted.Append('"');
+                    backslashes = 0;
+                    continue;
+                }
+                quoted.Append('\\', backslashes);
+                backslashes = 0;
+                quoted.Append(c);
+            }
+            quoted.Append('\\', backslashes * 2);
+            quoted.Append('"');
+            return quoted.ToString();
+        }
+
+        static void StartApplication(string target, string helperPath)
+        {
+            ProcessStartInfo start = new ProcessStartInfo();
+            start.FileName = target;
+            start.Arguments = "--cleanup-update-helper " + QuoteArgument(helperPath);
+            start.CreateNoWindow = false;
+            start.UseShellExecute = false;
+            if (Process.Start(start) == null)
+                throw new InvalidOperationException("Could not restart IPbind.");
+        }
+
+        static void ReplaceTarget(string pending, string target)
+        {
+            bool sameVolume = string.Equals(
+                Path.GetPathRoot(pending), Path.GetPathRoot(target),
+                StringComparison.OrdinalIgnoreCase);
+
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(target))
+                    {
+                        if (sameVolume)
+                            File.Replace(pending, target, null);
+                        else
+                        {
+                            File.Copy(pending, target, true);
+                            File.Delete(pending);
+                        }
+                    }
+                    else if (sameVolume)
+                        File.Move(pending, target);
+                    else
+                    {
+                        File.Copy(pending, target, false);
+                        File.Delete(pending);
+                    }
+                    return;
+                }
+                catch
+                {
+                    if (attempt == 7) throw;
+                    Thread.Sleep(1000);
+                }
+            }
+        }
+
+        static void ApplyUpdate(string[] args)
+        {
+            if (args.Length != 5)
+                throw new ArgumentException("The update helper arguments were invalid.");
+
+            string pending = Path.GetFullPath(args[1]);
+            string target = Path.GetFullPath(args[2]);
+            string expectedHash = args[3];
+            int parentPid;
+            if (!Regex.IsMatch(expectedHash ?? "", @"\A[0-9a-fA-F]{64}\z")
+                || !int.TryParse(args[4], out parentPid) || parentPid <= 0
+                || string.Equals(pending, target, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("The update helper arguments were invalid.");
+            }
+
+            try
+            {
+                using (Process parent = Process.GetProcessById(parentPid))
+                    parent.WaitForExit();
+            }
+            catch (ArgumentException)
+            {
+                // The parent already exited before the helper queried it.
+            }
+
+            FileInfo downloaded = new FileInfo(pending);
+            if (!downloaded.Exists || downloaded.Length < MinExeBytes
+                || downloaded.Length > MaxExeBytes)
+            {
+                throw new InvalidOperationException(
+                    "The downloaded update has an unexpected size.");
+            }
+            if (!string.Equals(
+                Sha256(pending), expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The downloaded update failed its integrity check.");
+            }
+
+            ReplaceTarget(pending, target);
+            if (!File.Exists(target))
+                throw new InvalidOperationException("The updated executable is missing.");
+        }
+
+        public static bool TryRunApplyUpdate(string[] args)
+        {
+            if (args == null || args.Length == 0
+                || !string.Equals(args[0], "--apply-update", StringComparison.Ordinal))
+                return false;
+
+            string target = args.Length > 2 ? args[2] : "";
+            string pending = args.Length > 1 ? args[1] : "";
+            string helperPath = Application.ExecutablePath;
+            string errorFile = "";
+            try
+            {
+                if (!string.IsNullOrEmpty(target))
+                {
+                    target = Path.GetFullPath(target);
+                    string directory = Path.GetDirectoryName(target);
+                    if (!string.IsNullOrEmpty(directory))
+                        errorFile = Path.Combine(directory, "update-error.txt");
+                }
+
+                ApplyUpdate(args);
+                if (!string.IsNullOrEmpty(errorFile))
+                    try { File.Delete(errorFile); } catch { }
+            }
+            catch (Exception ex)
+            {
+                if (!string.IsNullOrEmpty(errorFile))
+                {
+                    try
+                    {
+                        PrivateFile.WriteAllText(
+                            errorFile, "Update failed: " + MostSpecificMessage(ex));
+                    }
+                    catch { }
+                }
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(pending))
+                    try { File.Delete(pending); } catch { }
+            }
+
+            if (!string.IsNullOrEmpty(target) && File.Exists(target))
+            {
+                try { StartApplication(target, helperPath); } catch { }
+            }
+            return true;
+        }
+
+        public static void BeginHelperCleanup(string[] args)
+        {
+            if (args == null || args.Length != 2
+                || !string.Equals(
+                    args[0], "--cleanup-update-helper", StringComparison.Ordinal))
+                return;
+
+            string helperPath;
+            try { helperPath = Path.GetFullPath(args[1]); }
+            catch { return; }
+            if (string.Equals(
+                helperPath, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            Thread cleanup = new Thread(delegate()
+            {
+                for (int attempt = 0; attempt < 20; attempt++)
+                {
+                    try
+                    {
+                        File.Delete(helperPath);
+                        return;
+                    }
+                    catch { Thread.Sleep(250); }
+                }
+            });
+            cleanup.IsBackground = true;
+            cleanup.Start();
         }
 
         public static void DownloadAndRestart()
@@ -490,73 +736,28 @@ namespace IPbind
 
             string expectedHash;
             string pending = DownloadVerifiedExe(directory, out expectedHash);
-            string errorFile = Path.Combine(directory, "update-error.txt");
-            string script = Path.Combine(
-                ChooseStagingDirectory(directory),
-                ".IPbind-update-" + Guid.NewGuid().ToString("N") + ".ps1");
-            string scriptText = @"
-$ErrorActionPreference = ""Stop""
-$pending = $env:IPBIND_UPDATE_PENDING
-$exe = $env:IPBIND_UPDATE_EXE
-$expectedHash = $env:IPBIND_UPDATE_SHA256
-$errorFile = $env:IPBIND_UPDATE_ERROR
-try {
-    $process = Get-Process -Id ([int]$env:IPBIND_UPDATE_PID) -ErrorAction SilentlyContinue
-    if ($process) { $process.WaitForExit() }
-    if ((Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash -ne $expectedHash) {
-        throw ""The downloaded update failed its integrity check.""
-    }
-    $length = (Get-Item -LiteralPath $pending).Length
-    if ($length -lt 20480 -or $length -gt 524288000) {
-        throw ""The downloaded update has an unexpected size.""
-    }
-    for ($attempt = 0; $attempt -lt 8; $attempt++) {
-        try {
-            Move-Item -LiteralPath $pending -Destination $exe -Force
-            break
-        } catch {
-            if ($attempt -eq 7) { throw }
-            Start-Sleep -Seconds 1
-        }
-    }
-    if (-not (Test-Path -LiteralPath $exe)) {
-        throw ""The updated executable is missing.""
-    }
-    Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
-    Start-Process -FilePath $exe
-} catch {
-    ""Update failed: $($_.Exception.Message)"" | Set-Content -LiteralPath $errorFile
-    if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe }
-} finally {
-    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-}
-";
-            using (FileStream stream = new FileStream(
-                script, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(true)))
-                writer.Write(scriptText);
-
-            ProcessStartInfo start = new ProcessStartInfo();
-            start.FileName = "powershell.exe";
-            start.Arguments =
-                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + QuoteArgument(script);
-            start.CreateNoWindow = true;
-            start.UseShellExecute = false;
-            start.EnvironmentVariables["IPBIND_UPDATE_PENDING"] = pending;
-            start.EnvironmentVariables["IPBIND_UPDATE_EXE"] = exe;
-            start.EnvironmentVariables["IPBIND_UPDATE_SHA256"] = expectedHash;
-            start.EnvironmentVariables["IPBIND_UPDATE_ERROR"] = errorFile;
-            start.EnvironmentVariables["IPBIND_UPDATE_PID"] =
-                Process.GetCurrentProcess().Id.ToString(
-                    System.Globalization.CultureInfo.InvariantCulture);
+            string stagingDirectory = ChooseStagingDirectory(directory);
+            string helper = Path.Combine(
+                stagingDirectory,
+                ".IPbind-update-helper-" + Guid.NewGuid().ToString("N") + ".exe");
             try
             {
+                PrivateFile.CopyExecutable(Application.ExecutablePath, helper);
+
+                ProcessStartInfo start = new ProcessStartInfo();
+                start.FileName = helper;
+                start.Arguments = "--apply-update " + QuoteArgument(pending) + " " +
+                    QuoteArgument(exe) + " " + QuoteArgument(expectedHash) + " " +
+                    Process.GetCurrentProcess().Id.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture);
+                start.CreateNoWindow = true;
+                start.UseShellExecute = false;
                 if (Process.Start(start) == null)
                     throw new InvalidOperationException("Could not start the update helper.");
             }
             catch
             {
-                try { File.Delete(script); } catch { }
+                try { File.Delete(helper); } catch { }
                 try { File.Delete(pending); } catch { }
                 throw;
             }
@@ -667,18 +868,40 @@ try {
             label.LinkColor = Color.FromArgb(25, 90, 160);
             int start = text.IndexOf(linkedText, StringComparison.Ordinal);
             label.LinkArea = new LinkArea(start, linkedText.Length);
-            label.Links[0].LinkData = url;
+            Uri safeUrl;
+            label.Links[0].LinkData = TryGetHttpsUrl(url, out safeUrl)
+                ? safeUrl.AbsoluteUri
+                : null;
             label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
             {
                 try
                 {
-                    ProcessStartInfo info = new ProcessStartInfo((string)e.Link.LinkData);
+                    Uri destination;
+                    if (!TryGetHttpsUrl(e.Link.LinkData as string, out destination))
+                        return;
+
+                    ProcessStartInfo info = new ProcessStartInfo(destination.AbsoluteUri);
                     info.UseShellExecute = true;
                     Process.Start(info);
                 }
                 catch { }
             };
             return label;
+        }
+
+        static bool TryGetHttpsUrl(string value, out Uri uri)
+        {
+            uri = null;
+            Uri parsed;
+            if (string.IsNullOrWhiteSpace(value)
+                || !Uri.TryCreate(value, UriKind.Absolute, out parsed)
+                || !string.Equals(
+                    parsed.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                || string.IsNullOrEmpty(parsed.Host))
+                return false;
+
+            uri = parsed;
+            return true;
         }
 
         void CheckUpdates(object sender, EventArgs e)
@@ -1035,8 +1258,37 @@ try {
 
         int Netsh(string args, out string output) { return RunProc("netsh", args, out output); }
 
+        bool ValidateAdapterAlias(string alias)
+        {
+            if (string.IsNullOrEmpty(alias))
+            {
+                Log("Adapter validation failed: the interface name is empty.", "ERR");
+                return false;
+            }
+            if (alias.IndexOfAny(new char[] { '"', '\r', '\n', '\0' }) >= 0)
+            {
+                Log("Adapter validation failed: the interface name contains unsafe characters.", "ERR");
+                return false;
+            }
+
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    if (string.Equals(ni.Name, alias, StringComparison.Ordinal))
+                        return true;
+                Log("Adapter validation failed: '" + alias +
+                    "' is not a currently listed interface.", "ERR");
+            }
+            catch (Exception ex)
+            {
+                Log("Adapter validation failed: " + ex.Message, "ERR");
+            }
+            return false;
+        }
+
         void ShowCurrentConfig(string alias)
         {
+            if (!ValidateAdapterAlias(alias)) return;
             Log("Current IPv4 config for '" + alias + "':");
             string outp;
             Netsh("interface ipv4 show addresses name=\"" + alias + "\"", out outp);
@@ -1052,6 +1304,7 @@ try {
         {
             string alias = GetSelectedAlias();
             if (alias == null) { Log("No interface selected.", "WARN"); return false; }
+            if (!ValidateAdapterAlias(alias)) return false;
 
             string status = AdapterStatus(alias);
             if (status != "Up")
@@ -1103,7 +1356,8 @@ try {
             string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
             try
             {
-                File.WriteAllText(script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
+                PrivateFile.WriteAllText(
+                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
                 RunProc("netsh", "-f \"" + script + "\"", out outp);
             }
             catch (Exception ex) { outp = ex.Message; }
@@ -1150,6 +1404,7 @@ try {
         {
             string alias = GetSelectedAlias();
             if (alias == null) { Log("No interface selected.", "WARN"); return false; }
+            if (!ValidateAdapterAlias(alias)) return false;
             Log("Returning '" + alias + "' to DHCP...");
             string outp = "";
 
@@ -1160,7 +1415,8 @@ try {
             string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
             try
             {
-                File.WriteAllText(script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
+                PrivateFile.WriteAllText(
+                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
                 RunProc("netsh", "-f \"" + script + "\"", out outp);
             }
             catch (Exception ex) { outp = ex.Message; }
