@@ -7,13 +7,14 @@ One-click static IP binder for air-gapped equipment. A compiled .NET WinForms to
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 
 <br clear="all">
+<br>
 
 Current version: **2.3.112**.
 
 ## Download
 
-**[Download Installer — IPbind-Setup.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)**
+### [Download Installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
 
 The Installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
 
-<sub>Prefer a single file? [Portable — IPbind.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)</sub>
+Prefer a single file? [Download Portable Version](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)

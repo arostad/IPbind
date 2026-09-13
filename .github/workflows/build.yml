@@ -73,7 +73,7 @@ jobs:
           tag_name: latest
           name: Latest
           body: |
-            **[Download Installer — IPbind-Setup.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)**
+            **[Download Installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)**
 
             The Installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
 
