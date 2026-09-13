@@ -581,7 +581,7 @@ try {
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = Z(430, 330);
+            ClientSize = Z(430, 360);
             try { Icon = owner.Icon; } catch { }
 
             Label title = MakeLabel("IPbind", 18F, FontStyle.Bold, 24, 20, 382, 34);
@@ -591,24 +591,24 @@ try {
                 "One-click Static IP Binder for easily\r\n" +
                 "accessing air-gapped equipment\r\n" +
                 "spread across multiple IP ranges",
-                9F, FontStyle.Regular, 24, 82, 382, 58);
+                9F, FontStyle.Regular, 24, 94, 382, 58);
 
             LinkLabel directed = MakeLink(
                 "App carefully directed by Andy Rostad",
-                "Andy Rostad", "https://github.com/arostad", 24, 142, 382, 22);
+                "Andy Rostad", "https://github.com/arostad", 24, 166, 382, 22);
             LinkLabel source = MakeLink(
-                "Source", "Source", "https://github.com/arostad/IPbind", 24, 170, 382, 22);
+                "Source", "Source", "https://github.com/arostad/IPbind", 24, 194, 382, 22);
             LinkLabel license = MakeLink(
                 "Released under the MIT License", "MIT License",
-                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 198, 382, 22);
+                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 222, 382, 22);
 
             checkButton = new Button();
             checkButton.Text = "Check for updates";
-            checkButton.Location = P(120, 230);
+            checkButton.Location = P(120, 254);
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
-            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 268, 382, 48);
+            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 292, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
