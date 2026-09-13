@@ -73,11 +73,11 @@ jobs:
           tag_name: latest
           name: Latest
           body: |
-            **Portable — IPbind.exe:** primary single-file download.
+            **[Download Installer — IPbind-Setup.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)**
 
-            **Installer — IPbind-Setup.exe:** matching per-user installer.
+            The Installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
 
-            Both downloads are refreshed together on every push to main.
+            <sub>Prefer a single file? [Portable — IPbind.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)</sub>
           files: |
             release/IPbind.exe
             release/IPbind.exe.sha256
