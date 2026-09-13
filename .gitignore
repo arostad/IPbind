@@ -2,6 +2,7 @@
 Version.cs
 IPbind.exe
 IPbind-*.exe
+dist/
 *.user
 .vs/
 bin/
