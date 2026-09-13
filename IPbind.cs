@@ -91,7 +91,16 @@ namespace IPbind
 
         static HttpClient CreateClient()
         {
-            HttpClient client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+            EnableModernTls();
+
+            IWebProxy systemProxy = WebRequest.GetSystemWebProxy();
+            systemProxy.Credentials = CredentialCache.DefaultCredentials;
+            HttpClientHandler handler = new HttpClientHandler();
+            handler.AllowAutoRedirect = false;
+            handler.UseProxy = true;
+            handler.Proxy = systemProxy;
+
+            HttpClient client = new HttpClient(handler);
             client.Timeout = TimeSpan.FromMinutes(15);
             client.DefaultRequestHeaders.UserAgent.ParseAdd("IPbind");
             client.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue
@@ -101,6 +110,104 @@ namespace IPbind
             };
             client.DefaultRequestHeaders.Pragma.ParseAdd("no-cache");
             return client;
+        }
+
+        static void EnableModernTls()
+        {
+            // Numeric casts keep this source buildable on Framework reference assemblies
+            // that predate the enum names. TLS 1.2 = 3072; TLS 1.3 = 12288.
+            SecurityProtocolType current = ServicePointManager.SecurityProtocol;
+            SecurityProtocolType tls12 = (SecurityProtocolType)3072;
+            SecurityProtocolType tls13 = (SecurityProtocolType)12288;
+            try
+            {
+                ServicePointManager.SecurityProtocol = current | tls12 | tls13;
+            }
+            catch (NotSupportedException)
+            {
+                // Older Framework/Windows combinations reject the TLS 1.3 value.
+                ServicePointManager.SecurityProtocol = current | tls12;
+            }
+        }
+
+        static string MostSpecificMessage(Exception exception)
+        {
+            string message = "";
+            Exception current = exception;
+            for (int depth = 0; current != null && depth < 12; depth++)
+            {
+                if (!string.IsNullOrWhiteSpace(current.Message))
+                    message = current.Message.Trim();
+                current = current.InnerException;
+            }
+            return message;
+        }
+
+        static string DescribeWebFailure(WebException exception)
+        {
+            HttpWebResponse response = exception.Response as HttpWebResponse;
+            if (response != null)
+            {
+                return "HTTP " + (int)response.StatusCode + " " +
+                    response.StatusDescription;
+            }
+
+            switch (exception.Status)
+            {
+                case WebExceptionStatus.TrustFailure:
+                    return "TLS certificate trust failure";
+                case WebExceptionStatus.SecureChannelFailure:
+                    return "TLS secure-channel failure";
+                case WebExceptionStatus.ConnectFailure:
+                    return "connection failed or was refused";
+                case WebExceptionStatus.NameResolutionFailure:
+                    return "DNS name resolution failed";
+                case WebExceptionStatus.ProxyNameResolutionFailure:
+                    return "proxy name resolution failed";
+                case WebExceptionStatus.Timeout:
+                    return "request timed out";
+                default:
+                    return exception.Status.ToString();
+            }
+        }
+
+        static string DescribeError(Exception exception, string prefix)
+        {
+            if (exception == null) return prefix + ".";
+
+            WebException web = null;
+            System.Net.Sockets.SocketException socket = null;
+            Exception current = exception;
+            for (int depth = 0; current != null && depth < 12; depth++)
+            {
+                if (web == null) web = current as WebException;
+                if (socket == null)
+                    socket = current as System.Net.Sockets.SocketException;
+                current = current.InnerException;
+            }
+
+            string detail = MostSpecificMessage(exception);
+            if (web != null)
+            {
+                string summary = prefix + " (" + DescribeWebFailure(web) + ")";
+                return string.IsNullOrEmpty(detail) ? summary + "." : summary + ": " + detail;
+            }
+            if (socket != null)
+            {
+                string socketFailure =
+                    socket.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionRefused
+                    ? "connection refused"
+                    : "socket " + socket.SocketErrorCode;
+                string summary = prefix + " (" + socketFailure + ")";
+                return string.IsNullOrEmpty(detail) ? summary + "." : summary + ": " + detail;
+            }
+
+            return string.IsNullOrEmpty(detail) ? prefix + "." : prefix + ": " + detail;
+        }
+
+        public static string DescribeError(Exception exception)
+        {
+            return DescribeError(exception, "Update failed");
         }
 
         static string FreshUrl(string url)
@@ -363,7 +470,7 @@ namespace IPbind
             }
             catch (Exception ex)
             {
-                error = ex.Message;
+                error = DescribeError(ex, "Update check failed");
                 return false;
             }
         }
@@ -481,25 +588,26 @@ try {
             Label version = MakeLabel(
                 "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
             Label tagline = MakeLabel(
-                "One-click static IP binder for air-gapped equipment",
-                9F, FontStyle.Regular, 24, 88, 382, 36);
+                "One-click Static IP Binder for easily accessing air-gapped equipment " +
+                "spread across multiple IP ranges",
+                9F, FontStyle.Regular, 24, 82, 382, 58);
 
             LinkLabel directed = MakeLink(
                 "App carefully directed by Andy Rostad",
-                "Andy Rostad", "https://github.com/arostad", 24, 136, 382, 22);
+                "Andy Rostad", "https://github.com/arostad", 24, 142, 382, 22);
             LinkLabel source = MakeLink(
-                "Source", "Source", "https://github.com/arostad/IPbind", 24, 166, 382, 22);
+                "Source", "Source", "https://github.com/arostad/IPbind", 24, 170, 382, 22);
             LinkLabel license = MakeLink(
                 "Released under the MIT License", "MIT License",
-                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 196, 382, 22);
+                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 198, 382, 22);
 
             checkButton = new Button();
             checkButton.Text = "Check for updates";
-            checkButton.Location = P(120, 232);
+            checkButton.Location = P(120, 230);
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
-            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 270, 382, 42);
+            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 268, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
@@ -582,7 +690,11 @@ try {
                 try { info = UpdateChecker.Check(); }
                 catch (Exception ex)
                 {
-                    info = new UpdateInfo { Error = ex.Message, IsNewer = false };
+                    info = new UpdateInfo
+                    {
+                        Error = UpdateChecker.DescribeError(ex),
+                        IsNewer = false
+                    };
                 }
                 try
                 {
@@ -632,7 +744,7 @@ try {
                         BeginInvoke((MethodInvoker)delegate
                         {
                             if (IsDisposed) return;
-                            statusLabel.Text = ex.Message;
+                            statusLabel.Text = UpdateChecker.DescribeError(ex);
                             checkButton.Enabled = true;
                         });
                     }
@@ -1192,7 +1304,7 @@ try {
                         BeginInvoke((MethodInvoker)delegate
                         {
                             if (IsDisposed) return;
-                            lblUpdateBanner.Text = ex.Message;
+                            lblUpdateBanner.Text = UpdateChecker.DescribeError(ex);
                             btnUpdateNow.Text = "Update";
                             btnUpdateNow.Enabled = true;
                             btnUpdateLater.Enabled = true;
@@ -1297,7 +1409,7 @@ try {
         // No captioned controls are resized, so text retains its designed DPI-scaled bounds.
         void ApplyLeftColumnStatusLayout()
         {
-            lblStatus.Location = P(20, updateBanner.Visible ? 486 : 446);
+            lblStatus.Location = P(20, updateBanner.Visible ? 512 : 472);
         }
 
         // If an unusually large DPI makes the full design wider or taller than the
@@ -1484,7 +1596,7 @@ try {
             Controls.Add(lblTitle);
 
             Label lblSub = new Label();
-            lblSub.Text = "Static IP Binder for accessing air-gapped automation equipment spread across multiple IP ranges";
+            lblSub.Text = "Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges";
             lblSub.Font = UiFont(9F, FontStyle.Italic);
             lblSub.Location = P(20, 38);
             lblSub.Size = Z(520, 34);
@@ -1523,29 +1635,30 @@ try {
 
             Label lblIPs = new Label();
             lblIPs.Text =
-                "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24).\r\n" +
-                "No gateway or DNS:";
+                "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
+            lblIPs.Font = UiFont(8F, FontStyle.Regular);
             lblIPs.Location = P(20, 146);
-            lblIPs.Size = Z(520, 40);
+            lblIPs.Size = Z(530, 22);
+            lblIPs.TextAlign = ContentAlignment.MiddleLeft;
             Controls.Add(lblIPs);
 
             txtIPs = new TextBox();
             txtIPs.Multiline = true;
             txtIPs.ScrollBars = ScrollBars.Vertical;
-            txtIPs.Location = P(20, 186);
-            txtIPs.Size = Z(520, 149);
+            txtIPs.Location = P(20, 170);
+            txtIPs.Size = Z(520, 196);
             txtIPs.Font = new Font("Consolas", 10F);
             Controls.Add(txtIPs);
 
-            Button btnSaveList = MakeButton("Save List", 20, 341, 166, 28);
+            Button btnSaveList = MakeButton("Save List", 20, 372, 166, 28);
             btnSaveList.Click += delegate { SaveList(false); };
             Controls.Add(btnSaveList);
 
-            Button btnRestore = MakeButton("Restore Defaults", 197, 341, 166, 28);
+            Button btnRestore = MakeButton("Restore Defaults", 197, 372, 166, 28);
             btnRestore.Click += delegate { RestoreDefaults(); };
             Controls.Add(btnRestore);
 
-            Button btnShow = MakeButton("Show Current", 374, 341, 166, 28);
+            Button btnShow = MakeButton("Show Current", 374, 372, 166, 28);
             btnShow.Click += delegate
             {
                 string a = GetSelectedAlias();
@@ -1554,7 +1667,7 @@ try {
             };
             Controls.Add(btnShow);
 
-            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 375, 255, 60);
+            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 406, 255, 60);
             btnBind.Font = UiFont(12F, FontStyle.Bold);
             btnBind.BackColor = Color.FromArgb(46, 125, 50);
             btnBind.ForeColor = Color.White;
@@ -1569,7 +1682,7 @@ try {
             };
             Controls.Add(btnBind);
 
-            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 285, 375, 255, 60);
+            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 285, 406, 255, 60);
             btnDhcp.Font = UiFont(12F, FontStyle.Bold);
             btnDhcp.BackColor = Color.FromArgb(25, 90, 160);
             btnDhcp.ForeColor = Color.White;
@@ -1587,7 +1700,7 @@ try {
             lblStatus = new Label();
             lblStatus.Text = "Ready.";
             lblStatus.Font = UiFont(10F, FontStyle.Bold);
-            lblStatus.Location = P(20, 446);
+            lblStatus.Location = P(20, 472);
             lblStatus.Size = Z(520, 38);
             lblStatus.TextAlign = ContentAlignment.MiddleCenter;
             lblStatus.ForeColor = Color.FromArgb(60, 60, 60);
@@ -1615,7 +1728,7 @@ try {
             Controls.Add(console);
 
             updateBanner = new Panel();
-            updateBanner.Location = P(20, 443);
+            updateBanner.Location = P(20, 472);
             updateBanner.Size = Z(520, 38);
             updateBanner.BorderStyle = BorderStyle.FixedSingle;
             updateBanner.BackColor = Color.FromArgb(245, 247, 250);
