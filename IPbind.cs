@@ -460,19 +460,21 @@ try {
     {
         readonly Button checkButton;
         readonly Label statusLabel;
+        readonly float sc;
         UpdateInfo availableUpdate;
 
-        public AboutForm(Form owner, bool dark)
+        public AboutForm(Form owner, bool dark, float scale)
         {
+            sc = scale > 0f ? scale : 1f;
             Text = "About IPbind";
             Font = new Font("Segoe UI", 9F);
-            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(430, 330);
+            ClientSize = Z(430, 330);
             try { Icon = owner.Icon; } catch { }
 
             Label title = MakeLabel("IPbind", 18F, FontStyle.Bold, 24, 20, 382, 34);
@@ -493,8 +495,8 @@ try {
 
             checkButton = new Button();
             checkButton.Text = "Check for updates";
-            checkButton.Location = new Point(140, 232);
-            checkButton.Size = new Size(150, 30);
+            checkButton.Location = P(120, 232);
+            checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
             statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 270, 382, 42);
@@ -529,25 +531,29 @@ try {
             }
         }
 
-        static Label MakeLabel(
+        int U(int value) { return (int)Math.Round(value * sc); }
+        Point P(int x, int y) { return new Point(U(x), U(y)); }
+        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        Label MakeLabel(
             string text, float size, FontStyle style, int x, int y, int width, int height)
         {
             Label label = new Label();
             label.Text = text;
             label.Font = new Font("Segoe UI", size, style);
-            label.Location = new Point(x, y);
-            label.Size = new Size(width, height);
+            label.Location = P(x, y);
+            label.Size = Z(width, height);
             label.TextAlign = ContentAlignment.MiddleCenter;
             return label;
         }
 
-        static LinkLabel MakeLink(
+        LinkLabel MakeLink(
             string text, string linkedText, string url, int x, int y, int width, int height)
         {
             LinkLabel label = new LinkLabel();
             label.Text = text;
-            label.Location = new Point(x, y);
-            label.Size = new Size(width, height);
+            label.Location = P(x, y);
+            label.Size = Z(width, height);
             label.TextAlign = ContentAlignment.MiddleCenter;
             label.LinkColor = Color.FromArgb(25, 90, 160);
             int start = text.IndexOf(linkedText, StringComparison.Ordinal);
@@ -676,7 +682,6 @@ try {
         bool updateDismissed;
         bool shown;
         bool fittingWorkingArea;
-        int consoleHeightReduction;
         Rectangle fittedWorkingArea = Rectangle.Empty;
         Color BgCol, PanelCol, FgCol, SubCol, BorderCol, InputCol;
         readonly List<Adapter> adapters = new List<Adapter>();
@@ -1143,7 +1148,7 @@ try {
                         lblUpdateBanner.Text =
                             "Version " + info.RemoteVersion + " is available.";
                         updateBanner.Visible = true;
-                        ApplyFlexibleLayout();
+                        ApplyLeftColumnStatusLayout();
                         updateBanner.BringToFront();
                     });
                 }
@@ -1191,7 +1196,7 @@ try {
         {
             updateDismissed = true;
             updateBanner.Visible = false;
-            ApplyFlexibleLayout();
+            ApplyLeftColumnStatusLayout();
         }
 
         Button MakeButton(string text, int x, int y, int w, int h)
@@ -1275,19 +1280,11 @@ try {
                 FitToWorkingArea(true);
         }
 
-        // Keep the footer attached to the flexible console. The console gives up height
-        // first; all controls above it retain their designed size and position.
-        void ApplyFlexibleLayout()
+        // The optional update banner shares reserved space with the left-column status.
+        // No controls are resized, so captions retain their designed DPI-scaled bounds.
+        void ApplyLeftColumnStatusLayout()
         {
-            int normalConsoleHeight = Math.Max(U(96), U(296) - consoleHeightReduction);
-            int displayedConsoleHeight =
-                Math.Max(U(56), normalConsoleHeight - (updateBanner.Visible ? U(40) : 0));
-            console.Size = new Size(U(548), displayedConsoleHeight);
-
-            updateBanner.Location =
-                new Point(U(20), console.Top + normalConsoleHeight - U(34));
-            btnAbout.Location = new Point(U(20), U(774) - consoleHeightReduction);
-            lblVersion.Location = new Point(U(408), U(778) - consoleHeightReduction);
+            lblStatus.Location = P(20, updateBanner.Visible ? 506 : 464);
         }
 
         void FitToWorkingArea(bool center)
@@ -1309,25 +1306,20 @@ try {
                 int maxClientWidth = Math.Max(1, maxOuterWidth - chromeWidth);
                 int maxClientHeight = Math.Max(1, maxOuterHeight - chromeHeight);
 
-                int designedWidth = U(588);
-                int designedHeight = U(810);
-                int compactHeight = designedHeight - U(200); // leaves a 96px console
-                consoleHeightReduction = Math.Min(
-                    U(200), Math.Max(0, designedHeight - maxClientHeight));
-                int contentHeight = designedHeight - consoleHeightReduction;
-
+                int designedWidth = U(1000);
+                int designedHeight = U(620);
                 bool needsScrolling =
-                    maxClientWidth < designedWidth || maxClientHeight < compactHeight;
+                    maxClientWidth < designedWidth || maxClientHeight < designedHeight;
                 AutoScroll = needsScrolling;
                 AutoScrollMinSize = needsScrolling
-                    ? new Size(designedWidth, compactHeight)
+                    ? new Size(designedWidth, designedHeight)
                     : Size.Empty;
 
                 MaximumSize = new Size(maxOuterWidth, maxOuterHeight);
                 ClientSize = new Size(
                     Math.Min(designedWidth, maxClientWidth),
-                    Math.Min(contentHeight, maxClientHeight));
-                ApplyFlexibleLayout();
+                    Math.Min(designedHeight, maxClientHeight));
+                ApplyLeftColumnStatusLayout();
 
                 if (center)
                 {
@@ -1448,14 +1440,14 @@ try {
             try { using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) { sc = g.DpiX / 96f; } }
             catch { sc = 1f; }
 
-            this.ClientSize = Z(588, 810);
+            this.ClientSize = Z(1000, 620);
             this.SuspendLayout();
 
             Label lblTitle = new Label();
             lblTitle.Text = "IPbind";
             lblTitle.Font = UiFont(16F, FontStyle.Bold);
             lblTitle.Location = P(20, 14);
-            lblTitle.Size = Z(548, 28);
+            lblTitle.Size = Z(470, 28);
             lblTitle.TextAlign = ContentAlignment.MiddleCenter;
             Controls.Add(lblTitle);
 
@@ -1463,20 +1455,20 @@ try {
             lblSub.Text = "Static IP Binder for accessing air-gapped automation equipment spread across multiple IP ranges";
             lblSub.Font = UiFont(9F, FontStyle.Italic);
             lblSub.Location = P(20, 46);
-            lblSub.Size = Z(548, 16);
+            lblSub.Size = Z(470, 34);
             lblSub.TextAlign = ContentAlignment.MiddleCenter;
             lblSub.ForeColor = Color.FromArgb(90, 90, 90);
             Controls.Add(lblSub);
 
             Label lblAdapter = new Label();
             lblAdapter.Text = "Select your LAN interface below:";
-            lblAdapter.Location = P(20, 78);
+            lblAdapter.Location = P(20, 88);
             lblAdapter.AutoSize = true;
             Controls.Add(lblAdapter);
 
             combo = new ComboBox();
-            combo.Location = P(20, 100);
-            combo.Size = Z(440, 24);
+            combo.Location = P(20, 110);
+            combo.Size = Z(370, 24);
             combo.DropDownStyle = ComboBoxStyle.DropDownList;
             combo.SelectedIndexChanged += delegate
             {
@@ -1485,41 +1477,41 @@ try {
             };
             Controls.Add(combo);
 
-            Button btnRefresh = MakeButton("Refresh", 468, 99, 100, 26);
+            Button btnRefresh = MakeButton("Refresh", 398, 109, 92, 26);
             btnRefresh.Click += delegate { LoadAdapters(); };
             Controls.Add(btnRefresh);
 
             chkAll = new CheckBox();
             chkAll.Text = "Show all adapters (include virtual / cellular / VPN)";
             chkAll.Font = UiFont(8F, FontStyle.Regular);
-            chkAll.Location = P(20, 128);
-            chkAll.Size = Z(420, 20);
+            chkAll.Location = P(20, 140);
+            chkAll.Size = Z(470, 20);
             chkAll.CheckedChanged += delegate { LoadAdapters(); };
             Controls.Add(chkAll);
 
             Label lblIPs = new Label();
             lblIPs.Text = "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
-            lblIPs.Location = P(20, 154);
-            lblIPs.AutoSize = true;
+            lblIPs.Location = P(20, 166);
+            lblIPs.Size = Z(470, 32);
             Controls.Add(lblIPs);
 
             txtIPs = new TextBox();
             txtIPs.Multiline = true;
             txtIPs.ScrollBars = ScrollBars.Vertical;
-            txtIPs.Location = P(20, 176);
-            txtIPs.Size = Z(548, 132);
+            txtIPs.Location = P(20, 202);
+            txtIPs.Size = Z(470, 140);
             txtIPs.Font = new Font("Consolas", 10F);
             Controls.Add(txtIPs);
 
-            Button btnSaveList = MakeButton("Save List", 20, 314, 178, 28);
+            Button btnSaveList = MakeButton("Save List", 20, 350, 150, 28);
             btnSaveList.Click += delegate { SaveList(false); };
             Controls.Add(btnSaveList);
 
-            Button btnRestore = MakeButton("Restore Defaults", 205, 314, 178, 28);
+            Button btnRestore = MakeButton("Restore Defaults", 180, 350, 150, 28);
             btnRestore.Click += delegate { RestoreDefaults(); };
             Controls.Add(btnRestore);
 
-            Button btnShow = MakeButton("Show Current", 390, 314, 178, 28);
+            Button btnShow = MakeButton("Show Current", 340, 350, 150, 28);
             btnShow.Click += delegate
             {
                 string a = GetSelectedAlias();
@@ -1528,7 +1520,7 @@ try {
             };
             Controls.Add(btnShow);
 
-            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 350, 272, 60);
+            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 386, 230, 64);
             btnBind.Font = UiFont(12F, FontStyle.Bold);
             btnBind.BackColor = Color.FromArgb(46, 125, 50);
             btnBind.ForeColor = Color.White;
@@ -1543,7 +1535,7 @@ try {
             };
             Controls.Add(btnBind);
 
-            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 298, 350, 270, 60);
+            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 260, 386, 230, 64);
             btnDhcp.Font = UiFont(12F, FontStyle.Bold);
             btnDhcp.BackColor = Color.FromArgb(25, 90, 160);
             btnDhcp.ForeColor = Color.White;
@@ -1561,19 +1553,19 @@ try {
             lblStatus = new Label();
             lblStatus.Text = "Ready.";
             lblStatus.Font = UiFont(10F, FontStyle.Bold);
-            lblStatus.Location = P(20, 418);
-            lblStatus.Size = Z(548, 22);
+            lblStatus.Location = P(20, 464);
+            lblStatus.Size = Z(470, 42);
             lblStatus.TextAlign = ContentAlignment.MiddleCenter;
             lblStatus.ForeColor = Color.FromArgb(60, 60, 60);
             Controls.Add(lblStatus);
 
             Label lblConsole = new Label();
             lblConsole.Text = "Console output:";
-            lblConsole.Location = P(20, 444);
+            lblConsole.Location = P(510, 18);
             lblConsole.AutoSize = true;
             Controls.Add(lblConsole);
 
-            Button btnClear = MakeButton("Clear", 488, 440, 80, 24);
+            Button btnClear = MakeButton("Clear", 900, 14, 80, 24);
             btnClear.Click += delegate { console.Clear(); };
             Controls.Add(btnClear);
 
@@ -1581,41 +1573,41 @@ try {
             console.Multiline = true;
             console.ScrollBars = ScrollBars.Vertical;
             console.ReadOnly = true;
-            console.Location = P(20, 468);
-            console.Size = Z(548, 296);
+            console.Location = P(510, 44);
+            console.Size = Z(470, 526);
             console.Font = new Font("Consolas", 9F);
             console.BackColor = Color.FromArgb(18, 18, 18);
             console.ForeColor = Color.FromArgb(210, 210, 210);
             Controls.Add(console);
 
             updateBanner = new Panel();
-            updateBanner.Location = P(20, 730);
-            updateBanner.Size = Z(548, 38);
+            updateBanner.Location = P(20, 458);
+            updateBanner.Size = Z(470, 42);
             updateBanner.BorderStyle = BorderStyle.FixedSingle;
             updateBanner.BackColor = Color.FromArgb(245, 247, 250);
             updateBanner.Visible = false;
 
             lblUpdateBanner = new Label();
-            lblUpdateBanner.Location = P(8, 6);
-            lblUpdateBanner.Size = Z(326, 24);
+            lblUpdateBanner.Location = P(8, 7);
+            lblUpdateBanner.Size = Z(244, 26);
             lblUpdateBanner.TextAlign = ContentAlignment.MiddleLeft;
             lblUpdateBanner.AutoEllipsis = true;
             updateBanner.Controls.Add(lblUpdateBanner);
 
-            btnUpdateNow = MakeButton("Update", 340, 5, 96, 26);
+            btnUpdateNow = MakeButton("Update", 258, 7, 96, 26);
             btnUpdateNow.Click += InstallUpdateFromBanner;
             updateBanner.Controls.Add(btnUpdateNow);
 
-            btnUpdateLater = MakeButton("Later", 442, 5, 96, 26);
+            btnUpdateLater = MakeButton("Later", 360, 7, 96, 26);
             btnUpdateLater.Click += DismissUpdateBanner;
             updateBanner.Controls.Add(btnUpdateLater);
             Controls.Add(updateBanner);
 
-            btnAbout = MakeButton("About", 20, 774, 96, 26);
+            btnAbout = MakeButton("About", 510, 580, 96, 26);
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
-                using (AboutForm about = new AboutForm(this, dark))
+                using (AboutForm about = new AboutForm(this, dark, sc))
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);
@@ -1625,7 +1617,7 @@ try {
             lblVersion.Font = UiFont(8F, FontStyle.Regular);
             lblVersion.AutoSize = false;
             lblVersion.TextAlign = ContentAlignment.MiddleRight;
-            lblVersion.Location = P(408, 778);
+            lblVersion.Location = P(820, 584);
             lblVersion.Size = Z(160, 20);
             lblVersion.ForeColor = Color.FromArgb(120, 120, 120);
             Controls.Add(lblVersion);
