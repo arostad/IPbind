@@ -60,6 +60,21 @@ Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postin
 var
   RemoveAppDataCheckBox: TNewCheckBox;
 
+function RemoveDataCommandLineRequested: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(I), '/REMOVEDATA=1') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
 procedure InitializeUninstallProgressForm;
 begin
   RemoveAppDataCheckBox := TNewCheckBox.Create(UninstallProgressForm);
@@ -72,14 +87,14 @@ begin
   RemoveAppDataCheckBox.Height := ScaleY(34);
   RemoveAppDataCheckBox.Caption :=
     'Remove all application data (saved IP lists, settings, and update cache)';
-  RemoveAppDataCheckBox.Checked := False;
+  RemoveAppDataCheckBox.Checked := RemoveDataCommandLineRequested;
   RemoveAppDataCheckBox.Visible := not UninstallSilent;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and
-     (not UninstallSilent) and RemoveAppDataCheckBox.Checked then
+     RemoveAppDataCheckBox.Checked then
   begin
     DelTree(ExpandConstant('{userappdata}\IPbind'), True, True, True);
     DelTree(ExpandConstant('{localappdata}\IPbind'), True, True, True);
