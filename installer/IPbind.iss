@@ -55,3 +55,38 @@ Name: "{userdesktop}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postinstall skipifsilent
+
+[Code]
+var
+  RemoveAppDataCheckBox: TNewCheckBox;
+
+procedure InitializeUninstallProgressForm;
+begin
+  RemoveAppDataCheckBox := TNewCheckBox.Create(UninstallProgressForm);
+  RemoveAppDataCheckBox.Parent := UninstallProgressForm;
+  RemoveAppDataCheckBox.Left := UninstallProgressForm.ProgressBar.Left;
+  RemoveAppDataCheckBox.Top :=
+    UninstallProgressForm.ProgressBar.Top +
+    UninstallProgressForm.ProgressBar.Height + ScaleY(8);
+  RemoveAppDataCheckBox.Width := UninstallProgressForm.ProgressBar.Width;
+  RemoveAppDataCheckBox.Height := ScaleY(34);
+  RemoveAppDataCheckBox.Caption :=
+    'Remove all application data (saved IP lists, settings, and update cache)';
+  RemoveAppDataCheckBox.Checked := False;
+  RemoveAppDataCheckBox.Visible := not UninstallSilent;
+
+  UninstallProgressForm.ClientHeight :=
+    UninstallProgressForm.ClientHeight + ScaleY(42);
+  UninstallProgressForm.CancelButton.Top :=
+    UninstallProgressForm.CancelButton.Top + ScaleY(42);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if (CurUninstallStep = usPostUninstall) and
+     (not UninstallSilent) and RemoveAppDataCheckBox.Checked then
+  begin
+    DelTree(ExpandConstant('{userappdata}\IPbind'), True, True, True);
+    DelTree(ExpandConstant('{localappdata}\IPbind'), True, True, True);
+  end;
+end;

@@ -8,7 +8,7 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.111**.
+Current version: **2.3.112**.
 
 ## Download
 
