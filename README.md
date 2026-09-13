@@ -8,10 +8,14 @@ App carefully directed by [Andy Rostad](https://github.com/arostad).  Released u
 
 <br clear="all">
 
-Current version: **2.3.107**.
+Current version: **2.3.108**.
 
 ## Download
 
 [**Download IPbind.exe**](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
 
 GitHub Actions rebuilds this download on every push to `main`.
+
+### Installer
+
+The portable Latest executable remains the primary download. A per-user Windows installer is available on request through the manual **Build installer** workflow artifact.
