@@ -789,9 +789,10 @@ namespace IPbind
             Label version = MakeLabel(
                 "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
             Label tagline = MakeLabel(
-                "One-click Static IP Binder for easily\r\n" +
-                "accessing air-gapped equipment\r\n" +
-                "spread across multiple IP ranges",
+                "\r\n\r\n" +
+                "One-click Static IP Binder for easily accessing\r\n" +
+                "air-gapped equipment spread across multiple IP ranges" +
+                "\r\n\r\n",
                 9F, FontStyle.Regular, 24, 94, 382, 58);
 
             LinkLabel directed = MakeLink(
