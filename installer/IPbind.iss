@@ -54,8 +54,9 @@ Name: "{userprograms}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
 Name: "{userdesktop}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
 
 [Run]
-; requireAdministrator exe; ShellExecute so UAC can prompt from unelevated Setup
-Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postinstall skipifsilent shellexecute
+; Verb: open + shellexec = ShellExecute so UAC can prompt from unelevated Setup
+; (Inno Setup 6.7 renamed the old shellexecute flag to shellexec)
+Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postinstall skipifsilent shellexec; Verb: open
 
 [Code]
 var
