@@ -10,7 +10,9 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 <br>
+
 Current version: **2.3.113**
+
 ## Download
 
 ### [Download Installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
