@@ -22,7 +22,7 @@
 #>
 
 # ==============================================================
-$Version = '2.3.114'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.115'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition

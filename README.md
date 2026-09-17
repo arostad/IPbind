@@ -10,7 +10,7 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.114**
+Current version: **2.3.115**
 
 ## Download
 
