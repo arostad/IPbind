@@ -16,7 +16,7 @@ Current version: **2.3.116**
 
 ### [Download installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
 
-The installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
+The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
 
 Prefer a single file? [Download the portable version](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
 
