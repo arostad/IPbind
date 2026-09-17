@@ -836,6 +836,7 @@ namespace IPbind
                 checkButton.FlatStyle = FlatStyle.Flat;
                 checkButton.BackColor = Color.FromArgb(50, 50, 50);
                 checkButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                statusLabel.BackColor = BackColor;
                 statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
             }
         }
