@@ -25,3 +25,7 @@ Prefer a single file? [Download the portable version](https://github.com/arostad
 <p align="center">
   <img src="screenshots/ipbind-main.png" alt="IPbind main window — LAN interface selector, static IP list, and console output in dark mode" width="920">
 </p>
+
+## Privacy
+
+IPbind is meant to stay out of your way on privacy. It does not ask you to sign in, and it does not upload your address list, adapter choices, or anything that identifies this computer. What you configure stays in your Windows user profile. The only network call for stats is an update check (at launch or from About), which asks for the latest version number. That check can bump a simple daily count by country so I can see rough usage; the connection's IP address and browser-style user-agent are not stored. When an update is available, the file itself downloads from GitHub Releases. Binding or reverting addresses is a local `netsh` action on your machine and does not phone home.
