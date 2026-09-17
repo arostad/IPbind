@@ -9,7 +9,6 @@ A compiled .NET WinForms tool that binds a set of static IPv4 addresses (no gate
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 
 <br clear="all">
-<br>
 
 Current version: **2.3.113**
 
