@@ -1752,6 +1752,47 @@ namespace IPbind
             }
         }
 
+        // Draw the closed field ourselves so Windows does not paint the selected
+        // adapter with the system highlight merely because the ComboBox has focus.
+        // The open list still highlights its active row so keyboard/mouse selection
+        // remains obvious.
+        void DrawAdapterItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Bounds.Width <= 0 || e.Bounds.Height <= 0) return;
+
+            bool editField = (e.State & DrawItemState.ComboBoxEdit) != 0;
+            bool selectedListItem =
+                combo.DroppedDown && !editField && (e.State & DrawItemState.Selected) != 0;
+
+            Color back = combo.BackColor;
+            Color fore = combo.ForeColor;
+            if (selectedListItem)
+            {
+                back = dark ? Color.FromArgb(70, 70, 70) : SystemColors.Highlight;
+                fore = dark ? FgCol : SystemColors.HighlightText;
+            }
+            else if ((e.State & DrawItemState.Disabled) != 0)
+            {
+                fore = dark ? SubCol : SystemColors.GrayText;
+            }
+
+            using (SolidBrush brush = new SolidBrush(back))
+                e.Graphics.FillRectangle(brush, e.Bounds);
+
+            string text =
+                e.Index >= 0 && e.Index < combo.Items.Count
+                    ? combo.Items[e.Index].ToString()
+                    : combo.Text;
+            Rectangle textBounds = new Rectangle(
+                e.Bounds.X + U(3), e.Bounds.Y,
+                Math.Max(0, e.Bounds.Width - U(6)), e.Bounds.Height);
+            TextRenderer.DrawText(
+                e.Graphics, text, combo.Font, textBounds, fore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                TextFormatFlags.NoPadding);
+        }
+
         // Detect the OS theme and, if dark, recolor the controls. Light mode is left
         // exactly as designed. Called at the end of BuildUi.
         void ApplyTheme()
@@ -1872,6 +1913,10 @@ namespace IPbind
             combo.Location = P(20, 94);
             combo.Size = Z(420, 24);
             combo.DropDownStyle = ComboBoxStyle.DropDownList;
+            combo.DrawMode = DrawMode.OwnerDrawFixed;
+            combo.DrawItem += DrawAdapterItem;
+            combo.DropDown += delegate { combo.Invalidate(); };
+            combo.DropDownClosed += delegate { combo.Invalidate(); };
             combo.SelectedIndexChanged += delegate
             {
                 string a = GetSelectedAlias();
