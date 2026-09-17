@@ -764,15 +764,37 @@ namespace IPbind
         }
     }
 
+    static class WindowTheme
+    {
+        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
+
+        // Tint a form's non-client title bar after its handle has been created.
+        public static void ApplyTitleBar(Form form, bool dark)
+        {
+            try
+            {
+                int on = dark ? 1 : 0;
+                // attribute 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/Win11);
+                // older builds used 19, so fall back to it.
+                if (DwmSetWindowAttribute(form.Handle, 20, ref on, 4) != 0)
+                    DwmSetWindowAttribute(form.Handle, 19, ref on, 4);
+            }
+            catch { }
+        }
+    }
+
     sealed class AboutForm : Form
     {
         readonly Button checkButton;
         readonly Label statusLabel;
         readonly float sc;
+        readonly bool dark;
         UpdateInfo availableUpdate;
 
         public AboutForm(Form owner, bool dark, float scale)
         {
+            this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = "About IPbind";
             Font = new Font("Segoe UI", 9F);
@@ -839,6 +861,12 @@ namespace IPbind
                 statusLabel.BackColor = BackColor;
                 statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
             }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            WindowTheme.ApplyTitleBar(this, dark);
         }
 
         int U(int value) { return (int)Math.Round(value * sc); }
@@ -1594,9 +1622,6 @@ namespace IPbind
         Font UiFont(float pt, FontStyle style) { return new Font("Segoe UI", pt, style); }
 
         // ---------------- dark mode ----------------
-        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
-        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
-
         // Themes a control's scrollbars/borders. "DarkMode_Explorer" gives dark scrollbars.
         [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
         static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subId);
@@ -1618,25 +1643,10 @@ namespace IPbind
             return false;
         }
 
-        // Tint the title bar. Must run after the handle exists, so it's called from
-        // OnHandleCreated (not BuildUi - forcing the handle early breaks CenterScreen).
-        void ApplyTitleBar()
-        {
-            try
-            {
-                int on = dark ? 1 : 0;
-                // attribute 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/Win11);
-                // older builds used 19, so fall back to it.
-                if (DwmSetWindowAttribute(this.Handle, 20, ref on, 4) != 0)
-                    DwmSetWindowAttribute(this.Handle, 19, ref on, 4);
-            }
-            catch { }
-        }
-
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            ApplyTitleBar();
+            WindowTheme.ApplyTitleBar(this, dark);
         }
 
         protected override void OnShown(EventArgs e)
