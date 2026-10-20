@@ -112,7 +112,7 @@ namespace IPbind
     static class UpdateChecker
     {
         const string WorkerVersionUrl =
-            "https://ipbind-update-pings.andy-s-account-376.workers.dev/version.txt";
+            "https://ipbind-update-pings.dataspike.workers.dev/version.txt";
         const string VersionUrl =
             "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
         const string ExeUrl =
@@ -127,7 +127,7 @@ namespace IPbind
         static readonly HashSet<string> TrustedDownloadHosts =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
-                "ipbind-update-pings.andy-s-account-376.workers.dev",
+                "ipbind-update-pings.dataspike.workers.dev",
                 "github.com",
                 "objects.githubusercontent.com",
                 "release-assets.githubusercontent.com"
