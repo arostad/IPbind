@@ -35,6 +35,7 @@ SetupIconFile=..\app.ico
 UninstallDisplayName=IPbind
 UninstallDisplayIcon={app}\IPbind.exe
 LicenseFile=..\LICENSE
+InfoBeforeFile=privacy.txt
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -44,6 +45,15 @@ RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+WizardInfoBefore=IPbind privacy
+InfoBeforeLabel=Please read how IPbind uses the network before continuing.
+
+[Tasks]
+; Checked by default (also for silent installs). On upgrade, Inno restores the
+; previous choice (UsePreviousTasks=yes is the default). Saved to update-check.txt.
+Name: "autoupdatecheck"; Description: "Check for updates at launch"; GroupDescription: "Updates (when off, check manually from About):"
 
 [Files]
 Source: "{#ExePath}"; DestDir: "{app}"; DestName: "IPbind.exe"; Flags: ignoreversion
@@ -74,6 +84,24 @@ begin
       Result := True;
       Exit;
     end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  SettingsDir: String;
+  Mode: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    SettingsDir := ExpandConstant('{userappdata}\IPbind');
+    if WizardIsTaskSelected('autoupdatecheck') then
+      Mode := 'auto'
+    else
+      Mode := 'manual';
+    if not ForceDirectories(SettingsDir) or
+       not SaveStringToFile(SettingsDir + '\update-check.txt', Mode, False) then
+      Log('Could not save update-check.txt in ' + SettingsDir);
   end;
 end;
 
