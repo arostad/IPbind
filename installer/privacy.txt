@@ -1,0 +1,3 @@
+IPbind privacy
+
+IPbind does not upload your address list, adapter choices, or anything that identifies your computer. Your configuration stays in your Windows user profile. The only network call is an update check (at launch or from About), which asks for the latest version number. That check bumps a simple daily update check count by country so I can see rough usage; the connection's IP address and user-agent are not stored. When an update is available, the file downloads directly from the IPbind GitHub repository. Binding or reverting addresses is a local netsh action on your machine and does not phone home.
