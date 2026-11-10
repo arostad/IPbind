@@ -1028,6 +1028,7 @@ namespace IPbind
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IPbind");
         readonly string StoreFile;
         readonly string AdapterFile;
+        readonly string UpdateCheckFile;
 
         float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
 
@@ -1056,6 +1057,7 @@ namespace IPbind
         {
             StoreFile = Path.Combine(AppDir, "ip-list.txt");
             AdapterFile = Path.Combine(AppDir, "adapter.txt");
+            UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
             BuildUi();
             LoadAdapters();
             LoadList();
@@ -1181,6 +1183,21 @@ namespace IPbind
 
         void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); }
         string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
+
+        // update-check.txt is written by the installer: "auto" (default) or "manual".
+        // Only an explicit "manual" turns off the launch check; a missing or unreadable
+        // file keeps automatic checks, so portable copies behave as before. Manual
+        // checks from About always work.
+        bool LaunchUpdateCheckEnabled()
+        {
+            try
+            {
+                if (!File.Exists(UpdateCheckFile)) return true;
+                string mode = File.ReadAllText(UpdateCheckFile).Trim();
+                return !string.Equals(mode, "manual", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return true; }
+        }
 
         void LoadAdapters()
         {
@@ -1544,6 +1561,7 @@ namespace IPbind
         {
             if (launchUpdateCheckStarted) return;
             launchUpdateCheckStarted = true;
+            if (!LaunchUpdateCheckEnabled()) return;   // user chose manual-only updates
             Thread thread = new Thread(delegate()
             {
                 UpdateInfo info;
