@@ -1252,6 +1252,22 @@ namespace IPbind
             "192.168.4.98/24",  "192.168.255.98/24"
         };
 
+        // Every default list IPbind has shipped before the current DefaultIPs (from
+        // git history). A saved list that still equals one of these exactly was never
+        // edited, so it is upgraded to the current defaults on launch. ADD the old
+        // DefaultIPs here whenever the defaults change.
+        static readonly string[][] PreviousDefaultSets = new string[][] {
+            // 2.3.117 and earlier (all prod releases before 2.3.119)
+            new string[] {
+                "10.255.255.98/24", "10.255.128.98/24", "192.168.0.98/24",
+                "192.168.1.98/24",  "192.168.4.98/24",  "192.168.255.98/24" },
+            // briefly on the 2.3.118 development branch (never in a release)
+            new string[] {
+                "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
+                "192.168.0.98/24",  "192.168.1.98/24",  "192.168.4.98/24",
+                "192.168.255.98/24" }
+        };
+
         static readonly Regex CidrRe =
             new Regex(@"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*(/\s*(\d{1,2}))?\s*$");
         static readonly Regex VirtualRe =
@@ -1296,6 +1312,8 @@ namespace IPbind
             LoadAdapters();
             LoadList();
             Log(BuildInfo.AppName + " v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            if (defaultsUpgraded)
+                Log("Default address list updated to the latest defaults.", "INFO");
             if (BuildInfo.IsBeta)
                 Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
         }
@@ -1376,6 +1394,55 @@ namespace IPbind
             if (!quiet) Log("Saved " + lines.Length + " address(es) to disk.", "OK");
         }
 
+        // BEGIN DefaultsUpgrade (self-contained; exercised by a host-side test)
+        // Order-, case- and whitespace-insensitive key for one saved line; CIDR entries
+        // are canonicalised exactly like TryCidr (missing prefix = /24).
+        static string DefaultsKey(string line)
+        {
+            string t = (line ?? "").Trim();
+            if (t.Length == 0) return null;
+            Match m = CidrRe.Match(t);
+            if (m.Success)
+            {
+                int[] o = new int[4];
+                bool ok = true;
+                for (int i = 0; i < 4; i++)
+                {
+                    o[i] = int.Parse(m.Groups[i + 1].Value);
+                    if (o[i] > 255) ok = false;
+                }
+                int prefix = m.Groups[6].Success ? int.Parse(m.Groups[6].Value) : 24;
+                if (ok && prefix >= 0 && prefix <= 32)
+                    return o[0] + "." + o[1] + "." + o[2] + "." + o[3] + "/" + prefix;
+            }
+            return Regex.Replace(t, @"\s+", "").ToLowerInvariant();
+        }
+
+        static HashSet<string> DefaultsKeySet(IEnumerable<string> lines)
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string l in lines)
+            {
+                string k = DefaultsKey(l);
+                if (k != null) set.Add(k);
+            }
+            return set;
+        }
+
+        // True only when the saved list is exactly an earlier shipped default list
+        // (never edited) and differs from the current defaults.
+        static bool IsUneditedOldDefaults(IEnumerable<string> saved, string[] current, string[][] previous)
+        {
+            HashSet<string> have = DefaultsKeySet(saved);
+            if (have.Count == 0 || have.SetEquals(DefaultsKeySet(current))) return false;
+            foreach (string[] old in previous)
+                if (have.SetEquals(DefaultsKeySet(old))) return true;
+            return false;
+        }
+        // END DefaultsUpgrade
+
+        bool defaultsUpgraded;
+
         void LoadList()
         {
             if (File.Exists(StoreFile))
@@ -1386,7 +1453,18 @@ namespace IPbind
                     string t = (l ?? "").Trim();
                     if (t.Length > 0) lines.Add(t);
                 }
-                if (lines.Count > 0) { txtIPs.Lines = lines.ToArray(); return; }
+                if (lines.Count > 0)
+                {
+                    if (IsUneditedOldDefaults(lines, DefaultIPs, PreviousDefaultSets))
+                    {
+                        txtIPs.Lines = DefaultIPs;
+                        SaveList(true);
+                        defaultsUpgraded = true;   // logged after the startup line
+                        return;
+                    }
+                    txtIPs.Lines = lines.ToArray();
+                    return;
+                }
             }
             txtIPs.Lines = DefaultIPs;
             SaveList(true);
