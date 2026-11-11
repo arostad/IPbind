@@ -795,9 +795,12 @@ namespace IPbind
         readonly float sc;
         readonly bool dark;
         UpdateInfo availableUpdate;
+        readonly string updateCheckFile;
+        readonly LinkLabel enableLaunchLink;
 
-        public AboutForm(Form owner, bool dark, float scale)
+        public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
+            this.updateCheckFile = updateCheckFile;
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = "About " + BuildInfo.AppName;
@@ -808,7 +811,9 @@ namespace IPbind
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = Z(430, 360);
+            // Taller only while the "turn on" link is shown (update-check.txt = manual).
+            bool manualOnly = !ReadLaunchCheckEnabled();
+            ClientSize = Z(430, manualOnly ? 388 : 360);
             try { Icon = owner.Icon; } catch { }
 
             Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
@@ -834,7 +839,19 @@ namespace IPbind
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
-            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 292, 382, 48);
+            // Only offered when the user chose manual updates (installer task unticked).
+            // There is deliberately no way to turn automatic checks off from here.
+            enableLaunchLink = new LinkLabel();
+            enableLaunchLink.Text = "Turn on automatic update checks…";
+            enableLaunchLink.Location = P(24, 296);
+            enableLaunchLink.Size = Z(382, 22);
+            enableLaunchLink.TextAlign = ContentAlignment.MiddleCenter;
+            enableLaunchLink.LinkColor = Color.FromArgb(25, 90, 160);
+            enableLaunchLink.Visible = manualOnly;
+            enableLaunchLink.LinkClicked += EnableLaunchChecks;
+
+            statusLabel = MakeLabel(
+                "", 8.5F, FontStyle.Regular, 24, manualOnly ? 324 : 292, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
@@ -843,6 +860,7 @@ namespace IPbind
             Controls.Add(source);
             Controls.Add(license);
             Controls.Add(checkButton);
+            Controls.Add(enableLaunchLink);
             Controls.Add(statusLabel);
 
             if (dark)
@@ -876,6 +894,48 @@ namespace IPbind
         int U(int value) { return (int)Math.Round(value * sc); }
         Point P(int x, int y) { return new Point(U(x), U(y)); }
         Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        bool ReadLaunchCheckEnabled()
+        {
+            try
+            {
+                if (!File.Exists(updateCheckFile)) return true;
+                return !string.Equals(
+                    File.ReadAllText(updateCheckFile).Trim(), "manual", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return true; }
+        }
+
+        bool WriteLaunchCheckMode(string mode)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(updateCheckFile);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(updateCheckFile, mode);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "Could not save the update setting: " + ex.Message;
+                return false;
+            }
+        }
+
+        // Consent first: the same privacy text the installer shows. "I Agree" saves
+        // "auto" and removes the link immediately; Cancel changes nothing.
+        void EnableLaunchChecks(object sender, LinkLabelLinkClickedEventArgs e)
+        {
+            bool agreed;
+            using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
+                agreed = consent.ShowDialog(this) == DialogResult.OK;
+            if (!agreed || !WriteLaunchCheckMode("auto")) return;
+
+            enableLaunchLink.Visible = false;
+            statusLabel.Location = P(24, 292);
+            ClientSize = Z(430, 360);
+            statusLabel.Text = "Updates will now be checked at launch.";
+        }
 
         Label MakeLabel(
             string text, float size, FontStyle style, int x, int y, int width, int height)
@@ -1009,6 +1069,107 @@ namespace IPbind
             });
             thread.IsBackground = true;
             thread.Start();
+        }
+    }
+
+    // Shows the installer's privacy text (installer/privacy.txt, embedded at build
+    // time as IPbind.privacy.txt so both are identical). "I Agree" returns OK.
+    sealed class PrivacyConsentForm : Form
+    {
+        readonly float sc;
+        readonly bool dark;
+
+        public PrivacyConsentForm(bool dark, float scale)
+        {
+            this.dark = dark;
+            sc = scale > 0f ? scale : 1f;
+            Text = BuildInfo.AppName + " privacy";
+            Font = new Font("Segoe UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = Z(520, 400);
+
+            Label intro = new Label();
+            intro.Text = "Please read how " + BuildInfo.AppName + " uses the network before turning on update checks at launch.";
+            intro.Location = P(16, 12);
+            intro.Size = Z(488, 40);
+            intro.TextAlign = ContentAlignment.MiddleLeft;
+
+            TextBox text = new TextBox();
+            text.Multiline = true;
+            text.ReadOnly = true;
+            text.WordWrap = true;
+            text.ScrollBars = ScrollBars.Vertical;
+            text.Location = P(16, 58);
+            text.Size = Z(488, 282);
+            text.Text = ReadPrivacyText();
+            text.TabStop = false;
+
+            Button agree = new Button();
+            agree.Text = "I Agree";
+            agree.DialogResult = DialogResult.OK;
+            agree.Location = P(300, 354);
+            agree.Size = Z(100, 32);
+
+            Button cancel = new Button();
+            cancel.Text = "Cancel";
+            cancel.DialogResult = DialogResult.Cancel;
+            cancel.Location = P(406, 354);
+            cancel.Size = Z(98, 32);
+            CancelButton = cancel;
+
+            Controls.Add(intro);
+            Controls.Add(text);
+            Controls.Add(agree);
+            Controls.Add(cancel);
+
+            if (dark)
+            {
+                BackColor = Color.FromArgb(32, 32, 32);
+                ForeColor = Color.FromArgb(230, 230, 230);
+                intro.ForeColor = ForeColor;
+                text.BackColor = Color.FromArgb(24, 24, 24);
+                text.ForeColor = ForeColor;
+                text.BorderStyle = BorderStyle.FixedSingle;
+                foreach (Button b in new Button[] { agree, cancel })
+                {
+                    b.FlatStyle = FlatStyle.Flat;
+                    b.BackColor = Color.FromArgb(50, 50, 50);
+                    b.ForeColor = ForeColor;
+                    b.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                }
+            }
+            Shown += delegate { cancel.Focus(); text.Select(0, 0); };
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            WindowTheme.ApplyTitleBar(this, dark);
+        }
+
+        int U(int value) { return (int)Math.Round(value * sc); }
+        Point P(int x, int y) { return new Point(U(x), U(y)); }
+        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        static string ReadPrivacyText()
+        {
+            try
+            {
+                using (Stream s = typeof(PrivacyConsentForm).Assembly
+                    .GetManifestResourceStream("IPbind.privacy.txt"))
+                {
+                    if (s != null)
+                        using (StreamReader r = new StreamReader(s, Encoding.UTF8, true))
+                            return r.ReadToEnd().Replace("\r\n", "\n").Replace("\n", "\r\n").Trim();
+                }
+            }
+            catch { }
+            return "The privacy notice could not be loaded. See the Privacy section at https://github.com/arostad/IPbind";
         }
     }
 
@@ -2466,7 +2627,7 @@ namespace IPbind
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
-                using (AboutForm about = new AboutForm(this, dark, sc))
+                using (AboutForm about = new AboutForm(this, dark, sc, UpdateCheckFile))
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);

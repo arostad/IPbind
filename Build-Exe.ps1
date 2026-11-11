@@ -117,6 +117,10 @@ $cscArgs = @(
 )
 if (Test-Path $ico) { $cscArgs = @("/win32icon:$ico", "/resource:$ico,IPbind.app.ico") + $cscArgs }
 else { Write-Warning 'app.ico not found in this folder - the exe (and its window/taskbar icon) will use the default icon.' }
+# Embedded so About's consent dialog shows exactly the installer's privacy page.
+$privacy = Join-Path $here 'installer\privacy.txt'
+if (-not (Test-Path $privacy)) { Write-Error "Missing $privacy"; return }
+$cscArgs = @("/resource:$privacy,IPbind.privacy.txt") + $cscArgs
 
 Write-Host 'Compiling ...' -ForegroundColor Cyan
 & $csc @cscArgs
