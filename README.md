@@ -10,11 +10,11 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.121**
+Current version: **2.3.120**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.121.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.121.exe)
+### Download installer: [IPbind-Installer-v2.3.120.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.120.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
 
