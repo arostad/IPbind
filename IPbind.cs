@@ -797,6 +797,9 @@ namespace IPbind
         UpdateInfo availableUpdate;
         readonly string updateCheckFile;
         readonly LinkLabel enableLaunchLink;
+        readonly CheckBox launchCheckBox;
+        readonly bool portableCopy;
+        bool settingLaunchCheck;
 
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
@@ -811,9 +814,14 @@ namespace IPbind
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            // Taller only while the "turn on" link is shown (update-check.txt = manual).
-            bool manualOnly = !ReadLaunchCheckEnabled();
-            ClientSize = Z(430, manualOnly ? 388 : 360);
+            // Installed copies: a "turn on" link only while update-check.txt = manual.
+            // Portable copies: a "Check for updates at launch" checkbox, always shown.
+            // The form is taller only while one of the two is shown.
+            portableCopy = !IsInstalledCopy();
+            bool launchEnabled = ReadLaunchCheckEnabled();
+            bool manualOnly = !portableCopy && !launchEnabled;
+            bool showRow = portableCopy || manualOnly;
+            ClientSize = Z(430, showRow ? 388 : 360);
             try { Icon = owner.Icon; } catch { }
 
             Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
@@ -839,8 +847,8 @@ namespace IPbind
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
-            // Only offered when the user chose manual updates (installer task unticked).
-            // There is deliberately no way to turn automatic checks off from here.
+            // Installed copies: only offered when the user chose manual updates
+            // (installer task unticked); there is no way to turn checks off here.
             enableLaunchLink = new LinkLabel();
             enableLaunchLink.Text = "Turn on automatic update checks…";
             enableLaunchLink.Location = P(24, 296);
@@ -850,8 +858,15 @@ namespace IPbind
             enableLaunchLink.Visible = manualOnly;
             enableLaunchLink.LinkClicked += EnableLaunchChecks;
 
+            launchCheckBox = new CheckBox();
+            launchCheckBox.Text = "Check for updates at launch";
+            launchCheckBox.AutoSize = true;
+            launchCheckBox.Checked = launchEnabled;
+            launchCheckBox.Visible = portableCopy;
+            launchCheckBox.CheckedChanged += LaunchCheckChanged;
+
             statusLabel = MakeLabel(
-                "", 8.5F, FontStyle.Regular, 24, manualOnly ? 324 : 292, 382, 48);
+                "", 8.5F, FontStyle.Regular, 24, showRow ? 324 : 292, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
@@ -861,7 +876,11 @@ namespace IPbind
             Controls.Add(license);
             Controls.Add(checkButton);
             Controls.Add(enableLaunchLink);
+            Controls.Add(launchCheckBox);
             Controls.Add(statusLabel);
+            // Centre the auto-sized checkbox under the button (device pixels).
+            launchCheckBox.Location = new Point(
+                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(296));
 
             if (dark)
             {
@@ -922,7 +941,58 @@ namespace IPbind
             }
         }
 
-        // Consent first: the same privacy text the installer shows. "I Agree" saves
+        // Installed = Inno Setup's uninstaller (unins*.exe + unins*.dat) sits next to
+        // the running exe. Every installed copy (prod or beta, any version) has it,
+        // the in-app updater never touches it, and portable copies never do.
+        static bool IsInstalledCopy()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
+                if (string.IsNullOrEmpty(dir)) return false;
+                foreach (string dat in Directory.GetFiles(dir, "unins*.dat"))
+                    if (File.Exists(Path.ChangeExtension(dat, ".exe"))) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        void SetLaunchCheckSilently(bool value)
+        {
+            settingLaunchCheck = true;
+            try { launchCheckBox.Checked = value; }
+            finally { settingLaunchCheck = false; }
+        }
+
+        // Portable checkbox: turning checks ON needs consent to the installer's
+        // privacy text (Cancel reverts); turning them OFF saves "manual" at once.
+        void LaunchCheckChanged(object sender, EventArgs e)
+        {
+            if (settingLaunchCheck) return;
+            if (launchCheckBox.Checked)
+            {
+                bool agreed;
+                using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
+                    agreed = consent.ShowDialog(this) == DialogResult.OK;
+                if (!agreed || !WriteLaunchCheckMode("auto"))
+                {
+                    SetLaunchCheckSilently(false);
+                    return;
+                }
+                statusLabel.Text = "Updates will now be checked at launch.";
+            }
+            else
+            {
+                if (!WriteLaunchCheckMode("manual"))
+                {
+                    SetLaunchCheckSilently(true);
+                    return;
+                }
+                statusLabel.Text = "Automatic update checks are off. Use Check for updates any time.";
+            }
+        }
+
+        // Installed link. Consent first: the same privacy text the installer shows. "I Agree" saves
         // "auto" and removes the link immediately; Cancel changes nothing.
         void EnableLaunchChecks(object sender, LinkLabelLinkClickedEventArgs e)
         {
