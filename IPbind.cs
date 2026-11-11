@@ -1,8 +1,9 @@
 // IPbind - Static IP Binder for accessing air-gapped industrial automation systems
 // A genuine compiled .NET WinForms application (no script wrapper).
-// Binds multiple static IPv4 addresses (no gateway/DNS) to a chosen LAN interface for
-// reaching air-gapped equipment web GUIs across different IP ranges, with one-click
-// DHCP revert. Local network configuration is the app's purpose; update checks are the
+// Binds multiple static IPv4 addresses to a chosen LAN interface for reaching
+// air-gapped equipment web GUIs across different IP ranges, with one-click DHCP revert.
+// By default no gateway or DNS is set; optional Gateway support adds a gateway (with a
+// high route metric) and DNS servers for one chosen address. Local network configuration is the app's purpose; update checks are the
 // only intentional outbound internet traffic.
 //
 // DPI handling: the layout is scaled explicitly in code from the real device DPI read
@@ -1029,12 +1030,28 @@ namespace IPbind
         readonly string StoreFile;
         readonly string AdapterFile;
         readonly string UpdateCheckFile;
+        readonly string GatewayFile;
+
+        // Optional Gateway support: one listed address may carry a gateway and DNS.
+        // The high metric keeps this route from beating Wi-Fi/corporate default routes.
+        const int GatewayMetric = 9999;
+        const string IpLabelPlain =
+            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
+        const string IpLabelGateway =
+            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24):";
 
         float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
 
         ComboBox combo;
         CheckBox chkAll;
         TextBox txtIPs;
+        Label lblIPs;
+        CheckBox chkGateway;
+        Label lblGwOn, lblGateway, lblDns1, lblDns2;
+        ComboBox cboGwIp;
+        TextBox txtGateway, txtDns1, txtDns2;
+        string gwChoice = "";     // remembered "ip/prefix" that uses the gateway
+        bool loadingGateway;
         TextBox console;
         Label lblStatus;
         Button btnBind, btnDhcp;
@@ -1058,9 +1075,11 @@ namespace IPbind
             StoreFile = Path.Combine(AppDir, "ip-list.txt");
             AdapterFile = Path.Combine(AppDir, "adapter.txt");
             UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
+            GatewayFile = Path.Combine(AppDir, "gateway.txt");
             BuildUi();
             LoadAdapters();
             LoadList();
+            LoadGatewaySettings();
             Log("IPbind v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
         }
 
@@ -1197,6 +1216,238 @@ namespace IPbind
                 return !string.Equals(mode, "manual", StringComparison.OrdinalIgnoreCase);
             }
             catch { return true; }
+        }
+
+        // ---------------- gateway support ----------------
+        // gateway.txt holds key=value lines: enabled, ip, gateway, dns1, dns2. A missing
+        // or unreadable file means Gateway support is off.
+        void LoadGatewaySettings()
+        {
+            loadingGateway = true;
+            try
+            {
+                bool enabled = false;
+                string gw = "", d1 = "", d2 = "";
+                gwChoice = "";
+                try
+                {
+                    if (File.Exists(GatewayFile))
+                    {
+                        foreach (string raw in File.ReadAllLines(GatewayFile))
+                        {
+                            string l = (raw ?? "").Trim();
+                            int eq = l.IndexOf('=');
+                            if (eq <= 0) continue;
+                            string k = l.Substring(0, eq).Trim().ToLowerInvariant();
+                            string v = l.Substring(eq + 1).Trim();
+                            if (v.Length > 40) v = v.Substring(0, 40);
+                            if (k == "enabled") enabled = v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+                            else if (k == "ip")
+                            {
+                                string ip; int pfx;
+                                if (TryCidr(v, out ip, out pfx)) gwChoice = ip + "/" + pfx;
+                            }
+                            else if (k == "gateway") gw = v;
+                            else if (k == "dns1") d1 = v;
+                            else if (k == "dns2") d2 = v;
+                        }
+                    }
+                }
+                catch { enabled = false; gw = ""; d1 = ""; d2 = ""; gwChoice = ""; }
+                txtGateway.Text = gw;
+                txtDns1.Text = d1;
+                txtDns2.Text = d2;
+                RefreshGatewayChoices();
+                chkGateway.Checked = enabled;
+                ApplyGatewayLayout();
+            }
+            finally { loadingGateway = false; }
+        }
+
+        void SaveGatewaySettings()
+        {
+            if (loadingGateway) return;
+            try
+            {
+                EnsureAppDir();
+                File.WriteAllLines(GatewayFile, new string[] {
+                    "enabled=" + (chkGateway.Checked ? "1" : "0"),
+                    "ip=" + gwChoice,
+                    "gateway=" + txtGateway.Text.Trim(),
+                    "dns1=" + txtDns1.Text.Trim(),
+                    "dns2=" + txtDns2.Text.Trim()
+                });
+            }
+            catch { }
+        }
+
+        // Fill "Use gateway on" from the valid entries currently in the list, keeping
+        // the remembered choice selected whenever it is still present.
+        void RefreshGatewayChoices()
+        {
+            if (cboGwIp == null) return;
+            List<string> keys = new List<string>();
+            foreach (string l in txtIPs.Lines)
+            {
+                string ip; int pfx;
+                if (TryCidr(l, out ip, out pfx))
+                {
+                    string k = ip + "/" + pfx;
+                    if (!keys.Contains(k)) keys.Add(k);
+                }
+            }
+            bool same = keys.Count == cboGwIp.Items.Count;
+            for (int i = 0; same && i < keys.Count; i++)
+                if ((string)cboGwIp.Items[i] != keys[i]) same = false;
+            if (!same)
+            {
+                cboGwIp.BeginUpdate();
+                cboGwIp.Items.Clear();
+                foreach (string k in keys) cboGwIp.Items.Add(k);
+                cboGwIp.EndUpdate();
+            }
+            int idx = gwChoice.Length > 0 ? keys.IndexOf(gwChoice) : -1;
+            if (cboGwIp.SelectedIndex != idx) cboGwIp.SelectedIndex = idx;
+        }
+
+        // Shows or hides the gateway rows. The IP list gives up exactly the height the
+        // two rows need, so nothing below the list moves.
+        void ApplyGatewayLayout()
+        {
+            bool on = chkGateway.Checked;
+            txtIPs.Height = U(on ? 134 : 196);
+            lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
+            foreach (Control c in new Control[] {
+                lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
+                c.Visible = on;
+        }
+
+        static bool TryIPv4(string s, out uint value)
+        {
+            value = 0;
+            Match m = Regex.Match(s ?? "", @"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*$");
+            if (!m.Success) return false;
+            for (int i = 1; i <= 4; i++)
+            {
+                int o = int.Parse(m.Groups[i].Value);
+                if (o > 255) return false;
+                value = (value << 8) | (uint)o;
+            }
+            return true;
+        }
+
+        static string IPv4Text(uint v)
+        {
+            return ((v >> 24) & 0xFF) + "." + ((v >> 16) & 0xFF) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
+        }
+
+        // Usable as a gateway or DNS server: not 0.x, loopback, multicast/reserved, or broadcast.
+        static bool IsUsableHost(uint v)
+        {
+            uint first = v >> 24;
+            return first != 0 && first != 127 && first < 224;
+        }
+
+        sealed class GatewayPlan
+        {
+            public string Ip;       // chosen address (dotted)
+            public int Prefix;
+            public string Gateway;
+            public string Dns1;     // may be null
+            public string Dns2;     // may be null
+        }
+
+        // Returns true when Gateway support is off (plan = null) or every field is valid.
+        // Logs the reason and returns false otherwise; nothing is applied in that case.
+        bool TryBuildGatewayPlan(out GatewayPlan plan)
+        {
+            plan = null;
+            if (!chkGateway.Checked) return true;
+
+            string choice = cboGwIp.SelectedIndex >= 0 ? (string)cboGwIp.SelectedItem : null;
+            if (choice == null)
+            {
+                Log("Gateway support is on, but no address is chosen in 'Use gateway on'. Pick one or turn Gateway support off.", "ERR");
+                return false;
+            }
+            bool listed = false;
+            foreach (string k in CanonicalList()) if (k == choice) listed = true;
+            string ip; int pfx;
+            if (!listed || !TryCidr(choice, out ip, out pfx))
+            {
+                Log("Gateway address '" + choice + "' is no longer in the IP list.", "ERR");
+                return false;
+            }
+            if (pfx >= 32)
+            {
+                Log("A /32 address has no subnet, so it cannot use a gateway. Use a shorter prefix such as /24.", "ERR");
+                return false;
+            }
+
+            string gwText = txtGateway.Text.Trim();
+            uint gw, ipv;
+            TryIPv4(ip, out ipv);
+            if (gwText.Length == 0)
+            {
+                Log("Gateway support is on, but no gateway is entered. Enter one or turn Gateway support off.", "ERR");
+                return false;
+            }
+            if (!TryIPv4(gwText, out gw) || !IsUsableHost(gw))
+            {
+                Log("Gateway '" + gwText + "' is not a valid IPv4 address.", "ERR");
+                return false;
+            }
+            uint mask = pfx == 0 ? 0u : (0xFFFFFFFFu << (32 - pfx));
+            uint net = ipv & mask;
+            uint bcast = net | ~mask;
+            if ((gw & mask) != net)
+            {
+                Log("Gateway " + IPv4Text(gw) + " is not in the same subnet as " + choice +
+                    " (" + IPv4Text(net) + "/" + pfx + ").", "ERR");
+                return false;
+            }
+            if (gw == ipv)
+            {
+                Log("Gateway " + IPv4Text(gw) + " is the same as the address it is for. Use the router's address.", "ERR");
+                return false;
+            }
+            if (pfx <= 30 && (gw == net || gw == bcast))
+            {
+                Log("Gateway " + IPv4Text(gw) + " is the " + (gw == net ? "network" : "broadcast") +
+                    " address of " + IPv4Text(net) + "/" + pfx + ", not a usable host.", "ERR");
+                return false;
+            }
+
+            string d1Text = txtDns1.Text.Trim(), d2Text = txtDns2.Text.Trim();
+            uint d1 = 0, d2 = 0;
+            if (d2Text.Length > 0 && d1Text.Length == 0)
+            {
+                Log("DNS 2 is filled in but DNS 1 is empty. Put the first DNS server in DNS 1.", "ERR");
+                return false;
+            }
+            if (d1Text.Length > 0 && (!TryIPv4(d1Text, out d1) || !IsUsableHost(d1)))
+            {
+                Log("DNS 1 '" + d1Text + "' is not a valid IPv4 address.", "ERR");
+                return false;
+            }
+            if (d2Text.Length > 0 && (!TryIPv4(d2Text, out d2) || !IsUsableHost(d2)))
+            {
+                Log("DNS 2 '" + d2Text + "' is not a valid IPv4 address.", "ERR");
+                return false;
+            }
+            if (d2Text.Length > 0 && d1 == d2)
+            {
+                Log("DNS 2 is the same as DNS 1. Clear DNS 2 or enter a different server.", "ERR");
+                return false;
+            }
+
+            plan = new GatewayPlan();
+            plan.Ip = ip;
+            plan.Prefix = pfx;
+            plan.Gateway = IPv4Text(gw);
+            plan.Dns1 = d1Text.Length > 0 ? IPv4Text(d1) : null;
+            plan.Dns2 = d2Text.Length > 0 ? IPv4Text(d2) : null;
+            return true;
         }
 
         void LoadAdapters()
@@ -1367,6 +1618,13 @@ namespace IPbind
 
             SaveList(true);
 
+            GatewayPlan gwPlan;
+            if (!TryBuildGatewayPlan(out gwPlan))
+            {
+                Log("Nothing was applied. Fix the gateway settings and try again.", "ERR");
+                return false;
+            }
+
             List<string[]> entries = new List<string[]>();
             foreach (string line in txtIPs.Lines)
             {
@@ -1376,6 +1634,17 @@ namespace IPbind
                 else Log("Skipping invalid entry: '" + line.Trim() + "'", "WARN");
             }
             if (entries.Count == 0) { Log("No valid addresses to apply.", "WARN"); return false; }
+
+            // With a gateway, the chosen address goes first: it becomes the primary
+            // ("set address") entry, which is where netsh attaches the gateway.
+            if (gwPlan != null)
+            {
+                int gi = entries.FindIndex(delegate (string[] e)
+                {
+                    return e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString();
+                });
+                if (gi > 0) { string[] g = entries[gi]; entries.RemoveAt(gi); entries.Insert(0, g); }
+            }
 
             Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' (single batch)...");
 
@@ -1392,10 +1661,23 @@ namespace IPbind
                 string ip = e[0];
                 int pfx = int.Parse(e[1]);
                 string mask = MaskFromPrefix(pfx);
-                cmds.Add(first
-                    ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
-                    : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
+                if (first && gwPlan != null)
+                    cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=static address=" + ip +
+                             " mask=" + mask + " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric);
+                else
+                    cmds.Add(first
+                        ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
+                        : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
                 first = false;
+            }
+            if (gwPlan != null && gwPlan.Dns1 != null)
+            {
+                // register=none: never publish these bench addresses to corporate DNS.
+                cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=static address=" +
+                         gwPlan.Dns1 + " register=none validate=no");
+                if (gwPlan.Dns2 != null)
+                    cmds.Add("interface ipv4 add dnsservers name=\"" + alias + "\" address=" +
+                             gwPlan.Dns2 + " index=2 validate=no");
             }
 
             string outp = "";
@@ -1410,6 +1692,13 @@ namespace IPbind
             finally { try { File.Delete(script); } catch { } }
 
             foreach (string[] e in entries) Log("  + " + e[0] + "/" + e[1], "OK");
+            if (gwPlan != null)
+            {
+                Log("  gateway " + gwPlan.Gateway + " (metric " + GatewayMetric + ") on " +
+                    gwPlan.Ip + "/" + gwPlan.Prefix, "OK");
+                if (gwPlan.Dns1 != null)
+                    Log("  DNS " + gwPlan.Dns1 + (gwPlan.Dns2 != null ? ", " + gwPlan.Dns2 : ""), "OK");
+            }
             // netsh prints harmless notes (e.g. "DHCP is already enabled") that are not
             // failures, so don't judge success by its output. Log real-looking errors as
             // warnings, everything else as info, then verify against the actual interface.
@@ -1430,16 +1719,23 @@ namespace IPbind
             List<string> want = new List<string>();
             foreach (string[] e in entries) want.Add(e[0]);
             int found = 0;
+            bool gwFound = false;
             try
             {
                 foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
                     if (ni.Name != alias) continue;
-                    foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
                         if (want.Contains(ua.Address.ToString())) found++;
+                    if (gwPlan != null)
+                        foreach (GatewayIPAddressInformation ga in props.GatewayAddresses)
+                            if (ga.Address.ToString() == gwPlan.Gateway) gwFound = true;
                 }
             }
             catch { }
+            if (gwPlan != null && !gwFound)
+                Log("Gateway " + gwPlan.Gateway + " is not showing on the interface yet.", "WARN");
             bool ok = found >= want.Count;
             if (!ok) Log("Only " + found + " of " + want.Count + " addresses are present on the interface.", "WARN");
             if (status != "Up") Log("Interface is not connected - addresses will activate once it comes up.", "WARN");
@@ -1640,6 +1936,31 @@ namespace IPbind
 
         Font UiFont(float pt, FontStyle style) { return new Font("Segoe UI", pt, style); }
 
+        Label MakeRowLabel(string text, int x, int y)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = UiFont(8F, FontStyle.Regular);
+            l.Location = P(x, y);
+            l.Size = Z(x == 20 ? 98 : 64, 23);
+            l.TextAlign = ContentAlignment.MiddleLeft;
+            l.Visible = false;
+            Controls.Add(l);
+            return l;
+        }
+
+        TextBox MakeIpBox(int x, int y)
+        {
+            TextBox t = new TextBox();
+            t.Location = P(x, y);
+            t.Width = U(188);
+            t.MaxLength = 15;
+            t.Visible = false;
+            t.TextChanged += delegate { SaveGatewaySettings(); };
+            Controls.Add(t);
+            return t;
+        }
+
         // ---------------- dark mode ----------------
         // Themes a control's scrollbars/borders. "DarkMode_Explorer" gives dark scrollbars.
         [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -1787,6 +2108,7 @@ namespace IPbind
         void DrawAdapterItem(object sender, DrawItemEventArgs e)
         {
             if (e.Bounds.Width <= 0 || e.Bounds.Height <= 0) return;
+            ComboBox combo = (ComboBox)sender;
 
             bool editField = (e.State & DrawItemState.ComboBoxEdit) != 0;
             bool selectedListItem =
@@ -1960,13 +2282,30 @@ namespace IPbind
             chkAll.Text = "Show all adapters (include virtual / cellular / VPN)";
             chkAll.Font = UiFont(8F, FontStyle.Regular);
             chkAll.Location = P(20, 122);
-            chkAll.Size = Z(520, 20);
+            chkAll.Size = Z(370, 20);
             chkAll.CheckedChanged += delegate { LoadAdapters(); };
             Controls.Add(chkAll);
 
-            Label lblIPs = new Label();
-            lblIPs.Text =
-                "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
+            chkGateway = new CheckBox();
+            chkGateway.Text = "Gateway support";
+            chkGateway.Font = UiFont(8F, FontStyle.Regular);
+            chkGateway.Location = P(410, 122);
+            chkGateway.Size = Z(130, 20);
+            chkGateway.CheckAlign = ContentAlignment.MiddleRight;
+            chkGateway.TextAlign = ContentAlignment.MiddleRight;
+            chkGateway.CheckedChanged += delegate
+            {
+                ApplyGatewayLayout();
+                SaveGatewaySettings();
+                if (!loadingGateway)
+                    Log(chkGateway.Checked
+                        ? "Gateway support on (remembered). Choose one address and enter its gateway and optional DNS."
+                        : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
+            };
+            Controls.Add(chkGateway);
+
+            lblIPs = new Label();
+            lblIPs.Text = IpLabelPlain;
             lblIPs.Font = UiFont(8F, FontStyle.Regular);
             lblIPs.Location = P(20, 146);
             lblIPs.Size = Z(530, 22);
@@ -1979,7 +2318,33 @@ namespace IPbind
             txtIPs.Location = P(20, 170);
             txtIPs.Size = Z(520, 196);
             txtIPs.Font = new Font("Consolas", 10F);
+            txtIPs.TextChanged += delegate { RefreshGatewayChoices(); };
             Controls.Add(txtIPs);
+
+            // Gateway rows (hidden until Gateway support is on). They sit in the bottom
+            // 62px of the IP list's normal area, which the list gives up when shown.
+            lblGwOn = MakeRowLabel("Use gateway on:", 20, 310);
+            cboGwIp = new ComboBox();
+            cboGwIp.Location = P(122, 310);
+            cboGwIp.Size = Z(150, 24);
+            cboGwIp.DropDownStyle = ComboBoxStyle.DropDownList;
+            cboGwIp.DrawMode = DrawMode.OwnerDrawFixed;
+            cboGwIp.DrawItem += DrawAdapterItem;
+            cboGwIp.DropDown += delegate { cboGwIp.Invalidate(); };
+            cboGwIp.DropDownClosed += delegate { cboGwIp.Invalidate(); };
+            cboGwIp.SelectionChangeCommitted += delegate
+            {
+                gwChoice = cboGwIp.SelectedIndex >= 0 ? (string)cboGwIp.SelectedItem : "";
+                SaveGatewaySettings();
+            };
+            Controls.Add(cboGwIp);
+            lblGateway = MakeRowLabel("Gateway:", 284, 310);
+            txtGateway = MakeIpBox(352, 310);
+            lblDns1 = MakeRowLabel("DNS 1:", 20, 339);
+            txtDns1 = MakeIpBox(122, 339);
+            txtDns1.Width = U(150);
+            lblDns2 = MakeRowLabel("DNS 2:", 284, 339);
+            txtDns2 = MakeIpBox(352, 339);
 
             Button btnSaveList = MakeButton("Save List", 20, 372, 166, 28);
             btnSaveList.Click += delegate { SaveList(false); };
