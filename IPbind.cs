@@ -27,13 +27,13 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: AssemblyTitle("IPbind - Static IP binder for easily accessing air-gapped equipment across multiple IP ranges")]
 [assembly: AssemblyDescription("Easily accesses air-gapped equipment across multiple IP ranges by binding static IPv4 addresses to a LAN interface, with one-click DHCP revert.")]
-[assembly: AssemblyProduct("IPbind")]
 [assembly: AssemblyCompany("Andy Rostad")]
 [assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
-// AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion and the
-// BuildInfo.Version string are generated fresh on every compile into Version.cs.
+// AssemblyTitle / AssemblyProduct / AssemblyVersion / AssemblyFileVersion /
+// AssemblyInformationalVersion and BuildInfo (Version, Channel, AppName,
+// ReleaseTag) are generated fresh on every compile into Version.cs by
+// Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
 
 namespace IPbind
 {
@@ -111,14 +111,16 @@ namespace IPbind
 
     static class UpdateChecker
     {
+        // Prod reads the Worker (usage count) and falls back to the latest release.
+        // Beta builds never touch the Worker and read only the beta pre-release, so
+        // a beta copy only ever updates from beta and a prod copy only from prod.
         const string WorkerVersionUrl =
             "https://ipbind-update-pings.dataspike.workers.dev/version.txt";
-        const string VersionUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
-        const string ExeUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe";
-        const string ChecksumUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe.sha256";
+        const string ReleaseBaseUrl =
+            "https://github.com/arostad/IPbind/releases/download/" + BuildInfo.ReleaseTag + "/";
+        const string VersionUrl = ReleaseBaseUrl + "version.txt";
+        const string ExeUrl = ReleaseBaseUrl + "IPbind.exe";
+        const string ChecksumUrl = ReleaseBaseUrl + "IPbind.exe.sha256";
         const string ExeFileName = "IPbind.exe";
         const long MinExeBytes = 20L * 1024L;
         const long MaxExeBytes = 500L * 1024L * 1024L;
@@ -377,7 +379,7 @@ namespace IPbind
         {
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "IPbind");
+                BuildInfo.AppName);
         }
 
         static bool LooksLikeSingleFileExtractPath(string path)
@@ -464,7 +466,8 @@ namespace IPbind
             string remoteText;
             Version remote;
             string error;
-            if (TryReadVersion(WorkerVersionUrl, out remoteText, out remote, out error)
+            if ((!BuildInfo.IsBeta
+                    && TryReadVersion(WorkerVersionUrl, out remoteText, out remote, out error))
                 || TryReadVersion(VersionUrl, out remoteText, out remote, out error))
             {
                 Version current;
@@ -791,12 +794,18 @@ namespace IPbind
         readonly float sc;
         readonly bool dark;
         UpdateInfo availableUpdate;
+        readonly string updateCheckFile;
+        readonly LinkLabel enableLaunchLink;
+        readonly CheckBox launchCheckBox;
+        readonly bool portableCopy;
+        bool settingLaunchCheck;
 
-        public AboutForm(Form owner, bool dark, float scale)
+        public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
+            this.updateCheckFile = updateCheckFile;
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
-            Text = "About IPbind";
+            Text = "About " + BuildInfo.AppName;
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -804,12 +813,19 @@ namespace IPbind
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = Z(430, 360);
+            // Installed copies: a "turn on" link only while update-check.txt = manual.
+            // Portable copies: a "Check for updates at launch" checkbox, always shown.
+            // The form is taller only while one of the two is shown.
+            portableCopy = !IsInstalledCopy();
+            bool launchEnabled = ReadLaunchCheckEnabled();
+            bool manualOnly = !portableCopy && !launchEnabled;
+            bool showRow = portableCopy || manualOnly;
+            ClientSize = Z(430, showRow ? 388 : 360);
             try { Icon = owner.Icon; } catch { }
 
-            Label title = MakeLabel("IPbind", 18F, FontStyle.Bold, 24, 20, 382, 34);
+            Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
             Label version = MakeLabel(
-                "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
+                "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
             Label tagline = MakeLabel(
                 "One-click Static IP Binder for easily accessing\r\n" +
                 "air-gapped equipment spread across multiple IP ranges",
@@ -830,7 +846,26 @@ namespace IPbind
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
-            statusLabel = MakeLabel("", 8.5F, FontStyle.Regular, 24, 292, 382, 48);
+            // Installed copies: only offered when the user chose manual updates
+            // (installer task unticked); there is no way to turn checks off here.
+            enableLaunchLink = new LinkLabel();
+            enableLaunchLink.Text = "Turn on automatic update checks…";
+            enableLaunchLink.Location = P(24, 296);
+            enableLaunchLink.Size = Z(382, 22);
+            enableLaunchLink.TextAlign = ContentAlignment.MiddleCenter;
+            enableLaunchLink.LinkColor = Color.FromArgb(25, 90, 160);
+            enableLaunchLink.Visible = manualOnly;
+            enableLaunchLink.LinkClicked += EnableLaunchChecks;
+
+            launchCheckBox = new CheckBox();
+            launchCheckBox.Text = "Check for updates at launch";
+            launchCheckBox.AutoSize = true;
+            launchCheckBox.Checked = launchEnabled;
+            launchCheckBox.Visible = portableCopy;
+            launchCheckBox.CheckedChanged += LaunchCheckChanged;
+
+            statusLabel = MakeLabel(
+                "", 8.5F, FontStyle.Regular, 24, showRow ? 324 : 292, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
@@ -839,7 +874,12 @@ namespace IPbind
             Controls.Add(source);
             Controls.Add(license);
             Controls.Add(checkButton);
+            Controls.Add(enableLaunchLink);
+            Controls.Add(launchCheckBox);
             Controls.Add(statusLabel);
+            // Centre the auto-sized checkbox under the button (device pixels).
+            launchCheckBox.Location = new Point(
+                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(296));
 
             if (dark)
             {
@@ -872,6 +912,99 @@ namespace IPbind
         int U(int value) { return (int)Math.Round(value * sc); }
         Point P(int x, int y) { return new Point(U(x), U(y)); }
         Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        bool ReadLaunchCheckEnabled()
+        {
+            try
+            {
+                if (!File.Exists(updateCheckFile)) return true;
+                return !string.Equals(
+                    File.ReadAllText(updateCheckFile).Trim(), "manual", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return true; }
+        }
+
+        bool WriteLaunchCheckMode(string mode)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(updateCheckFile);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(updateCheckFile, mode);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "Could not save the update setting: " + ex.Message;
+                return false;
+            }
+        }
+
+        // Installed = Inno Setup's uninstaller (unins*.exe + unins*.dat) sits next to
+        // the running exe. Every installed copy (prod or beta, any version) has it,
+        // the in-app updater never touches it, and portable copies never do.
+        static bool IsInstalledCopy()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
+                if (string.IsNullOrEmpty(dir)) return false;
+                foreach (string dat in Directory.GetFiles(dir, "unins*.dat"))
+                    if (File.Exists(Path.ChangeExtension(dat, ".exe"))) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        void SetLaunchCheckSilently(bool value)
+        {
+            settingLaunchCheck = true;
+            try { launchCheckBox.Checked = value; }
+            finally { settingLaunchCheck = false; }
+        }
+
+        // Portable checkbox: turning checks ON needs consent to the installer's
+        // privacy text (Cancel reverts); turning them OFF saves "manual" at once.
+        void LaunchCheckChanged(object sender, EventArgs e)
+        {
+            if (settingLaunchCheck) return;
+            if (launchCheckBox.Checked)
+            {
+                bool agreed;
+                using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
+                    agreed = consent.ShowDialog(this) == DialogResult.OK;
+                if (!agreed || !WriteLaunchCheckMode("auto"))
+                {
+                    SetLaunchCheckSilently(false);
+                    return;
+                }
+                statusLabel.Text = "Updates will now be checked at launch.";
+            }
+            else
+            {
+                if (!WriteLaunchCheckMode("manual"))
+                {
+                    SetLaunchCheckSilently(true);
+                    return;
+                }
+                statusLabel.Text = "Automatic update checks are off. Use Check for updates any time.";
+            }
+        }
+
+        // Installed link. Consent first: the same privacy text the installer shows. "I Agree" saves
+        // "auto" and removes the link immediately; Cancel changes nothing.
+        void EnableLaunchChecks(object sender, LinkLabelLinkClickedEventArgs e)
+        {
+            bool agreed;
+            using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
+                agreed = consent.ShowDialog(this) == DialogResult.OK;
+            if (!agreed || !WriteLaunchCheckMode("auto")) return;
+
+            enableLaunchLink.Visible = false;
+            statusLabel.Location = P(24, 292);
+            ClientSize = Z(430, 360);
+            statusLabel.Text = "Updates will now be checked at launch.";
+        }
 
         Label MakeLabel(
             string text, float size, FontStyle style, int x, int y, int width, int height)
@@ -1008,6 +1141,107 @@ namespace IPbind
         }
     }
 
+    // Shows the installer's privacy text (installer/privacy.txt, embedded at build
+    // time as IPbind.privacy.txt so both are identical). "I Agree" returns OK.
+    sealed class PrivacyConsentForm : Form
+    {
+        readonly float sc;
+        readonly bool dark;
+
+        public PrivacyConsentForm(bool dark, float scale)
+        {
+            this.dark = dark;
+            sc = scale > 0f ? scale : 1f;
+            Text = BuildInfo.AppName + " privacy";
+            Font = new Font("Segoe UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = Z(520, 400);
+
+            Label intro = new Label();
+            intro.Text = "Please read how " + BuildInfo.AppName + " uses the network before turning on update checks at launch.";
+            intro.Location = P(16, 12);
+            intro.Size = Z(488, 40);
+            intro.TextAlign = ContentAlignment.MiddleLeft;
+
+            TextBox text = new TextBox();
+            text.Multiline = true;
+            text.ReadOnly = true;
+            text.WordWrap = true;
+            text.ScrollBars = ScrollBars.Vertical;
+            text.Location = P(16, 58);
+            text.Size = Z(488, 282);
+            text.Text = ReadPrivacyText();
+            text.TabStop = false;
+
+            Button agree = new Button();
+            agree.Text = "I Agree";
+            agree.DialogResult = DialogResult.OK;
+            agree.Location = P(300, 354);
+            agree.Size = Z(100, 32);
+
+            Button cancel = new Button();
+            cancel.Text = "Cancel";
+            cancel.DialogResult = DialogResult.Cancel;
+            cancel.Location = P(406, 354);
+            cancel.Size = Z(98, 32);
+            CancelButton = cancel;
+
+            Controls.Add(intro);
+            Controls.Add(text);
+            Controls.Add(agree);
+            Controls.Add(cancel);
+
+            if (dark)
+            {
+                BackColor = Color.FromArgb(32, 32, 32);
+                ForeColor = Color.FromArgb(230, 230, 230);
+                intro.ForeColor = ForeColor;
+                text.BackColor = Color.FromArgb(24, 24, 24);
+                text.ForeColor = ForeColor;
+                text.BorderStyle = BorderStyle.FixedSingle;
+                foreach (Button b in new Button[] { agree, cancel })
+                {
+                    b.FlatStyle = FlatStyle.Flat;
+                    b.BackColor = Color.FromArgb(50, 50, 50);
+                    b.ForeColor = ForeColor;
+                    b.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                }
+            }
+            Shown += delegate { cancel.Focus(); text.Select(0, 0); };
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            WindowTheme.ApplyTitleBar(this, dark);
+        }
+
+        int U(int value) { return (int)Math.Round(value * sc); }
+        Point P(int x, int y) { return new Point(U(x), U(y)); }
+        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        static string ReadPrivacyText()
+        {
+            try
+            {
+                using (Stream s = typeof(PrivacyConsentForm).Assembly
+                    .GetManifestResourceStream("IPbind.privacy.txt"))
+                {
+                    if (s != null)
+                        using (StreamReader r = new StreamReader(s, Encoding.UTF8, true))
+                            return r.ReadToEnd().Replace("\r\n", "\n").Replace("\n", "\r\n").Trim();
+                }
+            }
+            catch { }
+            return "The privacy notice could not be loaded. See the Privacy section at https://github.com/arostad/IPbind";
+        }
+    }
+
     class MainForm : Form
     {
         static readonly string AppVersion = BuildInfo.Version;
@@ -1025,9 +1259,10 @@ namespace IPbind
                       RegexOptions.IgnoreCase);
 
         readonly string AppDir =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IPbind");
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), BuildInfo.AppName);
         readonly string StoreFile;
         readonly string AdapterFile;
+        readonly string UpdateCheckFile;
 
         float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
 
@@ -1056,10 +1291,13 @@ namespace IPbind
         {
             StoreFile = Path.Combine(AppDir, "ip-list.txt");
             AdapterFile = Path.Combine(AppDir, "adapter.txt");
+            UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
             BuildUi();
             LoadAdapters();
             LoadList();
-            Log("IPbind v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            Log(BuildInfo.AppName + " v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            if (BuildInfo.IsBeta)
+                Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
         }
 
         // scale helper: design pixels -> device pixels
@@ -1181,6 +1419,21 @@ namespace IPbind
 
         void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); }
         string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
+
+        // update-check.txt is written by the installer: "auto" (default) or "manual".
+        // Only an explicit "manual" turns off the launch check; a missing or unreadable
+        // file keeps automatic checks, so portable copies behave as before. Manual
+        // checks from About always work.
+        bool LaunchUpdateCheckEnabled()
+        {
+            try
+            {
+                if (!File.Exists(UpdateCheckFile)) return true;
+                string mode = File.ReadAllText(UpdateCheckFile).Trim();
+                return !string.Equals(mode, "manual", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return true; }
+        }
 
         void LoadAdapters()
         {
@@ -1544,6 +1797,7 @@ namespace IPbind
         {
             if (launchUpdateCheckStarted) return;
             launchUpdateCheckStarted = true;
+            if (!LaunchUpdateCheckEnabled()) return;   // user chose manual-only updates
             Thread thread = new Thread(delegate()
             {
                 UpdateInfo info;
@@ -1872,7 +2126,7 @@ namespace IPbind
 
         void BuildUi()
         {
-            this.Text = "IPbind v" + AppVersion;
+            this.Text = BuildInfo.AppName + " v" + AppVersion;
             this.Font = new Font("Segoe UI", 9F);
             this.AutoScaleMode = AutoScaleMode.None;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -1897,7 +2151,7 @@ namespace IPbind
             this.SuspendLayout();
 
             Label lblTitle = new Label();
-            lblTitle.Text = "IPbind";
+            lblTitle.Text = BuildInfo.AppName;
             lblTitle.Font = UiFont(16F, FontStyle.Bold);
             lblTitle.Location = P(20, 10);
             lblTitle.Size = Z(520, 28);
@@ -2067,7 +2321,7 @@ namespace IPbind
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
-                using (AboutForm about = new AboutForm(this, dark, sc))
+                using (AboutForm about = new AboutForm(this, dark, sc, UpdateCheckFile))
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);

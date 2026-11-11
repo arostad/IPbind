@@ -29,19 +29,62 @@ jobs:
           if (-not $versionMatch.Success) {
             throw 'Could not read $Version from Build-Exe.ps1.'
           }
-          Set-Content -Path .\version.txt -Value $versionMatch.Groups[1].Value -NoNewline
+          $version = $versionMatch.Groups[1].Value
+          Set-Content -Path .\version.txt -Value $version -NoNewline
+          # Updater assets (names must never change: existing installs fetch these).
           $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
+          # User-facing portable download (same bytes as IPbind.exe). Unversioned on
+          # purpose: the updater replaces the exe in place, keeping its filename.
+          $portable = "IPbind-Portable.exe"
+          Copy-Item .\IPbind.exe ".\$portable" -Force
+          Set-Content -Path ".\$portable.sha256" -Value "$hash  $portable" -NoNewline
 
+      # README download links must name the files this version publishes. Runs on
+      # every push and PR, and the release job needs this job, so a stale README
+      # fails the build and can never reach the Latest release.
+      - name: Check README download links match version
+        shell: pwsh
+        run: |
+          $version = Get-Content -Raw .\version.txt
+          $readme = Get-Content -Raw .\README.md
+          $base = 'https://github.com/arostad/IPbind/releases/download/latest/'
+          $errors = @()
+          foreach ($name in @("IPbind-Installer-v$version.exe", "IPbind-Portable.exe")) {
+            if (-not $readme.Contains("[$name]($base$name)")) {
+              $errors += "README is missing the link [$name]($base$name)"
+            }
+          }
+          foreach ($m in [regex]::Matches($readme, 'IPbind-Installer-v([0-9][0-9.]*[0-9])\.exe')) {
+            if ($m.Groups[1].Value -ne $version) {
+              $errors += "README names $($m.Value) but Build-Exe.ps1 version is $version"
+            }
+          }
+          if ($readme -match 'IPbind-Portable-v') {
+            $errors += "README names a versioned portable file; the portable download is IPbind-Portable.exe"
+          }
+          if ($readme -notmatch "(?m)^Current version: \*\*$([regex]::Escape($version))\*\*\s*$") {
+            $errors += "README 'Current version' line does not say $version (no trailing period)"
+          }
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host "README download links match $version"
+
+      # The installer is built on every push and PR so ISCC errors surface before
+      # merge; only the release job (main pushes) publishes it.
       - name: Install Inno Setup 6
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: choco install innosetup --yes --no-progress
 
       - name: Build per-user installer
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -ExePath .\IPbind.exe
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -ExePath .\IPbind.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = Get-Content -Raw .\version.txt
+          $installer = "IPbind-Installer-v$version.exe"
+          if (-not (Test-Path ".\dist\$installer")) { throw "Missing dist\$installer" }
+          $hash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ".\dist\$installer.sha256" -Value "$hash  $installer" -NoNewline
 
       - name: Upload release files
         uses: actions/upload-artifact@v4
@@ -51,6 +94,10 @@ jobs:
             IPbind.exe
             IPbind.exe.sha256
             version.txt
+            IPbind-Portable.exe
+            IPbind-Portable.exe.sha256
+            dist/IPbind-Installer-v*.exe
+            dist/IPbind-Installer-v*.exe.sha256
             dist/IPbind-Setup.exe
           if-no-files-found: error
 
@@ -67,20 +114,56 @@ jobs:
           name: IPbind
           path: ./release
 
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw .\release\version.txt).Trim()
+          if ($version -notmatch '^\d+(?:\.\d+){2,3}$') { throw "Bad version '$version'" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Update Latest release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: latest
           name: Latest
           body: |
-            **[Download Installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)**
+            **Download installer: [IPbind-Installer-v${{ steps.ver.outputs.version }}.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe)**
 
             The Installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
 
-            <sub>Prefer a single file? [Portable — IPbind.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)</sub>
+            <sub>Prefer a single file? Portable: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)</sub>
+          # IPbind.exe, IPbind.exe.sha256 and version.txt are the in-app updater's
+          # assets; IPbind-Setup.exe is a legacy unversioned installer name.
           files: |
             release/IPbind.exe
             release/IPbind.exe.sha256
             release/version.txt
+            release/IPbind-Portable.exe
+            release/IPbind-Portable.exe.sha256
+            release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe
+            release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe.sha256
             release/dist/IPbind-Setup.exe
+          fail_on_unmatched_files: true
           make_latest: true
+
+      # The latest tag is reused, so remove installers from older versions (and any
+      # stray versioned portable) after the new files are up. Same-named assets such
+      # as IPbind-Portable.exe are overwritten by the upload above. Updater and
+      # legacy assets are never touched.
+      - name: Remove previous versioned downloads
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $keep = @("IPbind-Installer-v$env:VERSION.exe", "IPbind-Installer-v$env:VERSION.exe.sha256")
+          $assets = gh release view latest -R $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list Latest release assets.' }
+          foreach ($name in $assets) {
+            if ($name -match '^IPbind-(Installer|Portable)-v' -and $keep -notcontains $name) {
+              Write-Host "Deleting stale asset $name"
+              gh release delete-asset latest $name -R $env:GITHUB_REPOSITORY --yes
+              if ($LASTEXITCODE -ne 0) { throw "Could not delete $name" }
+            }
+          }

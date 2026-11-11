@@ -10,15 +10,15 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.119**
+Current version: **2.3.120**
 
 ## Download
 
-### [Download installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
+### Download installer: [IPbind-Installer-v2.3.120.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.120.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
 
-Prefer a single file? [Download the portable version](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
+Prefer a single file? Download the portable version: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)
 
 ## Screenshot
 
@@ -28,5 +28,5 @@ Prefer a single file? [Download the portable version](https://github.com/arostad
 
 ## Privacy
 
-IPbind does not upload your address list, adapter choices, or anything that identifies your computer. Your configuration stays in your Windows user profile. The only network call is an update check (at launch or from About), which asks for the latest version number. That check bumps a simple daily update check count by country so I can see rough usage; the connection's IP address and user-agent are not stored. When an update is available, the file downloads directly from the IPbind GitHub repository. Binding or reverting addresses is a local `netsh` action on your machine and does not phone home.
+IPbind does not upload your address list, adapter choices, or anything that identifies your computer. Your configuration stays in your Windows user profile. The only network call is an update check (at launch or from About), which asks for the latest version number. The check goes to a small Cloudflare Worker run by me (ipbind-update-pings.dataspike.workers.dev). If that can't be reached, IPbind asks GitHub for the same version file instead. That check bumps a simple daily update check count by country so I can see rough usage; the connection's IP address and user-agent are not stored. Like any web request, your IP address is seen by Cloudflare or GitHub when the connection is made. IPbind itself sends no identifier, and the counter keeps only the country. You can turn off the automatic check at launch during installation ('Check for updates at launch'). When it's off, IPbind makes no network calls on its own; updates are checked only when you click Check for updates in About. When an update is available, the file downloads directly from the IPbind GitHub repository. Downloading an update connects only to GitHub and happens only after you choose to update. Binding or reverting addresses is a local `netsh` action on your machine and does not phone home.
 

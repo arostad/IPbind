@@ -18,17 +18,28 @@
     if it can't, builds to a uniquely-named file so you always get a fresh
     binary to run.
 
+    CHANNEL: -Channel prod (default) builds IPbind. -Channel beta builds the
+    separate "IPbind Beta" app (own name, orange icon app-beta.ico, own
+    settings folder, updates only from the beta pre-release). CI uses beta
+    only for the beta branch.
+
     Usage:   .\Build-Exe.ps1
+             .\Build-Exe.ps1 -Channel beta
 #>
 
+param(
+    [ValidateSet('prod', 'beta')]
+    [string]$Channel = 'prod'
+)
+
 # ==============================================================
-$Version = '2.3.119'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.120'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $src  = Join-Path $here 'IPbind.cs'
 $man  = Join-Path $here 'app.manifest'
-$ico  = Join-Path $here 'app.ico'
+$ico  = Join-Path $here ($(if ($Channel -eq 'beta') { 'app-beta.ico' } else { 'app.ico' }))
 $ver  = Join-Path $here 'Version.cs'
 $out  = Join-Path $here 'IPbind.exe'
 
@@ -37,15 +48,37 @@ if (-not (Test-Path $man)) { Write-Error "Missing $man"; return }
 
 # --- generate Version.cs from $Version ---
 $numeric = "$Version.0"   # 4-part numeric file version, e.g. 2.1.101.0
+if ($Channel -eq 'beta') {
+    $appName = 'IPbind Beta'
+    $releaseTag = 'beta'
+} else {
+    $appName = 'IPbind'
+    $releaseTag = 'latest'
+}
+$assemblyTitle = "$appName - Static IP binder for easily accessing air-gapped equipment across multiple IP ranges"
 $verSource = @"
 using System.Reflection;
+[assembly: AssemblyTitle("$assemblyTitle")]
+[assembly: AssemblyProduct("$appName")]
 [assembly: AssemblyVersion("$numeric")]
 [assembly: AssemblyFileVersion("$numeric")]
 [assembly: AssemblyInformationalVersion("$Version")]
-namespace IPbind { internal static class BuildInfo { public const string Version = "$Version"; } }
+namespace IPbind
+{
+    internal static class BuildInfo
+    {
+        public const string Version = "$Version";
+        public const string Channel = "$Channel";
+        public static readonly bool IsBeta = Channel == "beta";
+        // Window/About name and the %APPDATA% / %LOCALAPPDATA% folder name.
+        public const string AppName = "$appName";
+        // GitHub release tag the updater reads from (version.txt, IPbind.exe, .sha256).
+        public const string ReleaseTag = "$releaseTag";
+    }
+}
 "@
 Set-Content -Path $ver -Value $verSource -Encoding UTF8
-Write-Host "Build version: $Version  (file version $numeric)" -ForegroundColor Cyan
+Write-Host "Build version: $Version  (file version $numeric), channel: $Channel ($appName)" -ForegroundColor Cyan
 
 # --- never silently keep a locked old exe ---
 if (Test-Path $out) {
@@ -84,6 +117,10 @@ $cscArgs = @(
 )
 if (Test-Path $ico) { $cscArgs = @("/win32icon:$ico", "/resource:$ico,IPbind.app.ico") + $cscArgs }
 else { Write-Warning 'app.ico not found in this folder - the exe (and its window/taskbar icon) will use the default icon.' }
+# Embedded so About's consent dialog shows exactly the installer's privacy page.
+$privacy = Join-Path $here 'installer\privacy.txt'
+if (-not (Test-Path $privacy)) { Write-Error "Missing $privacy"; return }
+$cscArgs = @("/resource:$privacy,IPbind.privacy.txt") + $cscArgs
 
 Write-Host 'Compiling ...' -ForegroundColor Cyan
 & $csc @cscArgs

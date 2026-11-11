@@ -8,13 +8,19 @@
       .\Build-Installer.ps1
       .\Build-Installer.ps1 -ExePath .\IPbind.exe
       .\Build-Installer.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+      .\Build-Installer.ps1 -Channel beta -ExePath .\IPbind.exe   (exe built with -Channel beta)
+
+    -Channel beta packages the separate "IPbind Beta" app as
+    IPbind-Installer-v<version>-beta.exe (own AppId, folder and shortcuts).
 #>
 
 [CmdletBinding()]
 param(
     [string]$ExePath,
     [string]$IsccPath,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [ValidateSet('prod', 'beta')]
+    [string]$Channel = 'prod'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,7 +28,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
     Write-Host 'Building IPbind.exe ...' -ForegroundColor Cyan
-    & (Join-Path $root 'Build-Exe.ps1')
+    & (Join-Path $root 'Build-Exe.ps1') -Channel $Channel
     if ($LASTEXITCODE -ne 0) {
         throw "Build-Exe.ps1 failed with exit code $LASTEXITCODE."
     }
@@ -73,21 +79,28 @@ Write-Host "Packaging IPbind $version with $resolvedIscc ..." -ForegroundColor C
     "/DAppVersion=$version" `
     "/DExePath=$resolvedExe" `
     "/DOutputDir=$resolvedOutput" `
+    "/DChannel=$Channel" `
     $installerScript
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE."
 }
 
-$installerPath = Join-Path $resolvedOutput "IPbind-Setup-$version.exe"
+$installerName = if ($Channel -eq 'beta') { "IPbind-Installer-v$version-beta.exe" } else { "IPbind-Installer-v$version.exe" }
+$installerPath = Join-Path $resolvedOutput $installerName
 if (-not (Test-Path -LiteralPath $installerPath)) {
     throw "Inno Setup did not produce the expected installer: $installerPath"
 }
 
-$stableInstallerPath = Join-Path $resolvedOutput 'IPbind-Setup.exe'
-Copy-Item -LiteralPath $installerPath -Destination $stableInstallerPath -Force
+# Legacy unversioned name (prod only): not linked anywhere new, but kept on the
+# Latest release so older README copies and bookmarks still download the current build.
+$stableInstallerPath = $null
+if ($Channel -eq 'prod') {
+    $stableInstallerPath = Join-Path $resolvedOutput 'IPbind-Setup.exe'
+    Copy-Item -LiteralPath $installerPath -Destination $stableInstallerPath -Force
+}
 
 Write-Host "Done: $installerPath" -ForegroundColor Green
-Write-Host "Stable copy: $stableInstallerPath" -ForegroundColor Green
+if ($stableInstallerPath) { Write-Host "Legacy copy: $stableInstallerPath" -ForegroundColor Green }
 [PSCustomObject]@{
     Version = $version
     InstallerPath = $installerPath

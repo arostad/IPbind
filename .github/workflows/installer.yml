@@ -32,9 +32,16 @@ jobs:
           if (-not $versionMatch.Success) {
             throw 'Could not read $Version from Build-Exe.ps1.'
           }
-          Set-Content -Path .\version.txt -Value $versionMatch.Groups[1].Value -NoNewline
+          $version = $versionMatch.Groups[1].Value
+          Set-Content -Path .\version.txt -Value $version -NoNewline
           $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
+          $portable = "IPbind-Portable.exe"
+          Copy-Item .\IPbind.exe ".\$portable" -Force
+          Set-Content -Path ".\$portable.sha256" -Value "$hash  $portable" -NoNewline
+          $installer = "IPbind-Installer-v$version.exe"
+          $ihash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ".\dist\$installer.sha256" -Value "$ihash  $installer" -NoNewline
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
@@ -44,7 +51,10 @@ jobs:
             IPbind.exe
             IPbind.exe.sha256
             version.txt
-            dist/IPbind-Setup-*.exe
+            IPbind-Portable.exe
+            IPbind-Portable.exe.sha256
+            dist/IPbind-Installer-v*.exe
+            dist/IPbind-Installer-v*.exe.sha256
             dist/IPbind-Setup.exe
           if-no-files-found: error
 
@@ -53,9 +63,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $version = Get-Content -Raw .\version.txt
+          $keep = @("IPbind-Installer-v$version.exe", "IPbind-Installer-v$version.exe.sha256")
           gh release upload latest `
             .\IPbind.exe `
             .\IPbind.exe.sha256 `
             .\version.txt `
+            .\IPbind-Portable.exe `
+            .\IPbind-Portable.exe.sha256 `
+            ".\dist\IPbind-Installer-v$version.exe" `
+            ".\dist\IPbind-Installer-v$version.exe.sha256" `
             .\dist\IPbind-Setup.exe `
             --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Upload failed.' }
+          foreach ($name in (gh release view latest --json assets --jq '.assets[].name')) {
+            if ($name -match '^IPbind-(Installer|Portable)-v' -and $keep -notcontains $name) {
+              gh release delete-asset latest $name --yes
+            }
+          }
