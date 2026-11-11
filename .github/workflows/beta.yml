@@ -122,10 +122,10 @@ jobs:
           fi
 
           if gh release view beta -R "$REPO" >/dev/null 2>&1; then
-            gh release edit beta -R "$REPO" --prerelease --latest=false \
+            gh release edit beta -R "$REPO" --prerelease --latest=false --target "${SHA}" \
               --title "IPbind Beta ${VERSION} (pre-release)" --notes "$NOTES"
           else
-            gh release create beta -R "$REPO" --verify-tag --prerelease --latest=false \
+            gh release create beta -R "$REPO" --verify-tag --prerelease --latest=false --target "${SHA}" \
               --title "IPbind Beta ${VERSION} (pre-release)" --notes "$NOTES"
           fi
 
