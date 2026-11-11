@@ -1281,7 +1281,6 @@ namespace IPbind
         TextBox txtIPs;
         Label lblIPs;
         CheckBox chkGateway;
-        ToolTip gatewayTip;   // field so the tooltip lives as long as the form
         Label lblGwOn, lblGateway, lblDns1, lblDns2;
         ComboBox cboGwIp;
         TextBox txtGateway, txtDns1, txtDns2;
@@ -2540,16 +2539,6 @@ namespace IPbind
                         : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
             };
             Controls.Add(chkGateway);
-
-            // Gateway support is off by default; warn before someone turns it on.
-            gatewayTip = new ToolTip();
-            gatewayTip.AutoPopDelay = 10000;
-            gatewayTip.InitialDelay = 400;
-            gatewayTip.ReshowDelay = 200;
-            gatewayTip.ShowAlways = true;
-            gatewayTip.SetToolTip(chkGateway,
-                "Only enable if you know what you're doing!\r\n" +
-                "A gateway or DNS here can change how this PC reaches the internet.");
 
             lblIPs = new Label();
             lblIPs.Text = IpLabelPlain;
