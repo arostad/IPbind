@@ -33,13 +33,13 @@ jobs:
           $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
 
+      # The installer is built on every push and PR so ISCC errors surface before
+      # merge; only the release job (main pushes) publishes it.
       - name: Install Inno Setup 6
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: choco install innosetup --yes --no-progress
 
       - name: Build per-user installer
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -ExePath .\IPbind.exe
 
