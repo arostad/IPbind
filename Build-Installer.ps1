@@ -78,16 +78,18 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE."
 }
 
-$installerPath = Join-Path $resolvedOutput "IPbind-Setup-$version.exe"
+$installerPath = Join-Path $resolvedOutput "IPbind-Installer-v$version.exe"
 if (-not (Test-Path -LiteralPath $installerPath)) {
     throw "Inno Setup did not produce the expected installer: $installerPath"
 }
 
+# Legacy unversioned name: not linked anywhere new, but kept on the Latest
+# release so older README copies and bookmarks still download the current build.
 $stableInstallerPath = Join-Path $resolvedOutput 'IPbind-Setup.exe'
 Copy-Item -LiteralPath $installerPath -Destination $stableInstallerPath -Force
 
 Write-Host "Done: $installerPath" -ForegroundColor Green
-Write-Host "Stable copy: $stableInstallerPath" -ForegroundColor Green
+Write-Host "Legacy copy: $stableInstallerPath" -ForegroundColor Green
 [PSCustomObject]@{
     Version = $version
     InstallerPath = $installerPath

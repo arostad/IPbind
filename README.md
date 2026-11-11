@@ -16,11 +16,11 @@ Current version: **2.3.118**
 
 ## Download
 
-### [Download installer](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Setup.exe)
+### Download installer: [IPbind-Installer-v2.3.118.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.118.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
 
-Prefer a single file? [Download the portable version](https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe)
+Prefer a single file? Download the portable version: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)
 
 ## Screenshot
 
