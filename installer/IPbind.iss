@@ -7,33 +7,55 @@
 #ifndef OutputDir
   #define OutputDir "..\dist"
 #endif
+#ifndef Channel
+  #define Channel "prod"
+#endif
+
+; Channel "beta" builds the separate IPbind Beta app: own AppId, name, folder,
+; shortcuts, uninstall entry and settings folder, so it installs side by side
+; with IPbind and never overwrites it. Prod values are unchanged.
+#if Channel == "beta"
+  #define AppTitle "IPbind Beta"
+  #define AppIdValue "{{3E0BECC0-9CDB-47D6-BFFB-5A6B0DEEFC27}"
+  #define ExeName "IPbind Beta.exe"
+  #define SetupIcon "..\app-beta.ico"
+  #define OutputName "IPbind-Installer-v" + AppVersion + "-beta"
+  #define ReleaseTag "beta"
+#else
+  #define AppTitle "IPbind"
+  #define AppIdValue "{{A42A329A-EDE5-4D63-B2C7-92947FE79E14}"
+  #define ExeName "IPbind.exe"
+  #define SetupIcon "..\app.ico"
+  #define OutputName "IPbind-Installer-v" + AppVersion
+  #define ReleaseTag "latest"
+#endif
 
 [Setup]
-AppId={{A42A329A-EDE5-4D63-B2C7-92947FE79E14}
-AppName=IPbind
+AppId={#AppIdValue}
+AppName={#AppTitle}
 AppVersion={#AppVersion}
-AppVerName=IPbind {#AppVersion}
+AppVerName={#AppTitle} {#AppVersion}
 AppPublisher=Andy Rostad
 AppPublisherURL=https://github.com/arostad
 AppSupportURL=https://github.com/arostad/IPbind/issues
-AppUpdatesURL=https://github.com/arostad/IPbind/releases/tag/latest
-AppComments=IPbind is released under the MIT License.
+AppUpdatesURL=https://github.com/arostad/IPbind/releases/tag/{#ReleaseTag}
+AppComments={#AppTitle} is released under the MIT License.
 AppReadmeFile={app}\LICENSE.txt
 VersionInfoCompany=Andy Rostad
-VersionInfoDescription=IPbind per-user installer
-VersionInfoProductName=IPbind
+VersionInfoDescription={#AppTitle} per-user installer
+VersionInfoProductName={#AppTitle}
 VersionInfoProductVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
 VersionInfoCopyright=Copyright (C) 2026 Andy Rostad. MIT License.
-DefaultDirName={localappdata}\Programs\IPbind
-DefaultGroupName=IPbind
+DefaultDirName={localappdata}\Programs\{#AppTitle}
+DefaultGroupName={#AppTitle}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir={#OutputDir}
-OutputBaseFilename=IPbind-Installer-v{#AppVersion}
-SetupIconFile=..\app.ico
-UninstallDisplayName=IPbind
-UninstallDisplayIcon={app}\IPbind.exe
+OutputBaseFilename={#OutputName}
+SetupIconFile={#SetupIcon}
+UninstallDisplayName={#AppTitle}
+UninstallDisplayIcon={app}\{#ExeName}
 LicenseFile=..\LICENSE
 InfoBeforeFile=privacy.txt
 Compression=lzma2
@@ -47,8 +69,8 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WizardInfoBefore=IPbind privacy
-InfoBeforeLabel=Please read how IPbind uses the network before continuing.
+WizardInfoBefore={#AppTitle} privacy
+InfoBeforeLabel=Please read how {#AppTitle} uses the network before continuing.
 
 [Tasks]
 ; Checked by default (also for silent installs). On upgrade, Inno restores the
@@ -56,17 +78,17 @@ InfoBeforeLabel=Please read how IPbind uses the network before continuing.
 Name: "autoupdatecheck"; Description: "Check for updates at launch"; GroupDescription: "Updates (when off, check manually from About):"
 
 [Files]
-Source: "{#ExePath}"; DestDir: "{app}"; DestName: "IPbind.exe"; Flags: ignoreversion
+Source: "{#ExePath}"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{userprograms}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\IPbind"; Filename: "{app}\IPbind.exe"; WorkingDir: "{app}"
+Name: "{userprograms}\{#AppTitle}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"
+Name: "{userdesktop}\{#AppTitle}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"
 
 [Run]
 ; Verb: open + shellexec = ShellExecute so UAC can prompt from unelevated Setup
 ; (Inno Setup 6.7 renamed the old shellexecute flag to shellexec)
-Filename: "{app}\IPbind.exe"; Description: "Launch IPbind"; Flags: nowait postinstall skipifsilent shellexec; Verb: open
+Filename: "{app}\{#ExeName}"; Description: "Launch {#AppTitle}"; Flags: nowait postinstall skipifsilent shellexec; Verb: open
 
 [Code]
 var
@@ -94,7 +116,7 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
-    SettingsDir := ExpandConstant('{userappdata}\IPbind');
+    SettingsDir := ExpandConstant('{userappdata}\{#AppTitle}');
     if WizardIsTaskSelected('autoupdatecheck') then
       Mode := 'auto'
     else
@@ -126,7 +148,7 @@ begin
   if (CurUninstallStep = usPostUninstall) and
      RemoveAppDataCheckBox.Checked then
   begin
-    DelTree(ExpandConstant('{userappdata}\IPbind'), True, True, True);
-    DelTree(ExpandConstant('{localappdata}\IPbind'), True, True, True);
+    DelTree(ExpandConstant('{userappdata}\{#AppTitle}'), True, True, True);
+    DelTree(ExpandConstant('{localappdata}\{#AppTitle}'), True, True, True);
   end;
 end;

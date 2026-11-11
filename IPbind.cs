@@ -28,13 +28,13 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: AssemblyTitle("IPbind - Static IP binder for easily accessing air-gapped equipment across multiple IP ranges")]
 [assembly: AssemblyDescription("Easily accesses air-gapped equipment across multiple IP ranges by binding static IPv4 addresses to a LAN interface, with one-click DHCP revert.")]
-[assembly: AssemblyProduct("IPbind")]
 [assembly: AssemblyCompany("Andy Rostad")]
 [assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
-// AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion and the
-// BuildInfo.Version string are generated fresh on every compile into Version.cs.
+// AssemblyTitle / AssemblyProduct / AssemblyVersion / AssemblyFileVersion /
+// AssemblyInformationalVersion and BuildInfo (Version, Channel, AppName,
+// ReleaseTag) are generated fresh on every compile into Version.cs by
+// Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
 
 namespace IPbind
 {
@@ -112,14 +112,16 @@ namespace IPbind
 
     static class UpdateChecker
     {
+        // Prod reads the Worker (usage count) and falls back to the latest release.
+        // Beta builds never touch the Worker and read only the beta pre-release, so
+        // a beta copy only ever updates from beta and a prod copy only from prod.
         const string WorkerVersionUrl =
             "https://ipbind-update-pings.dataspike.workers.dev/version.txt";
-        const string VersionUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
-        const string ExeUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe";
-        const string ChecksumUrl =
-            "https://github.com/arostad/IPbind/releases/download/latest/IPbind.exe.sha256";
+        const string ReleaseBaseUrl =
+            "https://github.com/arostad/IPbind/releases/download/" + BuildInfo.ReleaseTag + "/";
+        const string VersionUrl = ReleaseBaseUrl + "version.txt";
+        const string ExeUrl = ReleaseBaseUrl + "IPbind.exe";
+        const string ChecksumUrl = ReleaseBaseUrl + "IPbind.exe.sha256";
         const string ExeFileName = "IPbind.exe";
         const long MinExeBytes = 20L * 1024L;
         const long MaxExeBytes = 500L * 1024L * 1024L;
@@ -378,7 +380,7 @@ namespace IPbind
         {
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "IPbind");
+                BuildInfo.AppName);
         }
 
         static bool LooksLikeSingleFileExtractPath(string path)
@@ -465,7 +467,8 @@ namespace IPbind
             string remoteText;
             Version remote;
             string error;
-            if (TryReadVersion(WorkerVersionUrl, out remoteText, out remote, out error)
+            if ((!BuildInfo.IsBeta
+                    && TryReadVersion(WorkerVersionUrl, out remoteText, out remote, out error))
                 || TryReadVersion(VersionUrl, out remoteText, out remote, out error))
             {
                 Version current;
@@ -797,7 +800,7 @@ namespace IPbind
         {
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
-            Text = "About IPbind";
+            Text = "About " + BuildInfo.AppName;
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -808,9 +811,9 @@ namespace IPbind
             ClientSize = Z(430, 360);
             try { Icon = owner.Icon; } catch { }
 
-            Label title = MakeLabel("IPbind", 18F, FontStyle.Bold, 24, 20, 382, 34);
+            Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
             Label version = MakeLabel(
-                "Version " + BuildInfo.Version, 9F, FontStyle.Regular, 24, 58, 382, 22);
+                "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
             Label tagline = MakeLabel(
                 "One-click Static IP Binder for easily accessing\r\n" +
                 "air-gapped equipment spread across multiple IP ranges",
@@ -1026,7 +1029,7 @@ namespace IPbind
                       RegexOptions.IgnoreCase);
 
         readonly string AppDir =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IPbind");
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), BuildInfo.AppName);
         readonly string StoreFile;
         readonly string AdapterFile;
         readonly string UpdateCheckFile;
@@ -1080,7 +1083,9 @@ namespace IPbind
             LoadAdapters();
             LoadList();
             LoadGatewaySettings();
-            Log("IPbind v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            Log(BuildInfo.AppName + " v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            if (BuildInfo.IsBeta)
+                Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
         }
 
         // scale helper: design pixels -> device pixels
@@ -2212,7 +2217,7 @@ namespace IPbind
 
         void BuildUi()
         {
-            this.Text = "IPbind v" + AppVersion;
+            this.Text = BuildInfo.AppName + " v" + AppVersion;
             this.Font = new Font("Segoe UI", 9F);
             this.AutoScaleMode = AutoScaleMode.None;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -2237,7 +2242,7 @@ namespace IPbind
             this.SuspendLayout();
 
             Label lblTitle = new Label();
-            lblTitle.Text = "IPbind";
+            lblTitle.Text = BuildInfo.AppName;
             lblTitle.Font = UiFont(16F, FontStyle.Bold);
             lblTitle.Location = P(20, 10);
             lblTitle.Size = Z(520, 28);

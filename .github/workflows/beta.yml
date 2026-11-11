@@ -1,0 +1,152 @@
+name: Beta
+
+# Separate "IPbind Beta" track. A push to the beta branch (or a manual run from
+# any ref) builds with -Channel beta and publishes the GitHub PRE-RELEASE tagged
+# "beta". Beta copies update only from this pre-release; prod (main -> latest)
+# is handled by build.yml and is never touched here.
+on:
+  push:
+    branches: [beta]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build IPbind Beta exe
+        shell: pwsh
+        run: |
+          Remove-Item -ErrorAction SilentlyContinue .\IPbind.exe
+          powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1 -Channel beta
+          if (-not (Test-Path .\IPbind.exe)) { throw 'Build-Exe.ps1 did not produce IPbind.exe' }
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path)
+          if ($info.ProductName -ne 'IPbind Beta') { throw "Expected product 'IPbind Beta', got '$($info.ProductName)'" }
+          Write-Host "Built $($info.ProductName) $($info.ProductVersion)"
+
+      - name: Write beta release metadata
+        shell: pwsh
+        run: |
+          $script = Get-Content -Raw .\Build-Exe.ps1
+          $versionMatch = [regex]::Match($script, "(?m)^\`$Version\s*=\s*'([^']+)'")
+          if (-not $versionMatch.Success) { throw 'Could not read $Version from Build-Exe.ps1.' }
+          $version = $versionMatch.Groups[1].Value
+          Set-Content -Path .\version.txt -Value $version -NoNewline
+          # Updater assets: same names the updater expects, read from the beta tag.
+          $hash = (Get-FileHash -Path .\IPbind.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path .\IPbind.exe.sha256 -Value "$hash  IPbind.exe" -NoNewline
+          Copy-Item .\IPbind.exe .\IPbind-Portable-beta.exe -Force
+          Set-Content -Path .\IPbind-Portable-beta.exe.sha256 -Value "$hash  IPbind-Portable-beta.exe" -NoNewline
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build IPbind Beta installer
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -Channel beta -ExePath .\IPbind.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = Get-Content -Raw .\version.txt
+          $installer = "IPbind-Installer-v$version-beta.exe"
+          if (-not (Test-Path ".\dist\$installer")) { throw "Missing dist\$installer" }
+          $hash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ".\dist\$installer.sha256" -Value "$hash  $installer" -NoNewline
+          Get-ChildItem .\dist | Format-Table Name, Length
+
+      - name: Upload beta files
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPbind-Beta
+          path: |
+            IPbind.exe
+            IPbind.exe.sha256
+            version.txt
+            IPbind-Portable-beta.exe
+            IPbind-Portable-beta.exe.sha256
+            dist/IPbind-Installer-v*-beta.exe
+            dist/IPbind-Installer-v*-beta.exe.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Download beta files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: IPbind-Beta
+          path: ./release
+
+      - name: Publish beta pre-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '\r\n' < release/version.txt)"
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){2,3}$ ]] || { echo "Bad version '$VERSION'"; exit 1; }
+          INSTALLER="IPbind-Installer-v${VERSION}-beta.exe"
+          BASE="https://github.com/${REPO}/releases/download/beta"
+          NOTES="$(cat <<NOTES_EOF
+          **Pre-release test build. Not for general use.** This is IPbind Beta ${VERSION}, built from commit ${SHA}.
+
+          IPbind Beta is a separate app: its own name, orange icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
+
+          **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
+
+          <sub>Portable: [IPbind-Portable-beta.exe](${BASE}/IPbind-Portable-beta.exe)</sub>
+          NOTES_EOF
+          )"
+          NOTES="$(printf '%s\n' "$NOTES" | sed 's/^          //')"
+
+          # Point the beta tag at the commit just built (create it if missing).
+          # Fully qualified refs: a branch is also named beta.
+          if gh api "repos/${REPO}/git/ref/tags/beta" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/beta" -f sha="${SHA}" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/beta" -f sha="${SHA}" >/dev/null
+          fi
+
+          if gh release view beta -R "$REPO" >/dev/null 2>&1; then
+            gh release edit beta -R "$REPO" --prerelease --latest=false \
+              --title "IPbind Beta ${VERSION} (pre-release)" --notes "$NOTES"
+          else
+            gh release create beta -R "$REPO" --verify-tag --prerelease --latest=false \
+              --title "IPbind Beta ${VERSION} (pre-release)" --notes "$NOTES"
+          fi
+
+          gh release upload beta -R "$REPO" --clobber \
+            release/IPbind.exe \
+            release/IPbind.exe.sha256 \
+            release/version.txt \
+            release/IPbind-Portable-beta.exe \
+            release/IPbind-Portable-beta.exe.sha256 \
+            "release/dist/${INSTALLER}" \
+            "release/dist/${INSTALLER}.sha256"
+
+          # Remove beta installers from earlier versions.
+          gh release view beta -R "$REPO" --json assets --jq '.assets[].name' | while read -r name; do
+            if [[ "$name" =~ ^IPbind-Installer-v.*-beta\.exe(\.sha256)?$ && "$name" != "$INSTALLER" && "$name" != "$INSTALLER.sha256" ]]; then
+              echo "Deleting stale asset $name"
+              gh release delete-asset beta "$name" -R "$REPO" --yes
+            fi
+          done
+
+          # Safety: the prod release must still be GitHub's Latest.
+          LATEST_TAG="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)"
+          echo "Latest release tag: ${LATEST_TAG}"
+          [[ "$LATEST_TAG" == "latest" ]] || { echo "::error::Latest release is '${LATEST_TAG}', expected 'latest'"; exit 1; }
