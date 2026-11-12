@@ -1853,15 +1853,16 @@ namespace IPbind
 
         void FitOnScreen()
         {
+            // Reposition only. Relaying out here would dispose fonts while the
+            // dialog is visible and can throw GDI+ "Parameter is not valid".
             if (!IsHandleCreated) return;
-            LayoutContent();
             Rectangle work = Screen.FromControl(this).WorkingArea;
             int x = Left, y = Top, w = Width, h = Height;
             if (x + w > work.Right) x = work.Right - w;
             if (y + h > work.Bottom) y = work.Bottom - h;
             if (x < work.Left) x = work.Left;
             if (y < work.Top) y = work.Top;
-            Bounds = new Rectangle(x, y, Width, Height);
+            Location = new Point(x, y);
         }
 
         void ApplyContinueState()
