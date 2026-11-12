@@ -1116,8 +1116,9 @@ namespace IPbind
 
         int LinkWidth(string text, Font font)
         {
-            // NoPadding under-measures LinkLabel paint (underline/overhang) by ~7 CSS px.
-            return MeasureLine(text, font).Width + U(8);
+            // NoPadding is tight; LinkLabel wraps (and our single-line height
+            // then clips the second line) if the width is even 1 CSS px short.
+            return MeasureLine(text, font).Width + U(16);
         }
 
         void LayoutContent()
