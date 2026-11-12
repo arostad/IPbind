@@ -45,10 +45,55 @@ namespace IPbind
         {
             if (UpdateChecker.TryRunApplyUpdate(args)) return;
             UpdateChecker.BeginHelperCleanup(args);
+            InstalledVersionSync.Run();
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+        }
+    }
+
+    // The in-app updater swaps only the exe, so the installer's Apps & Features entry
+    // (which winget reads) would keep the old version. On launch, an installed copy
+    // raises DisplayVersion to the running version. Portable copies, other users'
+    // installs and any error are skipped silently.
+    static class InstalledVersionSync
+    {
+        const string UninstallKeyFormat =
+            @"Software\Microsoft\Windows\CurrentVersion\Uninstall\{0}_is1";
+        const string ProdAppId = "{A42A329A-EDE5-4D63-B2C7-92947FE79E14}";
+        const string BetaAppId = "{3E0BECC0-9CDB-47D6-BFFB-5A6B0DEEFC27}";
+
+        public static void Run()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
+                if (string.IsNullOrEmpty(dir) || !File.Exists(Path.Combine(dir, "unins000.exe")))
+                    return;
+                string keyPath = string.Format(
+                    UninstallKeyFormat, BuildInfo.IsBeta ? BetaAppId : ProdAppId);
+                using (Microsoft.Win32.RegistryKey key =
+                    Microsoft.Win32.Registry.CurrentUser.OpenSubKey(keyPath, true))
+                {
+                    if (key == null) return;
+                    string location = key.GetValue("InstallLocation") as string;
+                    if (string.IsNullOrEmpty(location)
+                        || !string.Equals(
+                            Path.GetFullPath(location).TrimEnd('\\'), dir.TrimEnd('\\'),
+                            StringComparison.OrdinalIgnoreCase))
+                        return;
+                    System.Version running, listed;
+                    if (!System.Version.TryParse(BuildInfo.Version, out running)) return;
+                    string current = key.GetValue("DisplayVersion") as string;
+                    if (current != null && System.Version.TryParse(current, out listed)
+                        && listed >= running)
+                        return;
+                    key.SetValue("DisplayVersion", BuildInfo.Version,
+                        Microsoft.Win32.RegistryValueKind.String);
+                }
+            }
+            catch { }
         }
     }
 
