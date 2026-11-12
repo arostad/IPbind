@@ -3501,9 +3501,7 @@ namespace IPbind
             gatewayTip.InitialDelay = 400;
             gatewayTip.ReshowDelay = 200;
             gatewayTip.ShowAlways = true;
-            gatewayTip.SetToolTip(chkGateway,
-                "Only enable if you know what you're doing!\r\n" +
-                "A gateway or DNS here can change how this PC reaches the internet.");
+            gatewayTip.SetToolTip(chkGateway, "Only enable if you know what you're doing!");
 
             lblIPs = new Label();
             lblIPs.Text = IpLabelPlain;
