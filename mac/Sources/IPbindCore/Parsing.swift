@@ -20,6 +20,7 @@ public enum Parse {
     public struct InterfaceInfo {
         public var addresses: [(ip: IPv4, mask: IPv4)] = []
         public var status: String?   // "active" / "inactive"
+        public init() {}
     }
 
     /// Reads `ifconfig <dev>`.
