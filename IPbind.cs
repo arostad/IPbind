@@ -1305,29 +1305,23 @@ namespace IPbind
     // Startup reminder: static addresses stay on the adapter until Return to DHCP.
     // Shown at launch until the user clicks Continue with "Don't show this again"
     // ticked (MainForm then writes dhcp-reminder-dismissed.txt in the settings folder).
-    // Continue, Enter, Esc and the title-bar close box all stay inactive until
-    // "I understand" is ticked. Laid out in code from the DPI scale like AboutForm.
+    // Continue (and Enter) stay inactive until "I understand" is ticked. Exit is
+    // always available: Exit, Esc, the title-bar X and Alt+F4 all return Cancel,
+    // and MainForm then closes IPbind without touching any adapter or saving the
+    // opt-out. Laid out in code from the DPI scale like AboutForm.
     sealed class DhcpReminderForm : Form
     {
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        static extern bool EnableMenuItem(IntPtr hMenu, uint uIDEnableItem, uint uEnable);
         [System.Runtime.InteropServices.DllImport("comctl32.dll")]
         static extern int LoadIconWithScaleDown(IntPtr hinst, IntPtr pszName, int cx, int cy, out IntPtr phico);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern bool DestroyIcon(IntPtr hIcon);
-
-        const uint SC_CLOSE = 0xF060;
-        const uint MF_BYCOMMAND = 0x0;
-        const uint MF_GRAYED = 0x1;
-        const uint MF_ENABLED = 0x0;
 
         readonly float sc;
         readonly bool dark;
         readonly CheckBox understandBox;
         readonly CheckBox dontShowBox;
         readonly Button continueButton;
+        readonly Button exitButton;
         readonly Bitmap warningBitmap;
 
         public bool DontShowAgain { get { return dontShowBox.Checked; } }
@@ -1414,7 +1408,7 @@ namespace IPbind
             RunsLabel closing = new RunsLabel();
             closing.AddRun("Click ", Font, fore);
             closing.AddRun("Return to DHCP", bodyBold, fore);
-            closing.AddRun(" before you unplug from your equipment.", Font, fore);
+            closing.AddRun(" before plugging this adapter into a non-air-gapped network.", Font, fore);
             closing.Location = new Point(left, y);
             closing.FitWidth(textWidth);
             Controls.Add(closing);
@@ -1424,7 +1418,7 @@ namespace IPbind
             understandBox.Text = "I understand";
             understandBox.AutoSize = true;
             understandBox.Location = new Point(left, y);
-            understandBox.CheckedChanged += delegate { UpdateCloseState(); };
+            understandBox.CheckedChanged += delegate { continueButton.Enabled = understandBox.Checked; };
             Controls.Add(understandBox);
             y += understandBox.PreferredSize.Height + U(6);
 
@@ -1445,6 +1439,15 @@ namespace IPbind
             Controls.Add(continueButton);
             AcceptButton = continueButton;
 
+            // Way out for anyone who won't tick "I understand": closes IPbind.
+            exitButton = new Button();
+            exitButton.Text = "Exit";
+            exitButton.Size = continueButton.Size;
+            exitButton.Location = new Point(continueButton.Left - U(8) - exitButton.Width, continueButton.Top);
+            exitButton.DialogResult = DialogResult.Cancel;
+            Controls.Add(exitButton);
+            CancelButton = exitButton;
+
             ClientSize = new Size(width, Math.Max(checkBottom, continueButton.Bottom) + U(20));
 
             if (dark)
@@ -1456,6 +1459,9 @@ namespace IPbind
                 continueButton.FlatStyle = FlatStyle.Flat;
                 continueButton.BackColor = Color.FromArgb(50, 50, 50);
                 continueButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                exitButton.FlatStyle = FlatStyle.Flat;
+                exitButton.BackColor = Color.FromArgb(50, 50, 50);
+                exitButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
             }
 
             Shown += delegate { understandBox.Focus(); };
@@ -1502,45 +1508,10 @@ namespace IPbind
             catch { return SystemIcons.Warning.ToBitmap(); }
         }
 
-        void UpdateCloseState()
-        {
-            bool understood = understandBox.Checked;
-            continueButton.Enabled = understood;
-            if (!IsHandleCreated) return;
-            try
-            {
-                IntPtr menu = GetSystemMenu(Handle, false);
-                if (menu != IntPtr.Zero)
-                    EnableMenuItem(menu, SC_CLOSE, MF_BYCOMMAND | (understood ? MF_ENABLED : MF_GRAYED));
-            }
-            catch { }
-        }
-
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
-            UpdateCloseState();
-        }
-
-        protected override bool ProcessDialogKey(Keys keyData)
-        {
-            if (keyData == Keys.Escape)
-            {
-                // Esc closes only once "I understand" is ticked (and never saves the opt-out).
-                if (understandBox.Checked) DialogResult = DialogResult.Cancel;
-                return true;
-            }
-            return base.ProcessDialogKey(keyData);
-        }
-
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            // X / Alt+F4 are ignored until "I understand" is ticked. System closes
-            // (shutdown, Task Manager, owner closing) are always allowed.
-            if (e.CloseReason == CloseReason.UserClosing && !understandBox.Checked)
-                e.Cancel = true;
-            base.OnFormClosing(e);
         }
 
         protected override void Dispose(bool disposing)
@@ -1555,6 +1526,11 @@ namespace IPbind
         // A wrapped line made of differently styled runs (e.g. a bold phrase inside
         // a sentence). Words are measured and drawn with GDI TextRenderer, the same
         // renderer Labels use, so sizes follow the system DPI.
+        // Measuring MUST use the IDeviceContext overload: on .NET Framework the
+        // MeasureText(string, Font, Size, flags) overload drops NoPadding and adds
+        // glyph-overhang padding to every word, while DrawText(Graphics, ...) honors
+        // NoPadding, so each word was placed several pixels too far right (2.3.125's
+        // wide gaps between words).
         sealed class RunsLabel : Control
         {
             sealed class Word
@@ -1601,23 +1577,32 @@ namespace IPbind
             public void FitWidth(int maxWidth)
             {
                 int x = 0, y = 0, lineHeight = 0, widest = 0;
-                foreach (Word word in words)
+                // Screen DC: same system DPI the dialog paints at.
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                 {
-                    int fullWidth = TextRenderer.MeasureText(word.Text, word.Font, Size.Empty, Flags).Width;
-                    if (x > 0 && x + fullWidth > maxWidth)
+                    foreach (Word word in words)
                     {
-                        y += lineHeight;
-                        x = 0;
-                        lineHeight = 0;
-                        word.Text = word.Text.TrimStart(' ');
-                        fullWidth = TextRenderer.MeasureText(word.Text, word.Font, Size.Empty, Flags).Width;
+                        int fullWidth = Measure(g, word);
+                        if (x > 0 && x + fullWidth > maxWidth)
+                        {
+                            y += lineHeight;
+                            x = 0;
+                            lineHeight = 0;
+                            word.Text = word.Text.TrimStart(' ');
+                            fullWidth = Measure(g, word);
+                        }
+                        word.Location = new Point(x, y);
+                        x += fullWidth;
+                        widest = Math.Max(widest, x);
+                        lineHeight = Math.Max(lineHeight, word.Font.Height);
                     }
-                    word.Location = new Point(x, y);
-                    x += fullWidth;
-                    widest = Math.Max(widest, x);
-                    lineHeight = Math.Max(lineHeight, word.Font.Height);
                 }
                 Size = new Size(Math.Min(maxWidth, widest + 2), y + lineHeight + 2);
+            }
+
+            static int Measure(Graphics g, Word word)
+            {
+                return TextRenderer.MeasureText(g, word.Text, word.Font, new Size(int.MaxValue, int.MaxValue), Flags).Width;
             }
 
             protected override void OnPaint(PaintEventArgs e)
@@ -2708,15 +2693,25 @@ namespace IPbind
         }
 
         // Shown at every launch until the user clicks Continue with "Don't show this
-        // again" ticked. The flag file is new in 2.3.125, so fresh installs and the first
+        // again" ticked. Anything other than Continue closes IPbind. The flag file is new in 2.3.125, so fresh installs and the first
         // launch after updating from an older version both see it.
         void ShowDhcpReminderIfNeeded()
         {
             if (IsDisposed) return;
             try { if (File.Exists(DhcpReminderFile)) return; } catch { }
-            bool remember;
+            bool proceed, remember;
             using (DhcpReminderForm reminder = new DhcpReminderForm(this, dark, sc))
-                remember = reminder.ShowDialog(this) == DialogResult.OK && reminder.DontShowAgain;
+            {
+                proceed = reminder.ShowDialog(this) == DialogResult.OK;
+                remember = proceed && reminder.DontShowAgain;
+            }
+            if (!proceed)
+            {
+                // Exit, Esc, X or Alt+F4 on the reminder: quit without touching any
+                // adapter and without saving the opt-out.
+                Close();
+                return;
+            }
             if (!remember) return;
             try
             {

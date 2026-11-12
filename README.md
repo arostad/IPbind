@@ -8,17 +8,17 @@ A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one
 
 By default IPbind sets no gateway and no DNS. If one of your addresses needs to reach beyond its subnet, tick **Gateway support** and pick that address, then enter its gateway and up to two DNS servers. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
-At launch, IPbind reminds you to click Return to DHCP before you plug the adapter into another network, since leftover static addresses can conflict with devices there. Tick **I understand** to continue, and **Don’t show this again** to stop the reminder.
+At launch, IPbind reminds you to click Return to DHCP before you plug the adapter into another network, since leftover static addresses can conflict with devices there. Tick **I understand** to continue, or click **Exit** to close IPbind. Tick **Don’t show this again** to stop the reminder.
 
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 
 <br clear="all">
 
-Current version: **2.3.125**
+Current version: **2.3.126**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.125.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.125.exe)
+### Download installer: [IPbind-Installer-v2.3.126.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.126.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
