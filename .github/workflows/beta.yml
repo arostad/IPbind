@@ -105,7 +105,7 @@ jobs:
           NOTES="$(cat <<NOTES_EOF
           **Pre-release test build. Not for general use.** This is IPbind Beta ${VERSION}, built from commit ${SHA}.
 
-          IPbind Beta is a separate app: its own name, orange icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
+          IPbind Beta is a separate app: its own name, dark-gray and amber icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
 
           **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
 

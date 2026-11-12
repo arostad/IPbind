@@ -35,9 +35,12 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Andy Rostad")]
 [assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
 // AssemblyTitle / AssemblyProduct / AssemblyVersion / AssemblyFileVersion /
-// AssemblyInformationalVersion and BuildInfo (Version, Channel, AppName,
-// ReleaseTag) are generated fresh on every compile into Version.cs by
+// AssemblyInformationalVersion and BuildInfo (Version, Channel, DisplayVersion,
+// AppName, ReleaseTag) are generated fresh on every compile into Version.cs by
 // Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
+// DisplayVersion is Version plus a trailing "b" in Beta (title bar, About,
+// footer, log). Parsed versions, version.txt, and installer DisplayVersion
+// stay the numeric Version. Prod display is unchanged.
 
 namespace IPbind
 {
@@ -958,7 +961,7 @@ namespace IPbind
             nameLabel = MakeLabel();
             nameLabel.Text = BuildInfo.AppName;
             versionLabel = MakeLabel();
-            versionLabel.Text = "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : "");
+            versionLabel.Text = "Version " + BuildInfo.DisplayVersion;
             website = MakeLink("ipbind.com", "ipbind.com", "https://ipbind.com/");
             matchLabel = MakeLabel();
             matchLabel.Text = "Matches the current release";
@@ -1660,7 +1663,7 @@ namespace IPbind
                         if (!info.IsNewer)
                         {
                             SetStatus(string.IsNullOrEmpty(info.Error)
-                                ? "You're on the latest version (" + BuildInfo.Version + ")."
+                                ? "You're on the latest version (" + BuildInfo.DisplayVersion + ")."
                                 : info.Error);
                             return;
                         }
@@ -2092,6 +2095,20 @@ namespace IPbind
             }
         }
 
+        // TextRenderer without NoPadding includes GDI padding and descent so
+        // checkbox labels (glyphs such as g in "plug" / "again") are not clipped.
+        Size MeasureCheck(string text, Font font, int maxWidth)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue),
+                    TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
+                if (size.Width < 1) size.Width = maxWidth;
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
         int MaxClientHeight()
         {
             Rectangle work;
@@ -2268,8 +2285,8 @@ namespace IPbind
                     int btnW = U(150);
                     int btnH = U(40);
                     int ackTextW = width - 2 * footerPadX - chkBox - U(12);
-                    Size ackNeed = MeasureWrap(understandBox.Text, understandBox.Font, ackTextW);
-                    Size againNeed = MeasureWrap(dontShowBox.Text, dontShowBox.Font, ackTextW);
+                    Size ackNeed = MeasureCheck(understandBox.Text, understandBox.Font, ackTextW);
+                    Size againNeed = MeasureCheck(dontShowBox.Text, dontShowBox.Font, ackTextW);
                     int ackH = Math.Max(chkBox, ackNeed.Height);
                     int againH = Math.Max(chkBox, againNeed.Height);
                     int footerH = footerPadTop + ackH + U(8) + againH + footerGap + btnH + footerPadBot;
@@ -2891,7 +2908,7 @@ namespace IPbind
             LoadAdapters();
             LoadList();
             LoadGatewaySettings();
-            Log(BuildInfo.AppName + " v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            Log(BuildInfo.AppName + " v" + BuildInfo.DisplayVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
             if (defaultsUpgraded)
                 Log("Default address list updated to the latest defaults.", "INFO");
             if (BuildInfo.IsBeta)
@@ -4498,7 +4515,7 @@ namespace IPbind
 
         void BuildUi()
         {
-            this.Text = BuildInfo.AppName + " v" + AppVersion;
+            this.Text = BuildInfo.AppName + " v" + BuildInfo.DisplayVersion;
             this.Font = new Font("Segoe UI", 9F);
             this.AutoScaleMode = AutoScaleMode.None;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -4777,7 +4794,7 @@ namespace IPbind
             Controls.Add(btnAbout);
 
             lblVersion = new Label();
-            lblVersion.Text = "v" + AppVersion;
+            lblVersion.Text = "v" + BuildInfo.DisplayVersion;
             lblVersion.Font = UiFont(8F, FontStyle.Regular);
             lblVersion.AutoSize = false;
             lblVersion.TextAlign = ContentAlignment.MiddleRight;
