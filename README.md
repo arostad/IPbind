@@ -6,7 +6,7 @@ One-click Static IP Binder for easily accessing air-gapped equipment spread acro
 
 A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one chosen LAN interface so you can reach gear that lives on different `/24` subnets, then revert that interface to DHCP with one click.
 
-By default IPbind sets no gateway and no DNS. If one of your addresses needs to reach beyond its subnet, tick **Gateway support** and pick that address, then enter its gateway and up to two DNS servers. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
+By default IPbind sets no gateway and no DNS. Most equipment only needs an address on its own subnet. If you're on a LAN that also has internet, turn on **Gateway support** for one address and enter the router's gateway and up to two DNS servers. You can reach the local devices and stay online. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
 At launch, IPbind reminds you to click Return to DHCP before you plug the adapter into another network, since leftover static addresses can conflict with devices there. Tick **I understand** to continue, or click **Exit** to close IPbind. Tick **Don’t show this again** to stop the reminder.
 
