@@ -3724,6 +3724,132 @@ namespace IPbind
             return (addr & mask) == (ip & mask);
         }
 
+        // BEGIN ApplySafety (self-contained; exercised by a unit test)
+        internal enum DhcpOverlapKind { None, SameAsLease, InsideSubnet }
+
+        internal static int ClampPrefix(int prefix)
+        {
+            if (prefix < 0) return 0;
+            if (prefix > 32) return 32;
+            return prefix;
+        }
+
+        internal static DhcpOverlapKind ClassifyDhcpOverlap(uint bindAddr, uint leaseAddr, int leasePrefix)
+        {
+            leasePrefix = ClampPrefix(leasePrefix);
+            if (bindAddr == leaseAddr) return DhcpOverlapKind.SameAsLease;
+            if (InSubnet(bindAddr, leaseAddr, leasePrefix)) return DhcpOverlapKind.InsideSubnet;
+            return DhcpOverlapKind.None;
+        }
+
+        internal static string DhcpNetworkText(uint leaseAddr, int leasePrefix)
+        {
+            leasePrefix = ClampPrefix(leasePrefix);
+            uint mask = leasePrefix == 0 ? 0u : (0xFFFFFFFFu << (32 - leasePrefix));
+            return IPv4Text(leaseAddr & mask) + "/" + leasePrefix;
+        }
+
+        internal static string EqualDhcpAddressLog(string ip)
+        {
+            return ip + " is this adapter's DHCP address. Nothing was applied.";
+        }
+
+        internal static string InsideDhcpNetworkLog(string ip, string network)
+        {
+            return ip + " is inside the DHCP network " + network + ". Another device could be given this address.";
+        }
+
+        internal static string AddressInUseLog(string ip, string mac)
+        {
+            return ip + " is already in use on this network (MAC " + mac + "), skipped.";
+        }
+
+        internal static string AllAddressesInUseLog()
+        {
+            return "Every address was already in use on this network. Nothing was applied.";
+        }
+
+        internal static string FormatMac(byte[] mac, int length)
+        {
+            int n = length < 0 ? 0 : Math.Min(mac == null ? 0 : mac.Length, length);
+            if (n < 1) return "";
+            string[] parts = new string[n];
+            for (int i = 0; i < n; i++) parts[i] = mac[i].ToString("x2");
+            return string.Join("-", parts);
+        }
+        // END ApplySafety
+
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        static extern int SendARP(uint destIP, uint srcIP, byte[] pMacAddr, ref int phyAddrLen);
+
+        static uint ToIpAddr(uint hostOrder)
+        {
+            byte[] b = new byte[]
+            {
+                (byte)((hostOrder >> 24) & 0xFF),
+                (byte)((hostOrder >> 16) & 0xFF),
+                (byte)((hostOrder >> 8) & 0xFF),
+                (byte)(hostOrder & 0xFF)
+            };
+            return BitConverter.ToUInt32(b, 0);
+        }
+
+        sealed class ArpHit
+        {
+            public string Ip;
+            public string Mac;
+        }
+
+        // Probes only the given addresses, in parallel. SendARP is bounded by a
+        // 1s per-address join and a 1.5s overall deadline so Apply stays responsive.
+        // A timeout or error is treated as "not in use" (the address is not skipped).
+        List<ArpHit> ProbeInUse(List<string> ips, Dictionary<string, uint> srcByIp)
+        {
+            List<ArpHit> hits = new List<ArpHit>();
+            if (ips == null || ips.Count == 0) return hits;
+            ArpHit[] found = new ArpHit[ips.Count];
+            Thread[] threads = new Thread[ips.Count];
+            for (int i = 0; i < ips.Count; i++)
+            {
+                int idx = i;
+                string ip = ips[i];
+                uint dest, src = 0;
+                if (!TryIPv4(ip, out dest)) continue;
+                if (srcByIp != null) srcByIp.TryGetValue(ip, out src);
+                threads[idx] = new Thread(delegate()
+                {
+                    try
+                    {
+                        byte[] mac = new byte[8];
+                        int len = 6;
+                        int r = SendARP(ToIpAddr(dest), src == 0 ? 0u : ToIpAddr(src), mac, ref len);
+                        if (r == 0 && len >= 6)
+                        {
+                            ArpHit hit = new ArpHit();
+                            hit.Ip = ip;
+                            hit.Mac = FormatMac(mac, 6);
+                            found[idx] = hit;
+                        }
+                    }
+                    catch { }
+                });
+                threads[idx].IsBackground = true;
+                threads[idx].Start();
+            }
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(1500);
+            for (int i = 0; i < threads.Length; i++)
+            {
+                if (threads[i] == null) continue;
+                int remain = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remain < 1) remain = 1;
+                if (remain > 1000) remain = 1000;
+                threads[i].Join(remain);
+            }
+            for (int i = 0; i < found.Length; i++)
+                if (found[i] != null) hits.Add(found[i]);
+            return hits;
+        }
+
         // All netsh commands run in ONE netsh process via a script file. Spawning a
         // separate netsh.exe per address is what made this slow: on a managed machine,
         // endpoint security inspects every child process as it launches.
@@ -3905,6 +4031,102 @@ namespace IPbind
                 keep = false;
             }
             KeepRecord old = info != null ? LoadRecord(info.Guid) : null;
+
+            // Apply-time safety: never bind the adapter's own DHCP address, warn
+            // when a bind address sits in a DHCP lease subnet, and skip addresses
+            // that already answer ARP on that subnet. Isolated (non-DHCP-subnet)
+            // entries are not probed, so air-gapped use stays fast. Lease info is
+            // read here, before Keep DHCP or static mode changes the adapter.
+            List<string[]> leases = new List<string[]>();
+            if (info != null)
+            {
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
+                    uint leaseAddr;
+                    if (!TryIPv4(ua.Address.ToString(), out leaseAddr)) continue;
+                    leases.Add(new string[] { ua.Address.ToString(), ua.PrefixLength.ToString(), DhcpNetworkText(leaseAddr, ua.PrefixLength) });
+                }
+            }
+            foreach (string[] e in entries)
+            {
+                uint bindAddr;
+                if (!TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) == DhcpOverlapKind.SameAsLease)
+                    {
+                        Log(EqualDhcpAddressLog(e[0]), "ERR");
+                        return false;
+                    }
+                }
+            }
+            Dictionary<string, uint> probeSrc = new Dictionary<string, uint>();
+            List<string> inside = new List<string>();
+            foreach (string[] e in entries)
+            {
+                uint bindAddr;
+                if (!TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) != DhcpOverlapKind.InsideSubnet)
+                        continue;
+                    Log(InsideDhcpNetworkLog(e[0], lease[2]), "WARN");
+                    if (!probeSrc.ContainsKey(e[0]))
+                    {
+                        probeSrc[e[0]] = leaseAddr;
+                        inside.Add(e[0]);
+                    }
+                    break;
+                }
+            }
+            HashSet<string> alreadyHeld = new HashSet<string>(StringComparer.Ordinal);
+            if (info != null)
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                    alreadyHeld.Add(ua.Address.ToString());
+            if (old != null)
+                foreach (string[] e in old.Addresses)
+                    alreadyHeld.Add(e[0]);
+            List<string> toProbe = new List<string>();
+            foreach (string ip in inside)
+                if (!alreadyHeld.Contains(ip)) toProbe.Add(ip);
+            if (toProbe.Count > 0)
+            {
+                List<ArpHit> hits = ProbeInUse(toProbe, probeSrc);
+                if (hits.Count > 0)
+                {
+                    HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (ArpHit hit in hits)
+                    {
+                        used.Add(hit.Ip);
+                        Log(AddressInUseLog(hit.Ip, hit.Mac), "WARN");
+                    }
+                    List<string[]> kept = new List<string[]>();
+                    foreach (string[] e in entries)
+                        if (!used.Contains(e[0])) kept.Add(e);
+                    if (kept.Count == 0)
+                    {
+                        Log(AllAddressesInUseLog(), "ERR");
+                        return false;
+                    }
+                    if (gwPlan != null)
+                    {
+                        bool gwKept = false;
+                        foreach (string[] e in kept)
+                            if (e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString()) gwKept = true;
+                        if (!gwKept)
+                        {
+                            Log(gwPlan.Ip + " was the Gateway support address, so the gateway was not applied.", "WARN");
+                            gwPlan = null;
+                        }
+                    }
+                    entries = kept;
+                }
+            }
 
             List<string> cmds = new List<string>();
             cmds.Add("interface ipv4 set interface \"" + alias + "\" dadtransmits=0");

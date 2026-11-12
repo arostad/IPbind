@@ -33,6 +33,10 @@ jobs:
           if ($info.ProductName -ne 'IPbind Beta') { throw "Expected product 'IPbind Beta', got '$($info.ProductName)'" }
           Write-Host "Built $($info.ProductName) $($info.ProductVersion)"
 
+      - name: Run Apply-safety unit tests
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\.github\test\run-apply-safety-tests.ps1
+
       - name: Write beta release metadata
         shell: pwsh
         run: |
