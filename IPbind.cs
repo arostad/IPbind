@@ -869,6 +869,7 @@ namespace IPbind
         readonly bool dark;
         readonly string updateCheckFile;
         readonly bool portableCopy;
+        bool showEnableLaunchLink;
         readonly bool checkMatchOnShow;
         readonly Color bodyBack, footerBack, footerRule, fore, muted, quiet, linkColor, linkActive;
         readonly Color secondaryBack, secondaryBorder, secondaryFore, primaryBack, primaryFore;
@@ -981,7 +982,8 @@ namespace IPbind
                 "Turn on automatic update checks\u2026", null);
             // The installed "turn on" link runs the privacy-consent flow, not a URL.
             enableLaunchLink.Links[0].LinkData = "launch-checks";
-            enableLaunchLink.Visible = !portableCopy && !launchEnabled;
+            showEnableLaunchLink = !portableCopy && !launchEnabled;
+            enableLaunchLink.Visible = showEnableLaunchLink;
             enableLaunchLink.LinkClicked += EnableLaunchChecks;
 
             statusLabel = MakeLabel();
@@ -1112,6 +1114,12 @@ namespace IPbind
 
         int U(int value) { return (int)Math.Round(value * sc); }
 
+        int LinkWidth(string text, Font font)
+        {
+            // NoPadding under-measures LinkLabel paint (underline/overhang) by ~7 CSS px.
+            return MeasureLine(text, font).Width + U(8);
+        }
+
         void LayoutContent()
         {
             if (layingOut) return;
@@ -1186,7 +1194,7 @@ namespace IPbind
                 versionLabel.Location = new Point(stackX, nameLabel.Bottom + U(2));
                 versionLabel.Size = new Size(stackW, verSize.Height);
                 website.Location = new Point(stackX, versionLabel.Bottom + U(2));
-                website.Size = new Size(Math.Min(stackW, siteSize.Width + 2), siteSize.Height);
+                website.Size = new Size(Math.Min(stackW, LinkWidth(website.Text, fontBody)), siteSize.Height);
                 int afterHero = Math.Max(iconBox.Bottom, website.Bottom);
                 if (matchLabel.Visible)
                 {
@@ -1211,7 +1219,7 @@ namespace IPbind
                 foreach (LinkLabel link in pair)
                 {
                     Size need = MeasureLine(link.Text, fontBody);
-                    int w = need.Width + 2;
+                    int w = LinkWidth(link.Text, fontBody);
                     if (x > padX && x + w > padX + inner)
                     {
                         y = rowTop + rowH + U(8);
@@ -1227,10 +1235,12 @@ namespace IPbind
                 y = rowTop + rowH + U(8);
                 Size licNeed = MeasureLine(licenseLink.Text, fontBody);
                 licenseLink.Location = new Point(padX, y);
-                licenseLink.Size = new Size(Math.Min(inner, licNeed.Width + 2), licNeed.Height);
+                licenseLink.Size = new Size(Math.Min(inner, LinkWidth(licenseLink.Text, fontBody)), licNeed.Height);
                 y = licenseLink.Bottom;
 
-                if (launchCheckBox.Visible)
+                // Control.Visible is false while the form itself is hidden, so layout
+                // from our own flags rather than the getter.
+                if (portableCopy)
                 {
                     y += U(16);
                     Size boxNeed = MeasureWrap(launchCheckBox.Text, fontBody, inner - U(24));
@@ -1239,16 +1249,22 @@ namespace IPbind
                     launchCheckBox.Size = new Size(inner, boxH);
                     launchCheckBox.CheckAlign = ContentAlignment.MiddleLeft;
                     launchCheckBox.TextAlign = ContentAlignment.MiddleLeft;
+                    launchCheckBox.Visible = true;
                     y = launchCheckBox.Bottom;
                 }
-                if (enableLaunchLink.Visible)
+                else
+                    launchCheckBox.Visible = false;
+                if (showEnableLaunchLink)
                 {
                     y += U(16);
                     Size linkNeed = MeasureLine(enableLaunchLink.Text, fontBody);
                     enableLaunchLink.Location = new Point(padX, y);
-                    enableLaunchLink.Size = new Size(Math.Min(inner, linkNeed.Width + 2), linkNeed.Height);
+                    enableLaunchLink.Size = new Size(Math.Min(inner, LinkWidth(enableLaunchLink.Text, fontBody)), linkNeed.Height);
+                    enableLaunchLink.Visible = true;
                     y = enableLaunchLink.Bottom;
                 }
+                else
+                    enableLaunchLink.Visible = false;
                 if (!string.IsNullOrEmpty(statusLabel.Text))
                 {
                     y += U(16);
@@ -1327,23 +1343,10 @@ namespace IPbind
                 if (stream != null)
                 {
                     using (stream)
-                    using (Icon src = new Icon(stream))
-                    using (Icon sized = new Icon(src, Math.Max(px, 256), Math.Max(px, 256)))
-                    using (Bitmap raw = sized.ToBitmap())
                     {
-                        if (raw.Width == px && raw.Height == px)
-                            return new Bitmap(raw);
-                        Bitmap dest = new Bitmap(px, px);
-                        dest.SetResolution(96f * sc, 96f * sc);
-                        using (Graphics g = Graphics.FromImage(dest))
-                        {
-                            g.Clear(Color.Transparent);
-                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                            g.SmoothingMode = SmoothingMode.HighQuality;
-                            g.DrawImage(raw, 0, 0, px, px);
-                        }
-                        return dest;
+                        Bitmap frame = LoadBestIconFrame(stream, px);
+                        if (frame != null)
+                            return ScaleIconFrame(frame, px);
                     }
                 }
             }
@@ -1353,23 +1356,80 @@ namespace IPbind
                 Icon src = Icon ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath);
                 if (src != null)
                 {
-                    using (Icon sized = new Icon(src, Math.Max(px, 256), Math.Max(px, 256)))
+                    using (Icon sized = new Icon(src, px, px))
                     using (Bitmap raw = sized.ToBitmap())
-                    {
-                        Bitmap dest = new Bitmap(px, px);
-                        using (Graphics g = Graphics.FromImage(dest))
-                        {
-                            g.Clear(Color.Transparent);
-                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                            g.DrawImage(raw, 0, 0, px, px);
-                        }
-                        return dest;
-                    }
+                        return ScaleIconFrame(new Bitmap(raw), px);
                 }
             }
             catch { }
             return new Bitmap(px, px);
+        }
+
+        Bitmap ScaleIconFrame(Bitmap frame, int px)
+        {
+            if (frame.Width == px && frame.Height == px)
+                return frame;
+            Bitmap dest = new Bitmap(px, px);
+            dest.SetResolution(96f * sc, 96f * sc);
+            using (Graphics g = Graphics.FromImage(dest))
+            {
+                g.Clear(Color.Transparent);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.DrawImage(frame, 0, 0, px, px);
+            }
+            frame.Dispose();
+            return dest;
+        }
+
+        // IPbind's .ico frames are PNG-compressed; System.Drawing Icon often
+        // fails to decode those and returns a generic bitmap instead.
+        static Bitmap LoadBestIconFrame(Stream stream, int px)
+        {
+            byte[] data;
+            using (MemoryStream copy = new MemoryStream())
+            {
+                stream.CopyTo(copy);
+                data = copy.ToArray();
+            }
+            if (data.Length < 6) return null;
+            if (BitConverter.ToUInt16(data, 2) != 1) return null;
+            int count = BitConverter.ToUInt16(data, 4);
+            if (count <= 0) return null;
+
+            int bestOff = 0, bestSize = 0, bestW = -1, bestScore = int.MaxValue;
+            for (int i = 0; i < count; i++)
+            {
+                int dir = 6 + i * 16;
+                if (dir + 16 > data.Length) break;
+                int w = data[dir];
+                if (w == 0) w = 256;
+                int size = BitConverter.ToInt32(data, dir + 8);
+                int off = BitConverter.ToInt32(data, dir + 12);
+                int score = (w >= px) ? (w - px) : (10000 + (px - w));
+                if (score < bestScore || (score == bestScore && w > bestW))
+                {
+                    bestScore = score;
+                    bestW = w;
+                    bestOff = off;
+                    bestSize = size;
+                }
+            }
+            if (bestSize <= 0 || bestOff < 0 || bestOff + bestSize > data.Length)
+                return null;
+
+            byte[] blob = new byte[bestSize];
+            Buffer.BlockCopy(data, bestOff, blob, 0, bestSize);
+            if (blob.Length >= 8 && blob[0] == 0x89 && blob[1] == 0x50
+                && blob[2] == 0x4E && blob[3] == 0x47)
+            {
+                using (MemoryStream png = new MemoryStream(blob))
+                using (Image img = Image.FromStream(png))
+                    return new Bitmap(img);
+            }
+            return null;
         }
 
         protected override void CreateHandle()
@@ -1553,6 +1613,7 @@ namespace IPbind
                 agreed = consent.ShowDialog(this) == DialogResult.OK;
             if (!agreed || !WriteLaunchCheckMode("auto")) return;
 
+            showEnableLaunchLink = false;
             enableLaunchLink.Visible = false;
             SetStatus("Updates will now be checked at launch.");
         }
