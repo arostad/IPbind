@@ -10,7 +10,7 @@ By default IPbind sets no gateway and no DNS. Most equipment only needs an addre
 
 In IPbind Beta, **Keep DHCP** adds the static addresses alongside the adapter's DHCP address instead of replacing it (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
 
-At launch, IPbind reminds you to click Return to DHCP before you plug the adapter into another network, since leftover static addresses can conflict with devices there. Tick **I understand** to continue, or click **Exit** to close IPbind. Tick **Don’t show this again** to stop the reminder.
+At launch, IPbind reminds you to click **Return to DHCP** before you plug into a live network, since leftover static addresses can conflict with devices there. Tick **I’ll click Return to DHCP before I plug into a live network** to continue, or click **Exit IPbind** to close. Tick **Don’t show this again** to stop the reminder.
 
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 

@@ -15,6 +15,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -1353,27 +1355,66 @@ namespace IPbind
         }
     }
 
+    // Shared main-window button captions. The DHCP reminder popup reads these
+    // so the intro, replica and acknowledgement always match the real buttons.
+    static class UiCopy
+    {
+        public const string ApplyButton = "Apply Static IPs";
+        public const string DhcpButton = "Return to DHCP";
+        public static readonly Color ApplyButtonBack = Color.FromArgb(46, 125, 50);
+        public static readonly Color DhcpButtonBack = Color.FromArgb(25, 90, 160);
+    }
+
     // Startup reminder: static addresses stay on the adapter until Return to DHCP.
     // Shown at launch until the user clicks Continue with "Don't show this again"
     // ticked (MainForm then writes dhcp-reminder-dismissed.txt in the settings folder).
-    // Continue (and Enter) stay inactive until "I understand" is ticked. Exit is
-    // always available: Exit, Esc, the title-bar X and Alt+F4 all return Cancel,
+    // Continue (and Enter) stay inactive until the acknowledgement is ticked. Exit is
+    // always available: Exit IPbind, Esc, the title-bar X and Alt+F4 all return Cancel,
     // and MainForm then closes IPbind without touching any adapter or saving the
-    // opt-out. Laid out in code from the DPI scale like AboutForm.
+    // opt-out. Laid out in code from the real DPI scale; fonts, icons and the replica
+    // are drawn in pixels at that scale. WM_DPICHANGED / DpiChanged re-lays out the
+    // dialog if it moves to a monitor at a different scale. Standard title bar (no
+    // WM_NCCALCSIZE). FixedDialog, so DWMWA_BORDER_COLOR-while-maximized does not apply.
     sealed class DhcpReminderForm : Form
     {
-        [System.Runtime.InteropServices.DllImport("comctl32.dll")]
-        static extern int LoadIconWithScaleDown(IntPtr hinst, IntPtr pszName, int cx, int cy, out IntPtr phico);
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        static extern bool DestroyIcon(IntPtr hIcon);
+        const int WM_DPICHANGED = 0x02E0;
+        static readonly IntPtr DpiAwarenessPerMonitorV2 = new IntPtr(-4);
 
-        readonly float sc;
+        [DllImport("user32.dll")]
+        static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+        [DllImport("user32.dll")]
+        static extern int GetDpiForWindow(IntPtr hwnd);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        float sc;
         readonly bool dark;
+        readonly Color bodyBack, footerBack, panelBack, panelBorder, fore, muted, introColor, amber, amberInk;
+        readonly Color primaryBack, primaryFore, primaryDisabledBack, primaryDisabledBorder, primaryDisabledFore;
+        readonly Color secondaryBack, secondaryBorder, secondaryFore;
+
+        readonly VectorIcon warningIcon;
+        readonly Label eyebrow;
+        readonly Label title;
+        readonly RunsLabel intro;
+        readonly Panel card;
+        readonly ButtonReplica replica;
+        readonly Label cardHead;
+        readonly Label cardDesc;
+        readonly Label lead;
+        readonly VectorIcon[] rowIcons;
+        readonly Label[] rowHeads;
+        readonly Label[] rowDescs;
+        readonly Panel footer;
         readonly CheckBox understandBox;
         readonly CheckBox dontShowBox;
         readonly Button continueButton;
         readonly Button exitButton;
-        readonly Bitmap warningBitmap;
+
+        readonly List<Font> fonts = new List<Font>();
+        Font fontEyebrow, fontTitle, fontIntro, fontIntroBold, fontBody, fontBodyBold, fontSmall, fontButton, fontReplica;
+        bool layingOut;
 
         public bool DontShowAgain { get { return dontShowBox.Checked; } }
 
@@ -1382,201 +1423,812 @@ namespace IPbind
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = BuildInfo.AppName;
-            Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
+            KeyPreview = true;
             try { Icon = owner.Icon; } catch { }
-
-            Color fore = dark ? Color.FromArgb(230, 230, 230) : SystemColors.ControlText;
-            Color amber = dark ? Color.FromArgb(242, 179, 61) : Color.FromArgb(156, 92, 0);
-            Font headingBold = new Font("Segoe UI", 12F, FontStyle.Bold);
-            Font headingRegular = new Font("Segoe UI", 12F, FontStyle.Regular);
-            Font bodyBold = new Font("Segoe UI", 9F, FontStyle.Bold);
-
-            int width = U(600);
-            int left = U(24);
-            int textWidth = width - 2 * left;
-            int y = U(20);
-
-            // Heading row: warning icon, then bold amber "Important:" and the regular rest.
-            int iconSize = U(24);
-            warningBitmap = LoadWarningBitmap(iconSize);
-            PictureBox icon = new PictureBox();
-            icon.SizeMode = PictureBoxSizeMode.Zoom;
-            icon.Size = new Size(iconSize, iconSize);
-            icon.Image = warningBitmap;
-            icon.TabStop = false;
-
-            int headingLeft = left + iconSize + U(10);
-            RunsLabel heading = new RunsLabel();
-            heading.AddRun("Important:", headingBold, amber);
-            heading.AddRun(" Return to DHCP when you\u2019re done", headingRegular, fore);
-            heading.Location = new Point(headingLeft, 0);
-            heading.FitWidth(width - headingLeft - left);
-            int rowHeight = Math.Max(iconSize, heading.Height);
-            icon.Location = new Point(left, y + (rowHeight - iconSize) / 2);
-            heading.Top = y + (rowHeight - heading.Height) / 2;
-            Controls.Add(icon);
-            Controls.Add(heading);
-            y += rowHeight + U(14);
-
-            Label intro = WrapLabel(
-                "IPbind gives your Ethernet adapter static IP addresses so you can reach field equipment. " +
-                "They stay in place until you click Return to DHCP.", left, y, textWidth);
-            y += intro.Height + U(12);
-
-            Label leadIn = WrapLabel(
-                "If you plug this adapter into an office, public, or home network while those addresses are still set:",
-                left, y, textWidth);
-            y += leadIn.Height + U(6);
-
-            string[] bullets = new string[]
-            {
-                "One of your addresses may already belong to a device on that network, and you could knock it offline",
-                "Your addresses may fall inside that network\u2019s DHCP pool and clash with addresses it hands out",
-                "You likely won\u2019t have internet or network access",
-                "You could trip network security alarms, which may get your laptop blocked by network admins"
-            };
-            int bulletIndent = U(20);
-            foreach (string item in bullets)
-            {
-                Label dot = new Label();
-                dot.Text = "\u2022";
-                dot.UseMnemonic = false;
-                dot.AutoSize = false;
-                dot.Location = new Point(left + U(4), y);
-                dot.Size = new Size(bulletIndent - U(4), U(20));
-                Controls.Add(dot);
-                Label text = WrapLabel(item, left + bulletIndent, y, textWidth - bulletIndent);
-                y += text.Height + U(4);
-            }
-            y += U(10);
-
-            RunsLabel closing = new RunsLabel();
-            closing.AddRun("Click ", Font, fore);
-            closing.AddRun("Return to DHCP", bodyBold, fore);
-            closing.AddRun(" before plugging this adapter into a non-air-gapped network.", Font, fore);
-            closing.Location = new Point(left, y);
-            closing.FitWidth(textWidth);
-            Controls.Add(closing);
-            y += closing.Height + U(18);
-
-            understandBox = new CheckBox();
-            understandBox.Text = "I understand";
-            understandBox.AutoSize = true;
-            understandBox.Location = new Point(left, y);
-            understandBox.CheckedChanged += delegate { continueButton.Enabled = understandBox.Checked; };
-            Controls.Add(understandBox);
-            y += understandBox.PreferredSize.Height + U(6);
-
-            dontShowBox = new CheckBox();
-            dontShowBox.Text = "Don\u2019t show this again";
-            dontShowBox.AutoSize = true;
-            dontShowBox.Location = new Point(left, y);
-            Controls.Add(dontShowBox);
-            int checkBottom = y + dontShowBox.PreferredSize.Height;
-
-            continueButton = new Button();
-            continueButton.Text = "Continue";
-            continueButton.Size = Z(110, 32);
-            continueButton.Location = new Point(width - left - continueButton.Width,
-                checkBottom - continueButton.Height);
-            continueButton.Enabled = false;
-            continueButton.DialogResult = DialogResult.OK;
-            Controls.Add(continueButton);
-            AcceptButton = continueButton;
-
-            // Way out for anyone who won't tick "I understand": closes IPbind.
-            exitButton = new Button();
-            exitButton.Text = "Exit";
-            exitButton.Size = continueButton.Size;
-            exitButton.Location = new Point(continueButton.Left - U(8) - exitButton.Width, continueButton.Top);
-            exitButton.DialogResult = DialogResult.Cancel;
-            Controls.Add(exitButton);
-            CancelButton = exitButton;
-
-            ClientSize = new Size(width, Math.Max(checkBottom, continueButton.Bottom) + U(20));
 
             if (dark)
             {
-                BackColor = Color.FromArgb(32, 32, 32);
-                ForeColor = fore;
-                foreach (Control control in Controls)
-                    if (!(control is RunsLabel)) control.ForeColor = fore;
-                continueButton.FlatStyle = FlatStyle.Flat;
-                continueButton.BackColor = Color.FromArgb(50, 50, 50);
-                continueButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-                exitButton.FlatStyle = FlatStyle.Flat;
-                exitButton.BackColor = Color.FromArgb(50, 50, 50);
-                exitButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                // Spec dark palette; replica uses the real main-window button color.
+                bodyBack = Color.FromArgb(0x2B, 0x2B, 0x2B);
+                footerBack = Color.FromArgb(0x20, 0x20, 0x20);
+                panelBack = Color.FromArgb(0x1F, 0x1F, 0x1F);
+                panelBorder = Color.FromArgb(0x3A, 0x3A, 0x3A);
+                fore = Color.White;
+                introColor = Color.FromArgb(0xE4, 0xE4, 0xE4);
+                muted = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                amber = Color.FromArgb(0xFF, 0xC8, 0x3D);
+                amberInk = Color.FromArgb(0x1F, 0x1F, 0x1F);
+                primaryBack = Color.FromArgb(0x60, 0xCD, 0xFF);
+                primaryFore = Color.FromArgb(0x10, 0x10, 0x10);
+                primaryDisabledBack = Color.FromArgb(0x2A, 0x2A, 0x2A);
+                primaryDisabledBorder = Color.FromArgb(0x38, 0x38, 0x38);
+                primaryDisabledFore = Color.FromArgb(0x8C, 0x8C, 0x8C);
+                secondaryBack = Color.FromArgb(0x33, 0x33, 0x33);
+                secondaryBorder = Color.FromArgb(0x4A, 0x4A, 0x4A);
+                secondaryFore = Color.White;
+            }
+            else
+            {
+                // Light variant: app-like light surfaces, darker amber for contrast.
+                bodyBack = Color.FromArgb(0xF5, 0xF5, 0xF5);
+                footerBack = Color.FromArgb(0xEB, 0xEB, 0xEB);
+                panelBack = Color.White;
+                panelBorder = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                fore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                introColor = Color.FromArgb(0x2A, 0x2A, 0x2A);
+                muted = Color.FromArgb(0x5A, 0x5A, 0x5A);
+                amber = Color.FromArgb(156, 92, 0);
+                amberInk = Color.White;
+                primaryBack = Color.FromArgb(25, 90, 160);
+                primaryFore = Color.White;
+                primaryDisabledBack = Color.FromArgb(0xE0, 0xE0, 0xE0);
+                primaryDisabledBorder = Color.FromArgb(0xC0, 0xC0, 0xC0);
+                primaryDisabledFore = Color.FromArgb(0x8A, 0x8A, 0x8A);
+                secondaryBack = Color.FromArgb(0xF7, 0xF7, 0xF7);
+                secondaryBorder = Color.FromArgb(0xB0, 0xB0, 0xB0);
+                secondaryFore = fore;
             }
 
+            BackColor = bodyBack;
+            ForeColor = fore;
+            Font = MakeFont(9f, FontStyle.Regular);
+
+            warningIcon = new VectorIcon(VectorIcon.Kind.Warning, amber, amberInk, bodyBack);
+            eyebrow = MakeLabel();
+            eyebrow.Text = "BEFORE YOU START";
+            title = MakeLabel();
+            title.Text = "Return to DHCP before joining a live network";
+            intro = new RunsLabel();
+            Controls.Add(warningIcon);
+            Controls.Add(eyebrow);
+            Controls.Add(title);
+            Controls.Add(intro);
+
+            card = new Panel();
+            card.BackColor = panelBack;
+            card.Paint += PaintCardBorder;
+            replica = new ButtonReplica();
+            cardHead = MakeLabel();
+            cardHead.Text = "Look for this button in the main window";
+            cardDesc = MakeLabel();
+            cardDesc.Text = "Clicking it removes the addresses you bound and returns your selected interface to DHCP, ready for a live network.";
+            card.Controls.Add(replica);
+            card.Controls.Add(cardHead);
+            card.Controls.Add(cardDesc);
+            Controls.Add(card);
+
+            lead = MakeLabel();
+            lead.Text = "If you skip it and plug into a live network (office, home, or public):";
+            Controls.Add(lead);
+
+            string[] heads = new string[]
+            {
+                "Your laptop will likely not have internet",
+                "You could knock an existing device offline",
+                "You could set off security alerts"
+            };
+            string[] descs = new string[]
+            {
+                "No web, email, or network drives until the addresses are removed.",
+                "One of your addresses may already belong to something on that network.",
+                "Network admins may block your laptop until it\u2019s sorted out."
+            };
+            VectorIcon.Kind[] kinds = new VectorIcon.Kind[]
+            {
+                VectorIcon.Kind.NoInternet,
+                VectorIcon.Kind.Devices,
+                VectorIcon.Kind.Shield
+            };
+            rowIcons = new VectorIcon[3];
+            rowHeads = new Label[3];
+            rowDescs = new Label[3];
+            for (int i = 0; i < 3; i++)
+            {
+                rowIcons[i] = new VectorIcon(kinds[i], amber, amberInk, bodyBack);
+                rowHeads[i] = MakeLabel();
+                rowHeads[i].Text = heads[i];
+                rowDescs[i] = MakeLabel();
+                rowDescs[i].Text = descs[i];
+                Controls.Add(rowIcons[i]);
+                Controls.Add(rowHeads[i]);
+                Controls.Add(rowDescs[i]);
+            }
+
+            footer = new Panel();
+            footer.BackColor = footerBack;
+            footer.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                int y = 0;
+                using (Pen pen = new Pen(dark ? Color.FromArgb(0x1A, 0x1A, 0x1A) : Color.FromArgb(0xD0, 0xD0, 0xD0)))
+                    e.Graphics.DrawLine(pen, 0, y, footer.Width, y);
+            };
+            understandBox = new CheckBox();
+            understandBox.UseMnemonic = false;
+            understandBox.AutoSize = false;
+            understandBox.CheckedChanged += delegate { ApplyContinueState(); };
+            dontShowBox = new CheckBox();
+            dontShowBox.UseMnemonic = false;
+            dontShowBox.AutoSize = false;
+            dontShowBox.Text = "Don\u2019t show this again";
+            continueButton = new Button();
+            continueButton.Text = "Continue";
+            continueButton.Enabled = false;
+            continueButton.DialogResult = DialogResult.OK;
+            continueButton.FlatStyle = FlatStyle.Flat;
+            continueButton.FlatAppearance.BorderSize = 1;
+            continueButton.Cursor = Cursors.Hand;
+            exitButton = new Button();
+            exitButton.Text = "Exit IPbind";
+            exitButton.DialogResult = DialogResult.Cancel;
+            exitButton.FlatStyle = FlatStyle.Flat;
+            exitButton.FlatAppearance.BorderSize = 1;
+            exitButton.Cursor = Cursors.Hand;
+            footer.Controls.Add(understandBox);
+            footer.Controls.Add(dontShowBox);
+            footer.Controls.Add(continueButton);
+            footer.Controls.Add(exitButton);
+            Controls.Add(footer);
+            AcceptButton = continueButton;
+            CancelButton = exitButton;
+
+            LayoutContent();
             Shown += delegate { understandBox.Focus(); };
         }
 
-        Label WrapLabel(string text, int x, int y, int width)
+        Label MakeLabel()
         {
             Label label = new Label();
-            label.Text = text;
-            label.UseMnemonic = false;
             label.AutoSize = false;
-            label.Font = Font;
-            label.Padding = Padding.Empty;
-            int height = label.GetPreferredSize(new Size(width, 0)).Height;
-            label.Location = new Point(x, y);
-            label.Size = new Size(width, height + U(2));
-            Controls.Add(label);
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
             return label;
         }
 
-        static Bitmap LoadWarningBitmap(int size)
+        Font MakeFont(float points, FontStyle style)
         {
-            // Crisp, DPI-sized stock warning icon (IDI_WARNING); falls back to SystemIcons.Warning.
+            // Pixel fonts follow sc directly, so a test scale on a 96-DPI machine
+            // and a real system-DPI scale both render at the intended size.
+            Font font = new Font("Segoe UI", points * sc * 96f / 72f, style, GraphicsUnit.Pixel);
+            fonts.Add(font);
+            return font;
+        }
+
+        void DisposeFonts()
+        {
+            foreach (Font font in fonts) font.Dispose();
+            fonts.Clear();
+        }
+
+        const TextFormatFlags WrapFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl |
+            TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+
+        Size MeasureWrap(string text, Font font, int maxWidth)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue), WrapFlags);
+                if (size.Width < 1) size.Width = maxWidth;
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        Size MeasureLine(string text, Font font)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        int MaxClientHeight()
+        {
+            Rectangle work;
+            int chromeW, chromeH;
+            if (IsHandleCreated)
+            {
+                work = Screen.FromControl(this).WorkingArea;
+                chromeW = Math.Max(0, Width - ClientSize.Width);
+                chromeH = Math.Max(0, Height - ClientSize.Height);
+            }
+            else
+            {
+                work = Screen.PrimaryScreen.WorkingArea;
+                chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
+                chromeH = SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2;
+            }
+            return Math.Max(U(360), work.Height - chromeH - 4);
+        }
+
+        int U(int value) { return (int)Math.Round(value * sc); }
+
+        void LayoutContent()
+        {
+            if (layingOut) return;
+            layingOut = true;
             try
             {
-                IntPtr handle;
-                if (LoadIconWithScaleDown(IntPtr.Zero, new IntPtr(32515), size, size, out handle) == 0 &&
-                    handle != IntPtr.Zero)
+                List<Font> previousFonts = new List<Font>(fonts);
+                fonts.Clear();
+                fontEyebrow = MakeFont(12f, FontStyle.Bold);
+                fontTitle = MakeFont(22f, FontStyle.Bold);
+                fontIntro = MakeFont(15f, FontStyle.Regular);
+                fontIntroBold = MakeFont(15f, FontStyle.Bold);
+                fontBody = MakeFont(15f, FontStyle.Bold);
+                fontBodyBold = MakeFont(15f, FontStyle.Bold);
+                fontSmall = MakeFont(13f, FontStyle.Regular);
+                fontButton = MakeFont(14f, FontStyle.Bold);
+                fontReplica = MakeFont(12f, FontStyle.Bold);
+                Font = MakeFont(9f, FontStyle.Regular);
+
+                eyebrow.Font = fontEyebrow;
+                eyebrow.ForeColor = amber;
+                title.Font = fontTitle;
+                title.ForeColor = fore;
+                cardHead.Font = fontBody;
+                cardHead.ForeColor = fore;
+                cardDesc.Font = fontSmall;
+                cardDesc.ForeColor = muted;
+                lead.Font = MakeFont(14f, FontStyle.Regular);
+                lead.ForeColor = muted;
+                for (int i = 0; i < 3; i++)
                 {
-                    try
-                    {
-                        using (Icon stock = Icon.FromHandle(handle))
-                            return stock.ToBitmap();
-                    }
-                    finally { DestroyIcon(handle); }
+                    rowHeads[i].Font = fontBody;
+                    rowHeads[i].ForeColor = fore;
+                    rowDescs[i].Font = fontSmall;
+                    rowDescs[i].ForeColor = muted;
                 }
+                understandBox.Font = MakeFont(14f, FontStyle.Regular);
+                understandBox.ForeColor = fore;
+                understandBox.BackColor = footerBack;
+                understandBox.Text = "I\u2019ll click " + UiCopy.DhcpButton + " before I plug into a live network";
+                dontShowBox.Font = MakeFont(14f, FontStyle.Regular);
+                dontShowBox.ForeColor = muted;
+                dontShowBox.BackColor = footerBack;
+                continueButton.Font = fontButton;
+                exitButton.Font = fontButton;
+                exitButton.BackColor = secondaryBack;
+                exitButton.ForeColor = secondaryFore;
+                exitButton.FlatAppearance.BorderColor = secondaryBorder;
+                ApplyContinueState();
+
+                intro.Clear();
+                intro.AddRun("The addresses you bind using this app stay on your selected interface until you click the ", fontIntro, introColor);
+                intro.AddRun(UiCopy.DhcpButton, fontIntroBold, fore);
+                intro.AddRun(" button.", fontIntro, introColor);
+
+                replica.SetCaption(UiCopy.DhcpButton, fontReplica, UiCopy.DhcpButtonBack, Color.White, sc);
+
+                float tighten = 1f;
+                for (int attempt = 0; attempt < 8; attempt++)
+                {
+                    int padX = LerpPad(32, 20, tighten);
+                    int padY = LerpPad(28, 14, tighten);
+                    int gap = LerpPad(20, 10, tighten);
+                    int listGap = LerpPad(14, 8, tighten);
+                    int footerPadX = LerpPad(32, 20, tighten);
+                    int footerPadTop = LerpPad(18, 10, tighten);
+                    int footerPadBot = LerpPad(22, 12, tighten);
+                    int footerGap = LerpPad(16, 8, tighten);
+                    int cardPadX = LerpPad(18, 12, tighten);
+                    int cardPadY = LerpPad(16, 10, tighten);
+                    int cardGap = LerpPad(18, 12, tighten);
+                    int width = U(640);
+                    int maxW = width;
+                    if (IsHandleCreated)
+                    {
+                        Rectangle work = Screen.FromControl(this).WorkingArea;
+                        int chromeW = Math.Max(0, Width - ClientSize.Width);
+                        maxW = Math.Max(U(420), work.Width - chromeW - 4);
+                    }
+                    else
+                    {
+                        int chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
+                        maxW = Math.Max(U(420), Screen.PrimaryScreen.WorkingArea.Width - chromeW - 4);
+                    }
+                    if (width > maxW) width = maxW;
+                    int inner = width - 2 * padX;
+
+                    int y = padY;
+                    int iconSize = U(36);
+                    warningIcon.SetScale(iconSize, iconSize);
+                    Size eyeSize = MeasureLine(eyebrow.Text, fontEyebrow);
+                    Size titleSize = MeasureWrap(title.Text, fontTitle, inner - iconSize - U(14));
+                    int headTextH = eyeSize.Height + U(2) + titleSize.Height;
+                    int headH = Math.Max(iconSize, headTextH);
+                    warningIcon.Location = new Point(padX, y + (headH - iconSize) / 2);
+                    int textLeft = padX + iconSize + U(14);
+                    int textW = inner - iconSize - U(14);
+                    eyebrow.Location = new Point(textLeft, y + (headH - headTextH) / 2);
+                    eyebrow.Size = new Size(textW, eyeSize.Height);
+                    title.Location = new Point(textLeft, eyebrow.Bottom + U(2));
+                    title.Size = new Size(textW, titleSize.Height);
+                    y += headH + gap;
+
+                    intro.Location = new Point(padX, y);
+                    intro.FitWidth(inner);
+                    y += intro.Height + gap;
+
+                    replica.Recalculate();
+                    Size headNeed = MeasureWrap(cardHead.Text, fontBody, Math.Max(U(80), inner - 2 * cardPadX - replica.Width - cardGap));
+                    Size descNeed = MeasureWrap(cardDesc.Text, fontSmall, Math.Max(U(80), inner - 2 * cardPadX - replica.Width - cardGap));
+                    int cardTextH = headNeed.Height + U(1) + descNeed.Height;
+                    int cardH = Math.Max(replica.Height, cardTextH) + 2 * cardPadY;
+                    card.Location = new Point(padX, y);
+                    card.Size = new Size(inner, cardH);
+                    replica.Location = new Point(cardPadX, cardPadY + (cardH - 2 * cardPadY - replica.Height) / 2);
+                    int cardTextX = cardPadX + replica.Width + cardGap;
+                    int cardTextW = inner - cardTextX - cardPadX;
+                    if (cardTextW < U(80)) cardTextW = U(80);
+                    headNeed = MeasureWrap(cardHead.Text, fontBody, cardTextW);
+                    descNeed = MeasureWrap(cardDesc.Text, fontSmall, cardTextW);
+                    cardTextH = headNeed.Height + U(1) + descNeed.Height;
+                    int cardTextY = cardPadY + Math.Max(0, (cardH - 2 * cardPadY - cardTextH) / 2);
+                    cardHead.Location = new Point(cardTextX, cardTextY);
+                    cardHead.Size = new Size(cardTextW, headNeed.Height);
+                    cardDesc.Location = new Point(cardTextX, cardHead.Bottom + U(1));
+                    cardDesc.Size = new Size(cardTextW, descNeed.Height);
+                    y += cardH + gap;
+
+                    Size leadNeed = MeasureWrap(lead.Text, lead.Font, inner);
+                    lead.Location = new Point(padX, y);
+                    lead.Size = new Size(inner, leadNeed.Height);
+                    y += lead.Height + listGap;
+
+                    int rowIcon = U(22);
+                    int rowTextX = padX + rowIcon + U(14);
+                    int rowTextW = width - padX - rowTextX;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        rowIcons[i].SetScale(rowIcon, rowIcon);
+                        Size rh = MeasureWrap(rowHeads[i].Text, fontBody, rowTextW);
+                        Size rd = MeasureWrap(rowDescs[i].Text, fontSmall, rowTextW);
+                        int rowH = Math.Max(rowIcon, rh.Height + U(1) + rd.Height);
+                        rowIcons[i].Location = new Point(padX, y + U(1));
+                        rowHeads[i].Location = new Point(rowTextX, y);
+                        rowHeads[i].Size = new Size(rowTextW, rh.Height);
+                        rowDescs[i].Location = new Point(rowTextX, rowHeads[i].Bottom + U(1));
+                        rowDescs[i].Size = new Size(rowTextW, rd.Height);
+                        y += rowH + (i == 2 ? padY : listGap);
+                    }
+
+                    int bodyBottom = y;
+                    int chkBox = U(20);
+                    int btnW = U(150);
+                    int btnH = U(40);
+                    int ackTextW = width - 2 * footerPadX - chkBox - U(12);
+                    Size ackNeed = MeasureWrap(understandBox.Text, understandBox.Font, ackTextW);
+                    Size againNeed = MeasureWrap(dontShowBox.Text, dontShowBox.Font, ackTextW);
+                    int ackH = Math.Max(chkBox, ackNeed.Height);
+                    int againH = Math.Max(chkBox, againNeed.Height);
+                    int footerH = footerPadTop + ackH + U(8) + againH + footerGap + btnH + footerPadBot;
+                    footer.Location = new Point(0, bodyBottom);
+                    footer.Size = new Size(width, footerH);
+                    understandBox.Location = new Point(footerPadX, footerPadTop);
+                    understandBox.Size = new Size(width - 2 * footerPadX, ackH);
+                    understandBox.CheckAlign = ContentAlignment.TopLeft;
+                    understandBox.TextAlign = ContentAlignment.MiddleLeft;
+                    dontShowBox.Location = new Point(footerPadX, understandBox.Bottom + U(8));
+                    dontShowBox.Size = new Size(width - 2 * footerPadX, againH);
+                    dontShowBox.CheckAlign = ContentAlignment.TopLeft;
+                    dontShowBox.TextAlign = ContentAlignment.MiddleLeft;
+                    int btnY = dontShowBox.Bottom + footerGap;
+                    exitButton.Size = new Size(btnW, btnH);
+                    continueButton.Size = new Size(btnW, btnH);
+                    exitButton.Location = new Point(width - footerPadX - btnW, btnY);
+                    continueButton.Location = new Point(exitButton.Left - U(10) - btnW, btnY);
+
+                    int clientH = bodyBottom + footerH;
+                    int maxH = MaxClientHeight();
+                    if (clientH <= maxH || tighten <= 0.01f)
+                    {
+                        ClientSize = new Size(width, clientH);
+                        break;
+                    }
+                    tighten = Math.Max(0f, tighten - 0.2f);
+                }
+                foreach (Font previous in previousFonts) previous.Dispose();
+            }
+            finally { layingOut = false; }
+        }
+
+        int LerpPad(int full, int min, float tighten)
+        {
+            return U((int)Math.Round(min + (full - min) * tighten));
+        }
+
+        void ApplyContinueState()
+        {
+            bool on = understandBox.Checked;
+            continueButton.Enabled = on;
+            if (on)
+            {
+                continueButton.BackColor = primaryBack;
+                continueButton.ForeColor = primaryFore;
+                continueButton.FlatAppearance.BorderColor = primaryBack;
+                continueButton.Cursor = Cursors.Hand;
+            }
+            else
+            {
+                continueButton.BackColor = primaryDisabledBack;
+                continueButton.ForeColor = primaryDisabledFore;
+                continueButton.FlatAppearance.BorderColor = primaryDisabledBorder;
+                continueButton.Cursor = Cursors.Default;
+            }
+        }
+
+        void PaintCardBorder(object sender, PaintEventArgs e)
+        {
+            Rectangle r = new Rectangle(0, 0, card.Width - 1, card.Height - 1);
+            int rad = Math.Max(1, U(6));
+            using (GraphicsPath path = RoundedRect(r, rad))
+            using (Pen pen = new Pen(panelBorder))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.DrawPath(pen, path);
+            }
+        }
+
+        static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        protected override void CreateHandle()
+        {
+            IntPtr previous = IntPtr.Zero;
+            bool changed = false;
+            try
+            {
+                previous = SetThreadDpiAwarenessContext(DpiAwarenessPerMonitorV2);
+                changed = previous != IntPtr.Zero && previous != DpiAwarenessPerMonitorV2;
             }
             catch { }
-            try
+            try { base.CreateHandle(); }
+            finally
             {
-                using (Icon sized = new Icon(SystemIcons.Warning, size, size))
-                    return sized.ToBitmap();
+                if (changed)
+                {
+                    try { SetThreadDpiAwarenessContext(previous); } catch { }
+                }
             }
-            catch { return SystemIcons.Warning.ToBitmap(); }
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
+            try
+            {
+                int dpi = GetDpiForWindow(Handle);
+                if (dpi > 0)
+                {
+                    float windowSc = dpi / 96f;
+                    if (Math.Abs(windowSc - sc) > 0.02f)
+                    {
+                        sc = windowSc;
+                        LayoutContent();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (dpi > 0)
+                {
+                    float newSc = dpi / 96f;
+                    if (Math.Abs(newSc - sc) > 0.001f)
+                    {
+                        sc = newSc;
+                        LayoutContent();
+                    }
+                }
+                RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                int w = Width, h = Height;
+                int x = suggested.Left, y = suggested.Top;
+                Rectangle work = Screen.FromPoint(new Point(x, y)).WorkingArea;
+                if (x + w > work.Right) x = work.Right - w;
+                if (y + h > work.Bottom) y = work.Bottom - h;
+                if (x < work.Left) x = work.Left;
+                if (y < work.Top) y = work.Top;
+                Bounds = new Rectangle(x, y, w, h);
+                return;
+            }
+            base.WndProc(ref m);
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && warningBitmap != null) warningBitmap.Dispose();
+            if (disposing) DisposeFonts();
             base.Dispose(disposing);
         }
 
-        int U(int value) { return (int)Math.Round(value * sc); }
-        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+        // Non-interactive picture of the real Return to DHCP button: same caption,
+        // color and typeface, sized to the text, no focus, hover or click.
+        sealed class ButtonReplica : Control
+        {
+            string caption = "";
+            Font font;
+            Color fill, text;
+            float sc = 1f;
+
+            public ButtonReplica()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                SetStyle(ControlStyles.Selectable, false);
+                TabStop = false;
+                Cursor = Cursors.Default;
+            }
+
+            public void SetCaption(string caption, Font font, Color fill, Color text, float sc)
+            {
+                this.caption = caption;
+                this.font = font;
+                this.fill = fill;
+                this.text = text;
+                this.sc = sc;
+                Recalculate();
+            }
+
+            public void Recalculate()
+            {
+                if (font == null)
+                {
+                    Size = new Size((int)Math.Round(80 * sc), (int)Math.Round(32 * sc));
+                    return;
+                }
+                Size need;
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                    need = TextRenderer.MeasureText(g, caption, font, new Size(int.MaxValue, int.MaxValue),
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                int padX = (int)Math.Round(18 * sc);
+                int padY = (int)Math.Round(10 * sc);
+                Size = new Size(need.Width + 2 * padX, Math.Max(need.Height + 2 * padY, (int)Math.Round(36 * sc)));
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                int rad = Math.Max(1, (int)Math.Round(3 * sc));
+                Rectangle r = new Rectangle(0, 0, Width, Height);
+                using (GraphicsPath path = RoundedRect(new Rectangle(r.X, r.Y, r.Width - 1, r.Height - 1), rad))
+                using (SolidBrush brush = new SolidBrush(fill))
+                    e.Graphics.FillPath(brush, path);
+                if (font != null)
+                    TextRenderer.DrawText(e.Graphics, caption, font, ClientRectangle, text,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                const int WM_SETCURSOR = 0x0020, WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201,
+                    WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
+                if (m.Msg == WM_SETCURSOR || m.Msg == WM_MOUSEMOVE || m.Msg == WM_LBUTTONDOWN ||
+                    m.Msg == WM_LBUTTONUP || m.Msg == WM_LBUTTONDBLCLK)
+                {
+                    if (m.Msg == WM_SETCURSOR) { m.Result = (IntPtr)1; return; }
+                    return;
+                }
+                base.WndProc(ref m);
+            }
+        }
+
+        sealed class VectorIcon : Control
+        {
+            public enum Kind { Warning, NoInternet, Devices, Shield }
+
+            readonly Kind kind;
+            readonly Color accent, ink, backdrop;
+
+            public VectorIcon(Kind kind, Color accent, Color ink, Color backdrop)
+            {
+                this.kind = kind;
+                this.accent = accent;
+                this.ink = ink;
+                this.backdrop = backdrop;
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw, true);
+                SetStyle(ControlStyles.Selectable, false);
+                TabStop = false;
+                BackColor = Color.Transparent;
+            }
+
+            public void SetScale(int width, int height)
+            {
+                Size = new Size(width, height);
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                if (Width < 2 || Height < 2) return;
+                float vb = kind == Kind.Warning ? 36f : 22f;
+                g.ScaleTransform(Width / vb, Height / vb);
+                switch (kind)
+                {
+                    case Kind.Warning:
+                        using (GraphicsPath tri = ParseSvgPath("M18 4.5L33 31H3L18 4.5z"))
+                        using (SolidBrush fill = new SolidBrush(accent))
+                        using (Pen stroke = new Pen(accent, 3f) { LineJoin = LineJoin.Round })
+                        {
+                            g.FillPath(fill, tri);
+                            g.DrawPath(stroke, tri);
+                        }
+                        using (Pen stem = new Pen(ink, 3f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                            g.DrawLine(stem, 18f, 14f, 18f, 22f);
+                        using (SolidBrush dot = new SolidBrush(ink))
+                            g.FillEllipse(dot, 18f - 1.8f, 26.5f - 1.8f, 3.6f, 3.6f);
+                        break;
+                    case Kind.NoInternet:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            g.DrawEllipse(pen, 11f - 8f, 11f - 8f, 16f, 16f);
+                            using (GraphicsPath meridians = ParseSvgPath("M3 11h16M11 3c2.6 2.4 2.6 13.6 0 16M11 3c-2.6 2.4-2.6 13.6 0 16"))
+                                g.DrawPath(pen, meridians);
+                            using (Pen knock = new Pen(backdrop, 4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                g.DrawLine(knock, 4f, 4f, 18f, 18f);
+                            g.DrawLine(pen, 4f, 4f, 18f, 18f);
+                        }
+                        break;
+                    case Kind.Devices:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            DrawRoundRect(g, pen, 2.5f, 4f, 7f, 6f, 1f);
+                            DrawRoundRect(g, pen, 12.5f, 4f, 7f, 6f, 1f);
+                            using (GraphicsPath stand = ParseSvgPath("M6 10v4h10v-4M11 14v4M8 18h6"))
+                                g.DrawPath(pen, stand);
+                        }
+                        break;
+                    case Kind.Shield:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            using (GraphicsPath shield = ParseSvgPath("M11 2.5l7 2.5v5.500c0 4.200-2.900 7.400-7 9-4.100-1.600-7-4.800-7-9V5l7-2.500z"))
+                                g.DrawPath(pen, shield);
+                            using (GraphicsPath bang = ParseSvgPath("M11 7.5v4.500M11 15v.2"))
+                                g.DrawPath(pen, bang);
+                        }
+                        break;
+                }
+            }
+
+            static void DrawRoundRect(Graphics g, Pen pen, float x, float y, float w, float h, float r)
+            {
+                using (GraphicsPath path = new GraphicsPath())
+                {
+                    float d = r * 2f;
+                    path.AddArc(x, y, d, d, 180, 90);
+                    path.AddArc(x + w - d, y, d, d, 270, 90);
+                    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+                    path.AddArc(x, y + h - d, d, d, 90, 90);
+                    path.CloseFigure();
+                    g.DrawPath(pen, path);
+                }
+            }
+        }
+
+        static GraphicsPath ParseSvgPath(string d)
+        {
+            GraphicsPath path = new GraphicsPath();
+            path.FillMode = FillMode.Winding;
+            List<object> tokens = new List<object>();
+            int i = 0;
+            while (i < d.Length)
+            {
+                char c = d[i];
+                if (char.IsWhiteSpace(c) || c == ',') { i++; continue; }
+                if (char.IsLetter(c)) { tokens.Add(c); i++; continue; }
+                int start = i;
+                if (c == '+' || c == '-') i++;
+                bool dot = false;
+                while (i < d.Length)
+                {
+                    char n = d[i];
+                    if (char.IsDigit(n)) { i++; continue; }
+                    if (n == '.' && !dot) { dot = true; i++; continue; }
+                    break;
+                }
+                if (i == start || (i == start + 1 && (d[start] == '+' || d[start] == '-')))
+                { i++; continue; }
+                float value;
+                if (float.TryParse(d.Substring(start, i - start), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out value))
+                    tokens.Add(value);
+            }
+
+            float x = 0, y = 0, sx = 0, sy = 0;
+            char cmd = 'M';
+            int t = 0;
+            while (t < tokens.Count)
+            {
+                if (tokens[t] is char)
+                {
+                    cmd = (char)tokens[t];
+                    t++;
+                    if (cmd == 'z' || cmd == 'Z')
+                    {
+                        path.CloseFigure();
+                        x = sx; y = sy;
+                        continue;
+                    }
+                }
+                bool rel = char.IsLower(cmd);
+                char op = char.ToUpperInvariant(cmd);
+                if (op == 'M' || op == 'L')
+                {
+                    if (t + 1 >= tokens.Count || !(tokens[t] is float)) break;
+                    float nx = (float)tokens[t], ny = (float)tokens[t + 1]; t += 2;
+                    if (rel) { nx += x; ny += y; }
+                    if (op == 'M') { path.StartFigure(); sx = nx; sy = ny; cmd = rel ? 'l' : 'L'; }
+                    else path.AddLine(x, y, nx, ny);
+                    x = nx; y = ny;
+                }
+                else if (op == 'H')
+                {
+                    if (t >= tokens.Count || !(tokens[t] is float)) break;
+                    float nx = (float)tokens[t]; t++;
+                    if (rel) nx += x;
+                    path.AddLine(x, y, nx, y);
+                    x = nx;
+                }
+                else if (op == 'V')
+                {
+                    if (t >= tokens.Count || !(tokens[t] is float)) break;
+                    float ny = (float)tokens[t]; t++;
+                    if (rel) ny += y;
+                    path.AddLine(x, y, x, ny);
+                    y = ny;
+                }
+                else if (op == 'C')
+                {
+                    if (t + 5 >= tokens.Count) break;
+                    float x1 = (float)tokens[t], y1 = (float)tokens[t + 1];
+                    float x2 = (float)tokens[t + 2], y2 = (float)tokens[t + 3];
+                    float x3 = (float)tokens[t + 4], y3 = (float)tokens[t + 5];
+                    t += 6;
+                    if (rel) { x1 += x; y1 += y; x2 += x; y2 += y; x3 += x; y3 += y; }
+                    path.AddBezier(x, y, x1, y1, x2, y2, x3, y3);
+                    x = x3; y = y3;
+                }
+                else break;
+            }
+            return path;
+        }
 
         // A wrapped line made of differently styled runs (e.g. a bold phrase inside
         // a sentence). Words are measured and drawn with GDI TextRenderer, the same
-        // renderer Labels use, so sizes follow the system DPI.
+        // renderer Labels use, so sizes follow the current scale.
         // Measuring MUST use the IDeviceContext overload: on .NET Framework the
         // MeasureText(string, Font, Size, flags) overload drops NoPadding and adds
         // glyph-overhang padding to every word, while DrawText(Graphics, ...) honors
@@ -1607,6 +2259,12 @@ namespace IPbind
                 TabStop = false;
             }
 
+            public void Clear()
+            {
+                words.Clear();
+                pendingSpace = false;
+            }
+
             public void AddRun(string text, Font font, Color color)
             {
                 int i = 0;
@@ -1628,7 +2286,6 @@ namespace IPbind
             public void FitWidth(int maxWidth)
             {
                 int x = 0, y = 0, lineHeight = 0, widest = 0;
-                // Screen DC: same system DPI the dialog paints at.
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                 {
                     foreach (Word word in words)
@@ -1648,7 +2305,7 @@ namespace IPbind
                         lineHeight = Math.Max(lineHeight, word.Font.Height);
                     }
                 }
-                Size = new Size(Math.Min(maxWidth, widest + 2), y + lineHeight + 2);
+                Size = new Size(Math.Min(maxWidth, Math.Max(widest + 2, 1)), y + lineHeight + 2);
             }
 
             static int Measure(Graphics g, Word word)
@@ -3134,7 +3791,7 @@ namespace IPbind
             BeginInvoke((MethodInvoker)ShowDhcpReminderIfNeeded);
         }
 
-        // Shown at every launch until the user clicks Continue with "Don't show this
+        // Shown at every launch until the user clicks Continue with "Don’t show this
         // again" ticked. Anything other than Continue closes IPbind. The flag file is new in 2.3.125, so fresh installs and the first
         // launch after updating from an older version both see it.
         void ShowDhcpReminderIfNeeded()
@@ -3562,33 +4219,33 @@ namespace IPbind
             };
             Controls.Add(btnShow);
 
-            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 406, 255, 60);
+            btnBind = MakeButton(UiCopy.ApplyButton, 20, 406, 255, 60);
             btnBind.Font = UiFont(12F, FontStyle.Bold);
-            btnBind.BackColor = Color.FromArgb(46, 125, 50);
+            btnBind.BackColor = UiCopy.ApplyButtonBack;
             btnBind.ForeColor = Color.White;
             btnBind.FlatStyle = FlatStyle.Flat;
             btnBind.FlatAppearance.BorderSize = 0;
             btnBind.Click += delegate
             {
-                SetBusy("Applying static IPs to selected LAN interface...");
+                SetBusy("Applying static IPs...");
                 bool ok = InvokeBind();
-                EndBusy(ok, "Static IPs applied to selected LAN interface",
-                            "Failed to apply static IPs to selected LAN interface");
+                EndBusy(ok, "Static IPs applied",
+                            "Failed to apply static IPs");
             };
             Controls.Add(btnBind);
 
-            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 285, 406, 255, 60);
+            btnDhcp = MakeButton(UiCopy.DhcpButton, 285, 406, 255, 60);
             btnDhcp.Font = UiFont(12F, FontStyle.Bold);
-            btnDhcp.BackColor = Color.FromArgb(25, 90, 160);
+            btnDhcp.BackColor = UiCopy.DhcpButtonBack;
             btnDhcp.ForeColor = Color.White;
             btnDhcp.FlatStyle = FlatStyle.Flat;
             btnDhcp.FlatAppearance.BorderSize = 0;
             btnDhcp.Click += delegate
             {
-                SetBusy("Returning selected LAN interface to DHCP...");
+                SetBusy("Returning to DHCP...");
                 bool ok = InvokeDhcp();
-                EndBusy(ok, "Selected LAN interface returned to DHCP",
-                            "Failed to return selected LAN interface to DHCP");
+                EndBusy(ok, "Returned to DHCP",
+                            "Failed to return to DHCP");
             };
             Controls.Add(btnDhcp);
 
