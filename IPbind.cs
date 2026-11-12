@@ -2095,8 +2095,9 @@ namespace IPbind
             }
         }
 
-        // TextRenderer without NoPadding includes GDI padding and descent so
-        // checkbox labels (glyphs such as g in "plug" / "again") are not clipped.
+        // TextRenderer without NoPadding includes GDI padding and descent.
+        // WinForms CheckBox then insets that text, so MeasureCheckHeight adds
+        // 6 CSS pixels of inset (scaled) or the descenders are still clipped.
         Size MeasureCheck(string text, Font font, int maxWidth)
         {
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
@@ -2107,6 +2108,12 @@ namespace IPbind
                 if (size.Height < font.Height) size.Height = font.Height;
                 return size;
             }
+        }
+
+        int MeasureCheckHeight(string text, Font font, int maxWidth, int minHeight)
+        {
+            Size size = MeasureCheck(text, font, maxWidth);
+            return Math.Max(minHeight, size.Height + U(6));
         }
 
         int MaxClientHeight()
@@ -2285,10 +2292,8 @@ namespace IPbind
                     int btnW = U(150);
                     int btnH = U(40);
                     int ackTextW = width - 2 * footerPadX - chkBox - U(12);
-                    Size ackNeed = MeasureCheck(understandBox.Text, understandBox.Font, ackTextW);
-                    Size againNeed = MeasureCheck(dontShowBox.Text, dontShowBox.Font, ackTextW);
-                    int ackH = Math.Max(chkBox, ackNeed.Height);
-                    int againH = Math.Max(chkBox, againNeed.Height);
+                    int ackH = MeasureCheckHeight(understandBox.Text, understandBox.Font, ackTextW, chkBox);
+                    int againH = MeasureCheckHeight(dontShowBox.Text, dontShowBox.Font, ackTextW, chkBox);
                     int footerH = footerPadTop + ackH + U(8) + againH + footerGap + btnH + footerPadBot;
                     footer.Location = new Point(0, bodyBottom);
                     footer.Size = new Size(width, footerH);
