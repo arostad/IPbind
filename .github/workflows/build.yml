@@ -130,7 +130,7 @@ jobs:
           body: |
             **Download installer: [IPbind-Installer-v${{ steps.ver.outputs.version }}.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe)**
 
-            The Installer is recommended. It installs per-user under LocalAppData and does not require administrator access for installation. IPbind still elevates when run to apply network settings with `netsh`.
+            The Installer is recommended. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
             <sub>Prefer a single file? Portable: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)</sub>
           # IPbind.exe, IPbind.exe.sha256 and version.txt are the in-app updater's
