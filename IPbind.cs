@@ -910,7 +910,7 @@ namespace IPbind
                 "App created by Andy Rostad",
                 "Andy Rostad", "https://github.com/arostad", 24, 186, 382, 22);
             LinkLabel source = MakeLink(
-                "GitHub project page", "GitHub project page",
+                "GitHub Project Page", "GitHub Project Page",
                 "https://github.com/arostad/IPbind", 24, 214, 382, 22);
             LinkLabel license = MakeLink(
                 "Released under the MIT License", "MIT License",
