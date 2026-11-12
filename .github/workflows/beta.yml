@@ -111,7 +111,7 @@ jobs:
 
           IPbind Beta is a separate app: its own name, dark-gray and amber icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
 
-          This build asks, before uninstall, whether to also remove all IPbind Beta data (unchecked by default; silent uninstalls still honor /REMOVEDATA=1). Dragging the setup reminder between monitors no longer freezes the app or paints broken buttons. The reminder checkboxes line up with the first line of text and match the body type, and the intro has the missing space in "click the Return to DHCP button."
+          The setup reminder now resizes to fit when you drag it to a monitor with a different scale, so its checkboxes and buttons are no longer cut off. The reminder and About use the lighter type weights from the design, and the reminder has larger checkboxes. In About, the GitHub project page link sits next to ipbind.com. In the main window, Keep DHCP and Gateway support share one row above Apply Static IPs.
 
           **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
 

@@ -857,18 +857,477 @@ namespace IPbind
         }
     }
 
-    sealed class AboutForm : Form
+    // Native sizing for the per-monitor dialogs (About, setup reminder). WinForms on
+    // .NET Framework turns a client size into a window size with AdjustWindowRectEx,
+    // which uses the frame metrics of the system DPI, not the window's own DPI, and it
+    // reads screens through a cache. On a monitor whose scale differs from the system
+    // scale that gives the wrong window size. These helpers size, place and measure
+    // the window in physical pixels for the DPI the window really has.
+    static class DpiWindow
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public int dwFlags; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X, Y; }
+
+        const int GWL_STYLE = -16, GWL_EXSTYLE = -20;
+        const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+        const int MONITOR_DEFAULTTONEAREST = 2;
+
+        [DllImport("user32.dll")] static extern int GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int GetDpiForSystem();
+        [DllImport("user32.dll")] static extern bool AdjustWindowRectExForDpi(ref RECT rect, int style, bool menu, int exStyle, int dpi);
+        [DllImport("user32.dll")] static extern bool AdjustWindowRectEx(ref RECT rect, int style, bool menu, int exStyle);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr hwnd, int index);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref RECT rect, int flags);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
+        [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+        public static readonly IntPtr PerMonitorV2 = new IntPtr(-4);
+
+        // Runs native calls in the window's own DPI context so no coordinate
+        // virtualization happens, whatever context the calling thread is in.
+        static IntPtr Enter(IntPtr hwnd)
+        {
+            try
+            {
+                IntPtr ctx = hwnd != IntPtr.Zero ? GetWindowDpiAwarenessContext(hwnd) : PerMonitorV2;
+                if (ctx == IntPtr.Zero) ctx = PerMonitorV2;
+                return SetThreadDpiAwarenessContext(ctx);
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        static void Leave(IntPtr previous)
+        {
+            if (previous == IntPtr.Zero) return;
+            try { SetThreadDpiAwarenessContext(previous); } catch { }
+        }
+
+        public static int WindowDpi(IntPtr hwnd)
+        {
+            try { return hwnd != IntPtr.Zero ? GetDpiForWindow(hwnd) : 0; }
+            catch { return 0; }
+        }
+
+        public static int SystemDpi()
+        {
+            try { int dpi = GetDpiForSystem(); if (dpi > 0) return dpi; }
+            catch { }
+            try { using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return (int)Math.Round(g.DpiX); }
+            catch { return 96; }
+        }
+
+        // Window size for a client size, using the frame metrics of the given DPI.
+        public static Size WindowSizeFor(IntPtr hwnd, Size client, int dpi)
+        {
+            RECT r = new RECT();
+            r.Right = client.Width;
+            r.Bottom = client.Height;
+            int style = GetWindowLong32(hwnd, GWL_STYLE);
+            int ex = GetWindowLong32(hwnd, GWL_EXSTYLE);
+            bool ok = false;
+            try { if (dpi > 0) ok = AdjustWindowRectExForDpi(ref r, style, false, ex, dpi); }
+            catch { ok = false; }
+            if (!ok)
+            {
+                r = new RECT();
+                r.Right = client.Width;
+                r.Bottom = client.Height;
+                AdjustWindowRectEx(ref r, style, false, ex);
+            }
+            return new Size(r.Right - r.Left, r.Bottom - r.Top);
+        }
+
+        public static Rectangle WorkAreaFor(IntPtr hwnd, Rectangle bounds)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r = new RECT();
+                r.Left = bounds.Left; r.Top = bounds.Top; r.Right = bounds.Right; r.Bottom = bounds.Bottom;
+                IntPtr mon = MonitorFromRect(ref r, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO info = new MONITORINFO();
+                info.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+                if (mon != IntPtr.Zero && GetMonitorInfo(mon, ref info))
+                    return Rectangle.FromLTRB(info.rcWork.Left, info.rcWork.Top, info.rcWork.Right, info.rcWork.Bottom);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Screen.PrimaryScreen.WorkingArea;
+        }
+
+        public static Rectangle Bounds(IntPtr hwnd)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (GetWindowRect(hwnd, out r)) return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Rectangle.Empty;
+        }
+
+        // Client rectangle in screen pixels.
+        public static Rectangle ClientBounds(IntPtr hwnd)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (!GetClientRect(hwnd, out r)) return Rectangle.Empty;
+                POINT p = new POINT();
+                ClientToScreen(hwnd, ref p);
+                return new Rectangle(p.X, p.Y, r.Right - r.Left, r.Bottom - r.Top);
+            }
+            catch { return Rectangle.Empty; }
+            finally { Leave(prev); }
+        }
+
+        public static void SetBounds(IntPtr hwnd, Rectangle bounds)
+        {
+            IntPtr prev = Enter(hwnd);
+            try { SetWindowPos(hwnd, IntPtr.Zero, bounds.X, bounds.Y, bounds.Width, bounds.Height, SWP_NOZORDER | SWP_NOACTIVATE); }
+            catch { }
+            finally { Leave(prev); }
+        }
+
+        // Keep the whole window, title bar first, inside one work area.
+        public static Rectangle Clamp(Rectangle window, Rectangle work)
+        {
+            int x = window.X, y = window.Y;
+            if (x + window.Width > work.Right) x = work.Right - window.Width;
+            if (y + window.Height > work.Bottom) y = work.Bottom - window.Height;
+            if (x < work.Left) x = work.Left;
+            if (y < work.Top) y = work.Top;
+            return new Rectangle(x, y, window.Width, window.Height);
+        }
+    }
+
+    // Base for the About and setup-reminder dialogs. The handle is created Per-Monitor
+    // V2 (IPbind itself stays system-DPI aware), the content is laid out in code at
+    // scale sc, and the window is sized natively so that its client area is exactly
+    // the laid-out content at the DPI the window really has. On WM_DPICHANGED the
+    // content is laid out at the new scale first, then the window is moved to the
+    // top-left of the suggested rectangle with a size computed for the new DPI, in a
+    // single SetWindowPos (no intermediate resize at the old position, which could
+    // flip the window back to the other monitor).
+    abstract class PerMonitorDialog : Form
     {
         const int WM_DPICHANGED = 0x02E0;
-        static readonly IntPtr DpiAwarenessPerMonitorV2 = new IntPtr(-4);
+        const int WM_ENTERSIZEMOVE = 0x0231;
+        const int WM_EXITSIZEMOVE = 0x0232;
+        const int WM_GETDPISCALEDSIZE = 0x02E4;
+
+        protected float sc = 1f;
+        bool followSystemScale;
+        Size layoutClient;
+        bool deferResize;
+        bool dpiChanging;
+        bool inSizeMove;
+        Rectangle layoutWork = Rectangle.Empty;
+        int pendingDpi;
+        Rectangle pendingRect;
+
+        // Test and diagnostics hooks (read by the UI harness).
+        public Size LayoutClientSize { get { return layoutClient; } }
+        public float LayoutScale { get { return sc; } }
+        public readonly List<string> DpiLog = new List<string>();
+
+        protected abstract void LayoutContent();
+
+        // scale is MainForm's system-DPI scale in the app, or a test scale. Only a
+        // real system scale follows the window's own DPI when it is first shown.
+        protected void InitScale(float scale)
+        {
+            sc = scale > 0f ? scale : 1f;
+            followSystemScale = Math.Abs(sc - DpiWindow.SystemDpi() / 96f) < 0.01f;
+        }
+
+        protected int U(int value) { return (int)Math.Round(value * sc); }
+
+        static string regularFamily, semiboldFamily;
+
+        // The mockups were drawn in Segoe UI Variable Text (Windows 11), which is
+        // lighter and a little narrower than classic Segoe UI. Use it when it is
+        // installed; Windows 10 falls back to Segoe UI. Weights follow the mockups:
+        // 400 Regular, 600 the "... Semibold" family (Regular style), 700 Bold.
+        // GDI's FontStyle.Bold is 700, which read much heavier than the 600 asked for.
+        // px is already in device pixels (callers multiply by sc exactly once).
+        protected static Font NewUiFont(float px, FontStyle style, bool semibold)
+        {
+            if (regularFamily == null)
+            {
+                bool variable = HasFamily("Segoe UI Variable Text") && HasFamily("Segoe UI Variable Text Semibold");
+                regularFamily = variable ? "Segoe UI Variable Text" : "Segoe UI";
+                semiboldFamily = variable ? "Segoe UI Variable Text Semibold"
+                    : (HasFamily("Segoe UI Semibold") ? "Segoe UI Semibold" : null);
+            }
+            if (semibold && semiboldFamily != null)
+                return new Font(semiboldFamily, px, style & ~FontStyle.Bold, GraphicsUnit.Pixel);
+            if (semibold) style |= FontStyle.Bold;
+            return new Font(regularFamily, px, style, GraphicsUnit.Pixel);
+        }
+
+        static bool HasFamily(string name)
+        {
+            try
+            {
+                using (Font f = new Font(name, 12f, FontStyle.Regular, GraphicsUnit.Pixel))
+                    return string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        int CurrentDpi()
+        {
+            int dpi = IsHandleCreated ? DpiWindow.WindowDpi(Handle) : 0;
+            return dpi > 0 ? dpi : DpiWindow.SystemDpi();
+        }
+
+        // Work area the layout must fit: the target monitor during a DPI change,
+        // otherwise the monitor the window is on.
+        protected Rectangle CurrentWorkArea()
+        {
+            if (!layoutWork.IsEmpty) return layoutWork;
+            if (IsHandleCreated) return DpiWindow.WorkAreaFor(Handle, DpiWindow.Bounds(Handle));
+            return Screen.PrimaryScreen.WorkingArea;
+        }
+
+        // Frame size (window minus client) at the window's DPI.
+        protected Size ChromeSize()
+        {
+            if (!IsHandleCreated)
+                return new Size(SystemInformation.FixedFrameBorderSize.Width * 2,
+                    SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2);
+            Size client = new Size(200, 200);
+            Size win = DpiWindow.WindowSizeFor(Handle, client, CurrentDpi());
+            return new Size(Math.Max(0, win.Width - client.Width), Math.Max(0, win.Height - client.Height));
+        }
+
+        // Call at the end of LayoutContent instead of setting ClientSize.
+        protected void SetLayoutClientSize(Size client)
+        {
+            layoutClient = client;
+            if (!IsHandleCreated) { ClientSize = client; return; }
+            if (deferResize) return;
+            Size win = DpiWindow.WindowSizeFor(Handle, client, CurrentDpi());
+            Rectangle b = DpiWindow.Bounds(Handle);
+            DpiWindow.SetBounds(Handle, new Rectangle(b.X, b.Y, win.Width, win.Height));
+        }
+
+        protected void FitOnScreen()
+        {
+            if (!IsHandleCreated) return;
+            Rectangle b = DpiWindow.Bounds(Handle);
+            Rectangle work = DpiWindow.WorkAreaFor(Handle, b);
+            Rectangle fit = DpiWindow.Clamp(b, work);
+            if (fit != b) DpiWindow.SetBounds(Handle, fit);
+        }
+
+        protected override void CreateHandle()
+        {
+            IntPtr previous = IntPtr.Zero;
+            bool changed = false;
+            try
+            {
+                previous = SetThreadDpiAwarenessContext(DpiWindow.PerMonitorV2);
+                changed = previous != IntPtr.Zero && previous != DpiWindow.PerMonitorV2;
+            }
+            catch { }
+            try { base.CreateHandle(); }
+            finally
+            {
+                if (changed)
+                {
+                    try { SetThreadDpiAwarenessContext(previous); } catch { }
+                }
+            }
+        }
 
         [DllImport("user32.dll")]
         static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
 
-        [StructLayout(LayoutKind.Sequential)]
-        struct RECT { public int Left, Top, Right, Bottom; }
+        protected override void OnShown(EventArgs e)
+        {
+            // Opened on a monitor whose scale is not the system scale (for example
+            // IPbind sits on a 100% secondary while the main screen is 150%): no
+            // WM_DPICHANGED arrives, so adopt the window's real DPI here.
+            if (followSystemScale && IsHandleCreated)
+            {
+                int dpi = DpiWindow.WindowDpi(Handle);
+                if (dpi > 0 && Math.Abs(dpi / 96f - sc) > 0.001f)
+                {
+                    Rectangle b = DpiWindow.Bounds(Handle);
+                    Log("shown: window dpi " + dpi + " differs from scale " + sc);
+                    ApplyDpi(dpi, b, false);
+                }
+            }
+            base.OnShown(e);
+            EnsureClientMatchesLayout("shown");
+        }
 
-        float sc;
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                Rectangle suggested = Rectangle.Empty;
+                if (m.LParam != IntPtr.Zero)
+                {
+                    DpiWindow.RECT r = (DpiWindow.RECT)Marshal.PtrToStructure(m.LParam, typeof(DpiWindow.RECT));
+                    suggested = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+                }
+                if (suggested.IsEmpty && IsHandleCreated) suggested = DpiWindow.Bounds(Handle);
+                OnDpiMessage(dpi, suggested);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_GETDPISCALEDSIZE && m.LParam != IntPtr.Zero && !dpiChanging)
+            {
+                // Sent just before WM_DPICHANGED. Lay out at the new scale now and
+                // report the exact window size, so the rectangle Windows suggests
+                // (and the one a drag in progress keeps using) already fits the
+                // content instead of a linear guess from the old size.
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (dpi > 0)
+                {
+                    SuspendLayout();
+                    deferResize = true;
+                    try
+                    {
+                        if (Math.Abs(dpi / 96f - sc) > 0.001f)
+                        {
+                            sc = dpi / 96f;
+                            LayoutContent();
+                        }
+                    }
+                    finally
+                    {
+                        deferResize = false;
+                        ResumeLayout(false);
+                    }
+                    Size win = DpiWindow.WindowSizeFor(Handle, layoutClient, dpi);
+                    Marshal.WriteInt32(m.LParam, 0, win.Width);
+                    Marshal.WriteInt32(m.LParam, 4, win.Height);
+                    Log("scaled-size dpi " + dpi + " -> " + win);
+                    m.Result = (IntPtr)1;
+                    return;
+                }
+            }
+            if (m.Msg == WM_ENTERSIZEMOVE) inSizeMove = true;
+            if (m.Msg == WM_EXITSIZEMOVE)
+            {
+                inSizeMove = false;
+                base.WndProc(ref m);
+                // After a drag, make sure the content scale matches the monitor
+                // and the whole dialog, title bar included, is on that monitor.
+                int dpi = DpiWindow.WindowDpi(Handle);
+                if (dpi > 0 && Math.Abs(dpi / 96f - sc) > 0.001f)
+                    ApplyDpi(dpi, DpiWindow.Bounds(Handle), true);
+                EnsureClientMatchesLayout("exit-size-move");
+                FitOnScreen();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void OnDpiMessage(int dpi, Rectangle suggested)
+        {
+            if (dpi <= 0) return;
+            if (dpiChanging)
+            {
+                // A nested change (the window crossed back while we resized it):
+                // remember the latest one and apply it after the current pass.
+                pendingDpi = dpi;
+                pendingRect = suggested;
+                return;
+            }
+            ApplyDpi(dpi, suggested, !inSizeMove);
+        }
+
+        void ApplyDpi(int dpi, Rectangle suggested, bool clamp)
+        {
+            dpiChanging = true;
+            try
+            {
+                for (int pass = 0; pass < 4 && dpi > 0; pass++)
+                {
+                    pendingDpi = 0;
+                    Log("dpi " + dpi + " suggested " + suggested + " clamp=" + clamp);
+                    Rectangle work = DpiWindow.WorkAreaFor(Handle, suggested);
+                    float newSc = dpi / 96f;
+                    SuspendLayout();
+                    deferResize = true;
+                    layoutWork = work;
+                    try
+                    {
+                        if (Math.Abs(newSc - sc) > 0.001f)
+                        {
+                            sc = newSc;
+                            LayoutContent();
+                        }
+                    }
+                    finally
+                    {
+                        deferResize = false;
+                        layoutWork = Rectangle.Empty;
+                        ResumeLayout(false);
+                    }
+                    int frameDpi = DpiWindow.WindowDpi(Handle);
+                    if (frameDpi <= 0) frameDpi = dpi;
+                    Size win = DpiWindow.WindowSizeFor(Handle, layoutClient, frameDpi);
+                    Rectangle target = new Rectangle(suggested.X, suggested.Y, win.Width, win.Height);
+                    if (clamp) target = DpiWindow.Clamp(target, work);
+                    DpiWindow.SetBounds(Handle, target);
+                    Log("placed " + DpiWindow.Bounds(Handle) + " client " + DpiWindow.ClientBounds(Handle).Size
+                        + " layout " + layoutClient + " frameDpi " + frameDpi);
+                    PerformLayout();
+                    if (pendingDpi <= 0) break;
+                    dpi = pendingDpi;
+                    suggested = pendingRect;
+                }
+            }
+            finally { dpiChanging = false; pendingDpi = 0; }
+            Invalidate(true);
+            if (IsHandleCreated)
+                BeginInvoke((MethodInvoker)delegate { EnsureClientMatchesLayout("after-dpi"); });
+        }
+
+        // Safety net: if anything left the client area different from the laid-out
+        // content (for example a frame size from the wrong DPI), resize to match.
+        void EnsureClientMatchesLayout(string why)
+        {
+            if (!IsHandleCreated || IsDisposed || layoutClient.IsEmpty) return;
+            Size client = DpiWindow.ClientBounds(Handle).Size;
+            if (client == layoutClient) return;
+            Rectangle b = DpiWindow.Bounds(Handle);
+            Size win = new Size(b.Width + layoutClient.Width - client.Width, b.Height + layoutClient.Height - client.Height);
+            Rectangle target = new Rectangle(b.X, b.Y, win.Width, win.Height);
+            if (!inSizeMove) target = DpiWindow.Clamp(target, DpiWindow.WorkAreaFor(Handle, b));
+            DpiWindow.SetBounds(Handle, target);
+            Log(why + ": client was " + client + ", fixed to " + DpiWindow.ClientBounds(Handle).Size);
+        }
+
+        void Log(string line)
+        {
+            if (DpiLog.Count < 200) DpiLog.Add(line);
+        }
+    }
+
+    sealed class AboutForm : PerMonitorDialog
+    {
         readonly bool dark;
         readonly string updateCheckFile;
         readonly bool portableCopy;
@@ -881,6 +1340,7 @@ namespace IPbind
         readonly Label nameLabel;
         readonly Label versionLabel;
         readonly LinkLabel website;
+        readonly Label siteSeparator;
         readonly Label matchLabel;
         readonly Label tagline;
         readonly LinkLabel creditLink;
@@ -898,7 +1358,6 @@ namespace IPbind
         readonly List<Font> retiredFonts = new List<Font>();
         Font fontName, fontVersion, fontBody, fontPrivacy, fontStatus, fontButton, fontButtonBold;
         bool layingOut;
-        bool dpiChanging;
         bool settingLaunchCheck;
         UpdateInfo availableUpdate;
 
@@ -906,7 +1365,7 @@ namespace IPbind
         {
             this.updateCheckFile = updateCheckFile;
             this.dark = dark;
-            sc = scale > 0f ? scale : 1f;
+            InitScale(scale);
             Text = "About " + BuildInfo.AppName;
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -971,7 +1430,10 @@ namespace IPbind
             tagline = MakeLabel();
             tagline.Text = "One-click Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges";
             creditLink = MakeLink("App created by Andy Rostad", "Andy Rostad", "https://github.com/arostad");
-            sourceLink = MakeLink("GitHub Project Page", "GitHub Project Page", "https://github.com/arostad/IPbind");
+            sourceLink = MakeLink("GitHub project page", "GitHub project page", "https://github.com/arostad/IPbind");
+            siteSeparator = MakeLabel();
+            siteSeparator.Text = "\u00B7";
+            siteSeparator.AccessibleRole = AccessibleRole.Separator;
             licenseLink = MakeLink("Released under the MIT License", "MIT License",
                 "https://github.com/arostad/IPbind/blob/main/LICENSE");
 
@@ -1025,10 +1487,11 @@ namespace IPbind
             Controls.Add(nameLabel);
             Controls.Add(versionLabel);
             Controls.Add(website);
+            Controls.Add(siteSeparator);
+            Controls.Add(sourceLink);
             Controls.Add(matchLabel);
             Controls.Add(tagline);
             Controls.Add(creditLink);
-            Controls.Add(sourceLink);
             Controls.Add(licenseLink);
             Controls.Add(launchCheckBox);
             Controls.Add(enableLaunchLink);
@@ -1087,7 +1550,14 @@ namespace IPbind
 
         Font MakeFont(float px, FontStyle style)
         {
-            Font font = new Font("Segoe UI", px * sc, style, GraphicsUnit.Pixel);
+            Font font = NewUiFont(px * sc, style, false);
+            fonts.Add(font);
+            return font;
+        }
+
+        Font MakeSemibold(float px)
+        {
+            Font font = NewUiFont(px * sc, FontStyle.Regular, true);
             fonts.Add(font);
             return font;
         }
@@ -1117,7 +1587,6 @@ namespace IPbind
             }
         }
 
-        int U(int value) { return (int)Math.Round(value * sc); }
 
         int LinkWidth(string text, Font font)
         {
@@ -1126,7 +1595,7 @@ namespace IPbind
             return MeasureLine(text, font).Width + U(16);
         }
 
-        void LayoutContent()
+        protected override void LayoutContent()
         {
             if (layingOut) return;
             layingOut = true;
@@ -1134,13 +1603,13 @@ namespace IPbind
             {
                 List<Font> previous = new List<Font>(fonts);
                 fonts.Clear();
-                fontName = MakeFont(22f, FontStyle.Bold);
+                fontName = MakeSemibold(22f);
                 fontVersion = MakeFont(14f, FontStyle.Bold);
                 fontBody = MakeFont(14f, FontStyle.Regular);
                 fontPrivacy = MakeFont(12f, FontStyle.Regular);
                 fontStatus = MakeFont(13f, FontStyle.Regular);
                 fontButton = MakeFont(14f, FontStyle.Regular);
-                fontButtonBold = MakeFont(14f, FontStyle.Bold);
+                fontButtonBold = MakeSemibold(14f);
                 Font = MakeFont(9f, FontStyle.Regular);
 
                 nameLabel.Font = fontName; nameLabel.ForeColor = fore;
@@ -1151,7 +1620,8 @@ namespace IPbind
                 matchLabel.ForeColor = quiet;
                 tagline.Font = fontBody; tagline.ForeColor = muted;
                 StyleLink(creditLink); creditLink.Font = fontBody; creditLink.ForeColor = fore;
-                StyleLink(sourceLink); sourceLink.Font = fontBody; sourceLink.ForeColor = fore;
+                StyleLink(sourceLink); sourceLink.Font = fontBody;
+                siteSeparator.Font = fontBody; siteSeparator.ForeColor = quiet;
                 StyleLink(licenseLink); licenseLink.Font = fontBody; licenseLink.ForeColor = fore;
                 launchCheckBox.Font = fontBody;
                 launchCheckBox.ForeColor = fore;
@@ -1190,6 +1660,12 @@ namespace IPbind
                 Size verSize = MeasureLine(versionLabel.Text, fontVersion);
                 Size siteSize = MeasureLine(website.Text, fontBody);
                 int stackH = nameSize.Height + U(2) + verSize.Height + U(2) + siteSize.Height;
+                {
+                    int lineW = siteSize.Width + 2 * U(8) + MeasureLine(siteSeparator.Text, fontBody).Width
+                        + MeasureLine(sourceLink.Text, fontBody).Width;
+                    if (lineW + U(4) > stackW)
+                        stackH += U(2) + MeasureLine(sourceLink.Text, fontBody).Height;
+                }
                 if (matchLabel.Visible)
                     stackH += U(2) + MeasureLine(matchLabel.Text, matchLabel.Font).Height;
                 int heroH = Math.Max(iconPx, stackH);
@@ -1199,13 +1675,40 @@ namespace IPbind
                 nameLabel.Size = new Size(stackW, nameSize.Height);
                 versionLabel.Location = new Point(stackX, nameLabel.Bottom + U(2));
                 versionLabel.Size = new Size(stackW, verSize.Height);
+                // "ipbind.com  ·  GitHub project page" on one line; the GitHub link
+                // drops under the website only if the line would not fit.
+                Size srcSize = MeasureLine(sourceLink.Text, fontBody);
+                Size sepSize = MeasureLine(siteSeparator.Text, fontBody);
+                int sepGap = U(8);
+                int oneLineW = siteSize.Width + sepGap + sepSize.Width + sepGap + srcSize.Width;
+                bool siteOneLine = oneLineW + U(4) <= stackW;
                 website.Location = new Point(stackX, versionLabel.Bottom + U(2));
-                website.Size = new Size(Math.Min(stackW, LinkWidth(website.Text, fontBody)), siteSize.Height);
-                int afterHero = Math.Max(iconBox.Bottom, website.Bottom);
+                // LinkLabel needs slack or it wraps; the slack sits under the separator.
+                website.Size = new Size(Math.Min(stackW, siteSize.Width + U(16)), siteSize.Height);
+                int siteBottom = website.Bottom;
+                if (siteOneLine)
+                {
+                    siteSeparator.Visible = true;
+                    siteSeparator.Location = new Point(stackX + siteSize.Width + sepGap, website.Top);
+                    siteSeparator.Size = new Size(sepSize.Width + U(16), siteSize.Height);
+                    int srcX = siteSeparator.Left + sepSize.Width + sepGap;
+                    sourceLink.Location = new Point(srcX, website.Top);
+                    sourceLink.Size = new Size(Math.Max(1, Math.Min(stackX + stackW - srcX, LinkWidth(sourceLink.Text, fontBody))), srcSize.Height);
+                    siteSeparator.BringToFront();
+                    sourceLink.BringToFront();
+                }
+                else
+                {
+                    siteSeparator.Visible = false;
+                    sourceLink.Location = new Point(stackX, website.Bottom + U(2));
+                    sourceLink.Size = new Size(Math.Min(stackW, LinkWidth(sourceLink.Text, fontBody)), srcSize.Height);
+                    siteBottom = sourceLink.Bottom;
+                }
+                int afterHero = Math.Max(iconBox.Bottom, siteBottom);
                 if (matchLabel.Visible)
                 {
                     Size matchSize = MeasureLine(matchLabel.Text, matchLabel.Font);
-                    matchLabel.Location = new Point(stackX, website.Bottom + U(2));
+                    matchLabel.Location = new Point(stackX, siteBottom + U(2));
                     matchLabel.Size = new Size(stackW, matchSize.Height);
                     afterHero = Math.Max(iconBox.Bottom, matchLabel.Bottom);
                 }
@@ -1216,29 +1719,11 @@ namespace IPbind
                 tagline.Size = new Size(inner, tagSize.Height);
                 y = tagline.Bottom + U(18);
 
-                // Credit and GitHub share a wrapping row; the license always starts the next line.
-                int gap = U(28);
-                int x = padX;
-                int rowH = 0;
-                int rowTop = y;
-                LinkLabel[] pair = new LinkLabel[] { creditLink, sourceLink };
-                foreach (LinkLabel link in pair)
-                {
-                    Size need = MeasureLine(link.Text, fontBody);
-                    int w = LinkWidth(link.Text, fontBody);
-                    if (x > padX && x + w > padX + inner)
-                    {
-                        y = rowTop + rowH + U(8);
-                        x = padX;
-                        rowTop = y;
-                        rowH = 0;
-                    }
-                    link.Location = new Point(x, rowTop);
-                    link.Size = new Size(w, need.Height);
-                    x += w + gap;
-                    rowH = Math.Max(rowH, need.Height);
-                }
-                y = rowTop + rowH + U(8);
+                // Credit and license stacked, left-aligned, nothing to their right.
+                Size creditNeed = MeasureLine(creditLink.Text, fontBody);
+                creditLink.Location = new Point(padX, y);
+                creditLink.Size = new Size(Math.Min(inner, LinkWidth(creditLink.Text, fontBody)), creditNeed.Height);
+                y = creditLink.Bottom + U(8);
                 Size licNeed = MeasureLine(licenseLink.Text, fontBody);
                 licenseLink.Location = new Point(padX, y);
                 licenseLink.Size = new Size(Math.Min(inner, LinkWidth(licenseLink.Text, fontBody)), licNeed.Height);
@@ -1308,7 +1793,7 @@ namespace IPbind
                 checkButton.Location = new Point(footerPadX, footerPadTop);
                 closeButton.Location = new Point(width - footerPadX - closeW, footerPadTop);
 
-                ClientSize = new Size(width, y + footerH);
+                SetLayoutClientSize(new Size(width, y + footerH));
 
                 // Keep the previous fonts alive until the form is disposed.
                 // Disposing here can paint a button with a freed Font
@@ -1330,18 +1815,6 @@ namespace IPbind
         {
             statusLabel.Text = text ?? "";
             LayoutContent();
-        }
-
-        void FitOnScreen()
-        {
-            if (!IsHandleCreated) return;
-            Rectangle work = Screen.FromControl(this).WorkingArea;
-            int x = Left, y = Top, w = Width, h = Height;
-            if (x + w > work.Right) x = work.Right - w;
-            if (y + h > work.Bottom) y = work.Bottom - h;
-            if (x < work.Left) x = work.Left;
-            if (y < work.Top) y = work.Top;
-            Location = new Point(x, y);
         }
 
         Bitmap LoadAppIcon(int px)
@@ -1441,70 +1914,10 @@ namespace IPbind
             return null;
         }
 
-        protected override void CreateHandle()
-        {
-            IntPtr previous = IntPtr.Zero;
-            bool changed = false;
-            try
-            {
-                previous = SetThreadDpiAwarenessContext(DpiAwarenessPerMonitorV2);
-                changed = previous != IntPtr.Zero && previous != DpiAwarenessPerMonitorV2;
-            }
-            catch { }
-            try { base.CreateHandle(); }
-            finally
-            {
-                if (changed)
-                {
-                    try { SetThreadDpiAwarenessContext(previous); } catch { }
-                }
-            }
-        }
-
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_DPICHANGED)
-            {
-                ApplyDpiChanged(ref m);
-                return;
-            }
-            base.WndProc(ref m);
-        }
-
-        void ApplyDpiChanged(ref Message m)
-        {
-            if (dpiChanging) return;
-            dpiChanging = true;
-            try
-            {
-                SuspendLayout();
-                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
-                if (dpi > 0)
-                {
-                    float newSc = dpi / 96f;
-                    if (Math.Abs(newSc - sc) > 0.001f)
-                    {
-                        sc = newSc;
-                        LayoutContent();
-                    }
-                }
-                // Use the rectangle Windows already computed so the window
-                // stays on the target monitor (do not clamp the old origin
-                // with the new size — that can bounce it back).
-                if (m.LParam != IntPtr.Zero)
-                {
-                    RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-                    Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
-                }
-                ResumeLayout(true);
-            }
-            finally { dpiChanging = false; }
         }
 
         protected override void Dispose(bool disposing)
@@ -1854,20 +2267,8 @@ namespace IPbind
     // are drawn in pixels at that scale. WM_DPICHANGED / DpiChanged re-lays out the
     // dialog if it moves to a monitor at a different scale. Standard title bar (no
     // WM_NCCALCSIZE). FixedDialog, so DWMWA_BORDER_COLOR-while-maximized does not apply.
-    sealed class DhcpReminderForm : Form
+    sealed class DhcpReminderForm : PerMonitorDialog
     {
-        const int WM_DPICHANGED = 0x02E0;
-        static readonly IntPtr DpiAwarenessPerMonitorV2 = new IntPtr(-4);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
-        [DllImport("user32.dll")]
-        static extern int GetDpiForWindow(IntPtr hwnd);
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct RECT { public int Left, Top, Right, Bottom; }
-
-        float sc;
         readonly bool dark;
         readonly Color bodyBack, footerBack, panelBack, panelBorder, fore, muted, introColor, amber, amberInk;
         readonly Color primaryBack, primaryFore, primaryDisabledBack, primaryDisabledBorder, primaryDisabledFore;
@@ -1895,16 +2296,15 @@ namespace IPbind
 
         readonly List<Font> fonts = new List<Font>();
         readonly List<Font> retiredFonts = new List<Font>();
-        Font fontEyebrow, fontTitle, fontIntro, fontIntroBold, fontBody, fontBodyBold, fontSmall, fontButton, fontReplica;
+        Font fontEyebrow, fontTitle, fontIntro, fontIntroBold, fontBody, fontBodyBold, fontSmall, fontButton, fontButtonRegular, fontReplica;
         bool layingOut;
-        bool dpiChanging;
 
         public bool DontShowAgain { get { return dontShowBox.Checked; } }
 
         public DhcpReminderForm(Form owner, bool dark, float scale)
         {
             this.dark = dark;
-            sc = scale > 0f ? scale : 1f;
+            InitScale(scale);
             Text = BuildInfo.AppName;
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -2031,14 +2431,14 @@ namespace IPbind
                 using (Pen pen = new Pen(dark ? Color.FromArgb(0x1A, 0x1A, 0x1A) : Color.FromArgb(0xD0, 0xD0, 0xD0)))
                     e.Graphics.DrawLine(pen, 0, y, footer.Width, y);
             };
-            understandBox = new CheckBox();
+            understandBox = new RoundCheckBox();
             understandBox.UseMnemonic = false;
             understandBox.AutoSize = false;
             understandBox.UseCompatibleTextRendering = false;
             understandBox.CheckedChanged += delegate { ApplyContinueState(); };
             understandLabel = MakeLabel();
             understandLabel.Click += delegate { understandBox.Checked = !understandBox.Checked; };
-            dontShowBox = new CheckBox();
+            dontShowBox = new RoundCheckBox();
             dontShowBox.UseMnemonic = false;
             dontShowBox.AutoSize = false;
             dontShowBox.UseCompatibleTextRendering = false;
@@ -2090,7 +2490,14 @@ namespace IPbind
             // Spec typography is in CSS pixels at 96 DPI. Multiply by sc so a
             // test scale on a 96-DPI machine and a real system-DPI scale both
             // render at the intended size (not points, which would be 33% larger).
-            Font font = new Font("Segoe UI", px * sc, style, GraphicsUnit.Pixel);
+            Font font = NewUiFont(px * sc, style, false);
+            fonts.Add(font);
+            return font;
+        }
+
+        Font MakeSemibold(float px)
+        {
+            Font font = NewUiFont(px * sc, FontStyle.Regular, true);
             fonts.Add(font);
             return font;
         }
@@ -2130,29 +2537,16 @@ namespace IPbind
 
         int MaxClientHeight()
         {
-            Rectangle work;
-            int chromeW, chromeH;
-            if (IsHandleCreated)
-            {
-                work = Screen.FromControl(this).WorkingArea;
-                chromeW = Math.Max(0, Width - ClientSize.Width);
-                chromeH = Math.Max(0, Height - ClientSize.Height);
-            }
-            else
-            {
-                work = Screen.PrimaryScreen.WorkingArea;
-                chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
-                chromeH = SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2;
-            }
+            Rectangle work = CurrentWorkArea();
+            int chromeH = ChromeSize().Height;
             // Also cap to a 1080p working area (1920x1040) so 200% still fits
             // when the current screen is taller (CI runners often have no taskbar).
             int workH = Math.Min(work.Height, 1040);
             return Math.Max(U(360), workH - chromeH - 16);
         }
 
-        int U(int value) { return (int)Math.Round(value * sc); }
 
-        void LayoutContent()
+        protected override void LayoutContent()
         {
             if (layingOut) return;
             layingOut = true;
@@ -2160,15 +2554,16 @@ namespace IPbind
             {
                 List<Font> previousFonts = new List<Font>(fonts);
                 fonts.Clear();
-                fontEyebrow = MakeFont(12f, FontStyle.Bold);
-                fontTitle = MakeFont(22f, FontStyle.Bold);
+                fontEyebrow = MakeSemibold(12f);
+                fontTitle = MakeSemibold(22f);
                 fontIntro = MakeFont(15f, FontStyle.Regular);
-                fontIntroBold = MakeFont(15f, FontStyle.Bold);
-                fontBody = MakeFont(15f, FontStyle.Bold);
-                fontBodyBold = MakeFont(15f, FontStyle.Bold);
+                fontIntroBold = MakeSemibold(15f);
+                fontBody = MakeSemibold(15f);
+                fontBodyBold = MakeSemibold(15f);
                 fontSmall = MakeFont(13f, FontStyle.Regular);
-                fontButton = MakeFont(14f, FontStyle.Bold);
-                fontReplica = MakeFont(12f, FontStyle.Bold);
+                fontButton = MakeSemibold(14f);
+                fontButtonRegular = MakeFont(14f, FontStyle.Regular);
+                fontReplica = MakeFont(15f, FontStyle.Bold);
                 Font = MakeFont(9f, FontStyle.Regular);
 
                 eyebrow.Font = fontEyebrow;
@@ -2193,6 +2588,7 @@ namespace IPbind
                 understandBox.ForeColor = fore;
                 understandBox.BackColor = footerBack;
                 understandBox.Text = "";
+                StyleCheck(understandBox);
                 understandLabel.Font = fontCheck;
                 understandLabel.ForeColor = fore;
                 understandLabel.BackColor = Color.Transparent;
@@ -2202,13 +2598,14 @@ namespace IPbind
                 dontShowBox.ForeColor = muted;
                 dontShowBox.BackColor = footerBack;
                 dontShowBox.Text = "";
+                StyleCheck(dontShowBox);
                 dontShowLabel.Font = fontCheck;
                 dontShowLabel.ForeColor = muted;
                 dontShowLabel.BackColor = Color.Transparent;
                 dontShowLabel.Text = "Don\u2019t show this again";
                 dontShowBox.AccessibleName = dontShowLabel.Text;
                 continueButton.Font = fontButton;
-                exitButton.Font = fontButton;
+                exitButton.Font = fontButtonRegular;
                 exitButton.BackColor = secondaryBack;
                 exitButton.ForeColor = secondaryFore;
                 exitButton.FlatAppearance.BorderColor = secondaryBorder;
@@ -2221,8 +2618,12 @@ namespace IPbind
 
                 replica.SetCaption(UiCopy.DhcpButton, fontReplica, UiCopy.DhcpButtonBack, Color.White, sc);
 
+                // Tighten the spacing first; if it still does not fit the work area
+                // (200% on a 1080p screen), widen the dialog so text wraps less.
                 float tighten = 1f;
-                for (int attempt = 0; attempt < 8; attempt++)
+                int extraW = 0;
+                const int maxAttempts = 40;
+                for (int attempt = 0; attempt < maxAttempts; attempt++)
                 {
                     int padX = LerpPad(32, 20, tighten);
                     int padY = LerpPad(28, 14, tighten);
@@ -2235,18 +2636,12 @@ namespace IPbind
                     int cardPadX = LerpPad(18, 12, tighten);
                     int cardPadY = LerpPad(16, 10, tighten);
                     int cardGap = LerpPad(18, 12, tighten);
-                    int width = U(640);
+                    int width = U(640) + extraW;
                     int maxW = width;
-                    if (IsHandleCreated)
                     {
-                        Rectangle work = Screen.FromControl(this).WorkingArea;
-                        int chromeW = Math.Max(0, Width - ClientSize.Width);
-                        maxW = Math.Max(U(420), work.Width - chromeW - 4);
-                    }
-                    else
-                    {
-                        int chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
-                        maxW = Math.Max(U(420), Screen.PrimaryScreen.WorkingArea.Width - chromeW - 4);
+                        Rectangle work = CurrentWorkArea();
+                        int chromeW = ChromeSize().Width;
+                        maxW = Math.Max(U(420), Math.Min(work.Width, 1920) - chromeW - 4);
                     }
                     if (width > maxW) width = maxW;
                     int inner = width - 2 * padX;
@@ -2318,8 +2713,7 @@ namespace IPbind
                     int chkBox = U(20);
                     int btnW = U(150);
                     int btnH = U(40);
-                    int chkGap = U(8);
-                    int ackTextW = width - 2 * footerPadX - chkBox - chkGap;
+                    int ackTextW = width - 2 * footerPadX - chkBox - U(12);
                     int ackH = LayoutCheckRow(understandBox, understandLabel, footerPadX, footerPadTop, ackTextW, chkBox);
                     int againTop = footerPadTop + ackH + U(8);
                     int againH = LayoutCheckRow(dontShowBox, dontShowLabel, footerPadX, againTop, ackTextW, chkBox);
@@ -2334,12 +2728,15 @@ namespace IPbind
 
                     int clientH = bodyBottom + footerH;
                     int maxH = MaxClientHeight();
-                    if (clientH <= maxH || tighten <= 0.01f)
+                    // Widen by at most 240 design px (1520 px at 200%).
+                    bool widest = width >= maxW || extraW >= U(240);
+                    if (clientH <= maxH || (tighten <= 0.01f && widest) || attempt == maxAttempts - 1)
                     {
-                        ClientSize = new Size(width, clientH);
+                        SetLayoutClientSize(new Size(width, clientH));
                         break;
                     }
-                    tighten = Math.Max(0f, tighten - 0.2f);
+                    if (tighten > 0.01f) tighten = Math.Max(0f, tighten - 0.2f);
+                    else extraW += U(40);
                 }
                 // Hold old fonts until Dispose. Freeing them here, while a
                 // button paint is still queued, throws GDI+ "Parameter is not valid".
@@ -2351,16 +2748,18 @@ namespace IPbind
         // Glyph centered on the first line of the label (MiddleLeft when the
         // text is one line; first-line center when it wraps). The caption lives
         // on a Label so it uses the same GDI TextRenderer and weight as body text.
+        // The box control is the 20px square plus a focus-ring margin on each side.
         int LayoutCheckRow(CheckBox box, Label caption, int x, int y, int textW, int chkBox)
         {
             Size need = MeasureWrap(caption.Text ?? "", caption.Font, textW);
             int firstH = MeasureLine(caption.Text ?? "Ag", caption.Font).Height;
             int rowH = Math.Max(chkBox, need.Height + U(6));
-            caption.Location = new Point(x + chkBox + U(8), y);
+            caption.Location = new Point(x + chkBox + U(12), y);
             caption.Size = new Size(textW, rowH);
-            int boxY = y + Math.Max(0, (firstH - chkBox) / 2);
-            box.Size = new Size(chkBox, chkBox);
-            box.Location = new Point(x, boxY);
+            int boxY = y + (firstH - chkBox) / 2;
+            int ring = RoundCheckBox.RingFor(sc);
+            box.Size = new Size(chkBox + 2 * ring, chkBox + 2 * ring);
+            box.Location = new Point(x - ring, boxY - ring);
             box.CheckAlign = ContentAlignment.MiddleLeft;
             box.TextAlign = ContentAlignment.MiddleLeft;
             return rowH;
@@ -2369,20 +2768,6 @@ namespace IPbind
         int LerpPad(int full, int min, float tighten)
         {
             return U((int)Math.Round(min + (full - min) * tighten));
-        }
-
-        void FitOnScreen()
-        {
-            // Reposition only. Relaying out here would dispose fonts while the
-            // dialog is visible and can throw GDI+ "Parameter is not valid".
-            if (!IsHandleCreated) return;
-            Rectangle work = Screen.FromControl(this).WorkingArea;
-            int x = Left, y = Top, w = Width, h = Height;
-            if (x + w > work.Right) x = work.Right - w;
-            if (y + h > work.Bottom) y = work.Bottom - h;
-            if (x < work.Left) x = work.Left;
-            if (y < work.Top) y = work.Top;
-            Location = new Point(x, y);
         }
 
         void ApplyContinueState()
@@ -2434,26 +2819,6 @@ namespace IPbind
             return path;
         }
 
-        protected override void CreateHandle()
-        {
-            IntPtr previous = IntPtr.Zero;
-            bool changed = false;
-            try
-            {
-                previous = SetThreadDpiAwarenessContext(DpiAwarenessPerMonitorV2);
-                changed = previous != IntPtr.Zero && previous != DpiAwarenessPerMonitorV2;
-            }
-            catch { }
-            try { base.CreateHandle(); }
-            finally
-            {
-                if (changed)
-                {
-                    try { SetThreadDpiAwarenessContext(previous); } catch { }
-                }
-            }
-        }
-
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -2463,50 +2828,102 @@ namespace IPbind
             // by WM_DPICHANGED; do not overwrite a simulated scale here.
         }
 
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_DPICHANGED)
-            {
-                ApplyDpiChanged(ref m);
-                return;
-            }
-            base.WndProc(ref m);
-        }
-
-        void ApplyDpiChanged(ref Message m)
-        {
-            if (dpiChanging) return;
-            dpiChanging = true;
-            try
-            {
-                SuspendLayout();
-                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
-                if (dpi > 0)
-                {
-                    float newSc = dpi / 96f;
-                    if (Math.Abs(newSc - sc) > 0.001f)
-                    {
-                        sc = newSc;
-                        LayoutContent();
-                    }
-                }
-                // Use the rectangle Windows already computed so the window
-                // stays on the target monitor (do not clamp the old origin
-                // with the new size — that can bounce it back).
-                if (m.LParam != IntPtr.Zero)
-                {
-                    RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-                    Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
-                }
-                ResumeLayout(true);
-            }
-            finally { dpiChanging = false; }
-        }
-
         protected override void Dispose(bool disposing)
         {
             if (disposing) DisposeFonts();
             base.Dispose(disposing);
+        }
+
+        void StyleCheck(CheckBox box)
+        {
+            RoundCheckBox round = box as RoundCheckBox;
+            if (round == null) return;
+            round.Surface = footerBack;
+            round.BoxFill = Color.White;
+            round.BoxBorder = dark ? Color.FromArgb(0x76, 0x76, 0x76) : Color.FromArgb(0x5A, 0x5A, 0x5A);
+            round.CheckedFill = primaryBack;
+            round.CheckMark = primaryFore;
+            round.FocusColor = fore;
+            round.DrawScale = sc;
+            round.Invalidate();
+        }
+
+        // The mockup's checkbox: a 20px rounded white square (accent fill and a
+        // check mark when ticked), drawn at the dialog's own scale. The themed
+        // WinForms glyph stays 13px at the system DPI, so it looked tiny at 150%.
+        // Still a real CheckBox: keyboard, Space, focus and accessibility as usual.
+        sealed class RoundCheckBox : CheckBox
+        {
+            public Color Surface = Color.Black, BoxFill = Color.White, BoxBorder = Color.Gray;
+            public Color CheckedFill = Color.DodgerBlue, CheckMark = Color.Black, FocusColor = Color.White;
+            public float DrawScale = 1f;
+
+            public static int RingFor(float scale) { return Math.Max(2, (int)Math.Round(3 * scale)); }
+
+            public RoundCheckBox()
+            {
+                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                    ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                AutoSize = false;
+                UseMnemonic = false;
+                Text = "";
+                Cursor = Cursors.Hand;
+            }
+
+            protected override void OnCheckedChanged(EventArgs e)
+            {
+                base.OnCheckedChanged(e);
+                Invalidate();
+            }
+
+            protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+            protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Surface);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                int ring = RingFor(DrawScale);
+                Rectangle box = new Rectangle(ring, ring, Width - 2 * ring - 1, Height - 2 * ring - 1);
+                if (box.Width < 4 || box.Height < 4) return;
+                int rad = Math.Max(2, (int)Math.Round(3 * DrawScale));
+                using (GraphicsPath path = RoundedRect(box, rad))
+                {
+                    if (Checked)
+                    {
+                        using (SolidBrush fill = new SolidBrush(CheckedFill)) g.FillPath(fill, path);
+                        float w = box.Width, h = box.Height;
+                        PointF[] mark = new PointF[]
+                        {
+                            new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
+                            new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
+                            new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
+                        };
+                        using (Pen pen = new Pen(CheckMark, Math.Max(1.6f, 2f * DrawScale)))
+                        {
+                            pen.StartCap = LineCap.Round;
+                            pen.EndCap = LineCap.Round;
+                            pen.LineJoin = LineJoin.Round;
+                            g.DrawLines(pen, mark);
+                        }
+                    }
+                    else
+                    {
+                        using (SolidBrush fill = new SolidBrush(BoxFill)) g.FillPath(fill, path);
+                        using (Pen pen = new Pen(BoxBorder, Math.Max(1f, (float)Math.Round(DrawScale))))
+                            g.DrawPath(pen, path);
+                    }
+                }
+                if (Focused && ShowFocusCues)
+                {
+                    Rectangle outer = new Rectangle(0, 0, Width - 1, Height - 1);
+                    using (GraphicsPath focus = RoundedRect(outer, rad + ring))
+                    using (Pen pen = new Pen(FocusColor, Math.Max(1f, (float)Math.Round(DrawScale))))
+                        g.DrawPath(pen, focus);
+                }
+            }
         }
 
         // Non-interactive picture of the real Return to DHCP button: same caption,
@@ -2548,9 +2965,11 @@ namespace IPbind
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                     need = TextRenderer.MeasureText(g, caption, font, new Size(int.MaxValue, int.MaxValue),
                         TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                // Mockup: a 176x60 button with 15px bold text, centered.
                 int padX = (int)Math.Round(18 * sc);
                 int padY = (int)Math.Round(10 * sc);
-                Size = new Size(need.Width + 2 * padX, Math.Max(need.Height + 2 * padY, (int)Math.Round(36 * sc)));
+                Size = new Size(Math.Max(need.Width + 2 * padX, (int)Math.Round(176 * sc)),
+                    Math.Max(need.Height + 2 * padY, (int)Math.Round(60 * sc)));
                 Invalidate();
             }
 
@@ -3275,7 +3694,7 @@ namespace IPbind
         void ApplyGatewayLayout()
         {
             bool on = chkGateway.Checked;
-            txtIPs.Height = U(on ? 134 : 196);
+            txtIPs.Height = U(on ? 106 : 168);
             lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
             foreach (Control c in new Control[] {
                 lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
@@ -4495,6 +4914,13 @@ namespace IPbind
 
         Font UiFont(float pt, FontStyle style) { return new Font("Segoe UI", pt, style); }
 
+        // Width of a left-box option checkbox: glyph, gap and caption at this scale.
+        int OptionWidth(CheckBox box)
+        {
+            Size text = TextRenderer.MeasureText(box.Text, box.Font);
+            return text.Width + U(24);
+        }
+
         Label MakeRowLabel(string text, int x, int y)
         {
             Label l = new Label();
@@ -4902,14 +5328,15 @@ namespace IPbind
             };
             Controls.Add(combo);
 
-            // Keep DHCP sits right-aligned above Refresh, mirroring Gateway support below it.
+            // Keep DHCP and Gateway support share one row, left-aligned with the IP
+            // list, between the list buttons and Apply / Return to DHCP.
             chkKeepDhcp = new CheckBox();
             chkKeepDhcp.Text = "Keep DHCP";
             chkKeepDhcp.Font = UiFont(8F, FontStyle.Regular);
-            chkKeepDhcp.Location = P(410, 74);
-            chkKeepDhcp.Size = Z(130, 20);
-            chkKeepDhcp.CheckAlign = ContentAlignment.MiddleRight;
-            chkKeepDhcp.TextAlign = ContentAlignment.MiddleRight;
+            chkKeepDhcp.Location = P(20, 380);
+            chkKeepDhcp.Size = new Size(OptionWidth(chkKeepDhcp), U(20));
+            chkKeepDhcp.CheckAlign = ContentAlignment.MiddleLeft;
+            chkKeepDhcp.TextAlign = ContentAlignment.MiddleLeft;
             chkKeepDhcp.Checked = true;
             chkKeepDhcp.CheckedChanged += delegate
             {
@@ -4943,10 +5370,10 @@ namespace IPbind
             chkGateway = new CheckBox();
             chkGateway.Text = "Gateway support";
             chkGateway.Font = UiFont(8F, FontStyle.Regular);
-            chkGateway.Location = P(410, 122);
-            chkGateway.Size = Z(130, 20);
-            chkGateway.CheckAlign = ContentAlignment.MiddleRight;
-            chkGateway.TextAlign = ContentAlignment.MiddleRight;
+            chkGateway.Location = new Point(chkKeepDhcp.Right + U(28), U(380));
+            chkGateway.Size = new Size(OptionWidth(chkGateway), U(20));
+            chkGateway.CheckAlign = ContentAlignment.MiddleLeft;
+            chkGateway.TextAlign = ContentAlignment.MiddleLeft;
             chkGateway.CheckedChanged += delegate
             {
                 ApplyGatewayLayout();
@@ -4978,16 +5405,16 @@ namespace IPbind
             txtIPs.Multiline = true;
             txtIPs.ScrollBars = ScrollBars.Vertical;
             txtIPs.Location = P(20, 170);
-            txtIPs.Size = Z(520, 196);
+            txtIPs.Size = Z(520, 168);
             txtIPs.Font = new Font("Consolas", 10F);
             txtIPs.TextChanged += delegate { RefreshGatewayChoices(); };
             Controls.Add(txtIPs);
 
             // Gateway rows (hidden until Gateway support is on). They sit in the bottom
             // 62px of the IP list's normal area, which the list gives up when shown.
-            lblGwOn = MakeRowLabel("Use gateway on:", 20, 310);
+            lblGwOn = MakeRowLabel("Use gateway on:", 20, 282);
             cboGwIp = new ComboBox();
-            cboGwIp.Location = P(122, 310);
+            cboGwIp.Location = P(122, 282);
             cboGwIp.Size = Z(150, 24);
             cboGwIp.DropDownStyle = ComboBoxStyle.DropDownList;
             cboGwIp.DrawMode = DrawMode.OwnerDrawFixed;
@@ -5000,23 +5427,23 @@ namespace IPbind
                 SaveGatewaySettings();
             };
             Controls.Add(cboGwIp);
-            lblGateway = MakeRowLabel("Gateway:", 284, 310);
-            txtGateway = MakeIpBox(352, 310);
-            lblDns1 = MakeRowLabel("DNS 1:", 20, 339);
-            txtDns1 = MakeIpBox(122, 339);
+            lblGateway = MakeRowLabel("Gateway:", 284, 282);
+            txtGateway = MakeIpBox(352, 282);
+            lblDns1 = MakeRowLabel("DNS 1:", 20, 311);
+            txtDns1 = MakeIpBox(122, 311);
             txtDns1.Width = U(150);
-            lblDns2 = MakeRowLabel("DNS 2:", 284, 339);
-            txtDns2 = MakeIpBox(352, 339);
+            lblDns2 = MakeRowLabel("DNS 2:", 284, 311);
+            txtDns2 = MakeIpBox(352, 311);
 
-            Button btnSaveList = MakeButton("Save List", 20, 372, 166, 28);
+            Button btnSaveList = MakeButton("Save List", 20, 344, 166, 28);
             btnSaveList.Click += delegate { SaveList(false); };
             Controls.Add(btnSaveList);
 
-            Button btnRestore = MakeButton("Restore Defaults", 197, 372, 166, 28);
+            Button btnRestore = MakeButton("Restore Defaults", 197, 344, 166, 28);
             btnRestore.Click += delegate { RestoreDefaults(); };
             Controls.Add(btnRestore);
 
-            Button btnShow = MakeButton("Show Current", 374, 372, 166, 28);
+            Button btnShow = MakeButton("Show Current", 374, 344, 166, 28);
             btnShow.Click += delegate
             {
                 string a = GetSelectedAlias();
