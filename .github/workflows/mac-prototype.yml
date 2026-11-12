@@ -1,0 +1,116 @@
+name: Mac prototype
+
+on:
+  push:
+    branches: [mac-prototype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-prototype
+  cancel-in-progress: true
+
+jobs:
+  mac:
+    if: github.ref == 'refs/heads/mac-prototype'
+    runs-on: macos-14
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers; uname -m; swift --version
+
+      - name: Unit tests (validation, quoting, command builder, parsers)
+        run: swift test
+
+      - name: Build IPbind.app
+        run: ./build-app.sh
+
+      - name: Inspect bundle
+        run: |
+          file dist/IPbind.app/Contents/MacOS/IPbind
+          lipo -info dist/IPbind.app/Contents/MacOS/IPbind
+          codesign -dv dist/IPbind.app 2>&1 | head -20
+          ls -la dist
+
+      - name: Probe networksetup on the runner
+        continue-on-error: true
+        run: |
+          networksetup -listnetworkserviceorder
+          route -n get default | sed -n '1,8p'
+
+      # Runs the exact scripts the app builds, as root, against the runner's own wired
+      # service: adds addresses alongside DHCP, checks the default route is untouched and the
+      # internet still works, then removes everything.
+      - name: Smoke test persistent mode (extra services alongside DHCP)
+        run: |
+          set -x
+          BIN=$(swift build -c release --arch arm64 --show-bin-path)/ipbind-script
+          SVC=$(networksetup -listnetworkserviceorder | awk -F'[()]' '/Hardware Port:/ && $0 ~ /Device: en0/ {print prev} {prev=$0}' | sed -E 's/^\([0-9*]+\) //' | head -1)
+          [ -n "$SVC" ] || SVC=Ethernet
+          echo "service: $SVC"
+          GW0=$(route -n get default | awk '/gateway:/ {print $2}')
+          "$BIN" apply "$SVC" persistent 10.123.45.67/24 10.124.0.5/16 --gw 10.123.45.67/24 10.123.45.1 1.1.1.1 > apply.sh
+          cat apply.sh
+          sudo /bin/sh apply.sh
+          sleep 3
+          networksetup -listnetworkserviceorder
+          networksetup -getinfo "IPbind en0 10.123.45.67" || true
+          ifconfig en0 | grep 'inet '
+          ifconfig en0 | grep -q 'inet 10.123.45.67 ' && echo PERSIST_IP1_OK
+          ifconfig en0 | grep -q 'inet 10.124.0.5 ' && echo PERSIST_IP2_OK
+          GW1=$(route -n get default | awk '/gateway:/ {print $2}')
+          echo "default gw before=$GW0 after=$GW1"
+          curl -sS -o /dev/null -w 'internet: %{http_code}\n' https://github.com
+          "$BIN" dhcp "$SVC" > dhcp.sh
+          cat dhcp.sh
+          sudo /bin/sh dhcp.sh
+          sleep 2
+          networksetup -listnetworkserviceorder
+          if ifconfig en0 | grep -q 'inet 10.12[34]'; then echo "addresses left behind"; exit 1; fi
+          [ "$GW0" = "$GW1" ] || { echo "default route changed"; exit 1; }
+
+      - name: Smoke test temporary mode (ifconfig aliases)
+        run: |
+          set -x
+          BIN=$(swift build -c release --arch arm64 --show-bin-path)/ipbind-script
+          SVC=$(networksetup -listnetworkserviceorder | awk -F'[()]' '/Hardware Port:/ && $0 ~ /Device: en0/ {print prev} {prev=$0}' | sed -E 's/^\([0-9*]+\) //' | head -1)
+          [ -n "$SVC" ] || SVC=Ethernet
+          "$BIN" apply "$SVC" temporary 10.123.45.67/24 10.123.45.68/24 > apply.sh
+          cat apply.sh
+          sudo /bin/sh apply.sh
+          ifconfig en0 | grep 'inet '
+          "$BIN" dhcp "$SVC" 10.123.45.67 10.123.45.68 > dhcp.sh
+          sudo /bin/sh dhcp.sh
+          if ifconfig en0 | grep -q 'inet 10.123'; then exit 1; fi
+          curl -sS -o /dev/null -w 'internet: %{http_code}\n' https://github.com
+
+      - name: Launch smoke test + screenshot
+        continue-on-error: true
+        run: |
+          open dist/IPbind.app
+          sleep 8
+          pgrep -lf IPbind.app/Contents/MacOS/IPbind
+          screencapture -x shot.png || true
+          pkill -f IPbind.app/Contents/MacOS/IPbind || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPbind-mac-preview
+          path: mac/dist/IPbind-mac-preview.zip
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: mac/shot.png
+          retention-days: 1
+          if-no-files-found: ignore
