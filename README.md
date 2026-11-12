@@ -4,19 +4,21 @@
 
 One-click Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges.
 
-A compiled .NET WinForms tool that binds a set of static IPv4 addresses (no gateway, no DNS) onto one chosen LAN interface so you can reach gear that lives on different `/24` subnets, then revert that interface to DHCP with one click.
+A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one chosen LAN interface so you can reach gear that lives on different `/24` subnets, then revert that interface to DHCP with one click.
+
+By default IPbind sets no gateway and no DNS. If one of your addresses needs to reach beyond its subnet, tick **Gateway support** and pick that address, then enter its gateway and up to two DNS servers. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 
 <br clear="all">
 
-Current version: **2.3.122**
+Current version: **2.3.124**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.122.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.122.exe)
+### Download installer: [IPbind-Installer-v2.3.124.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.124.exe)
 
-The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
+The installer is recommended. It installs per-user under LocalAppData. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
 Prefer a single file? Download the portable version: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)
 
