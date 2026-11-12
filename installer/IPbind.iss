@@ -214,22 +214,22 @@ begin
     RemoveDataCheckBox.Checked := not RemoveDataCheckBox.Checked;
 end;
 
-function TextWidthOf(Form: TSetupForm; const S: String): Integer;
-begin
-  Form.Canvas.Font.Name := Form.Font.Name;
-  Form.Canvas.Font.Size := Form.Font.Size;
-  Form.Canvas.Font.Style := Form.Font.Style;
-  Result := Form.Canvas.TextWidth(S);
-end;
-
-function ButtonWidthFor(Form: TSetupForm; const S: String): Integer;
+function ButtonWidthFor(Owner: TWinControl; const S: String): Integer;
 var
-  W: Integer;
+  Tmp: TNewStaticText;
 begin
-  W := TextWidthOf(Form, S) + ScaleX(28);
-  if W < ScaleX(90) then
-    W := ScaleX(90);
-  Result := W;
+  Tmp := TNewStaticText.Create(Owner);
+  try
+    Tmp.Parent := Owner;
+    Tmp.Left := -ScaleX(2000);
+    Tmp.AutoSize := True;
+    Tmp.Caption := S;
+    Result := Tmp.Width + ScaleX(28);
+  finally
+    Tmp.Free;
+  end;
+  if Result < ScaleX(90) then
+    Result := ScaleX(90);
 end;
 
 { Hidden AutoSize label used only to measure wrapped height, including descent. }
