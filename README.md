@@ -12,13 +12,13 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.123**
+Current version: **2.3.124**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.123.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.123.exe)
+### Download installer: [IPbind-Installer-v2.3.124.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.124.exe)
 
-The installer is recommended. It installs per-user under LocalAppData. You do not need admin rights to install. IPbind prompts for elevation only when it applies network settings with `netsh`.
+The installer is recommended. It installs per-user under LocalAppData. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
 Prefer a single file? Download the portable version: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)
 
