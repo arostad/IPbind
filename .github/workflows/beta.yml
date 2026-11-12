@@ -111,6 +111,8 @@ jobs:
 
           IPbind Beta is a separate app: its own name, dark-gray and amber icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
 
+          This build asks, before uninstall, whether to also remove all IPbind Beta data (unchecked by default; silent uninstalls still honor /REMOVEDATA=1). Dragging the setup reminder between monitors no longer freezes the app or paints broken buttons. The reminder checkboxes line up with the first line of text and match the body type, and the intro has the missing space in "click the Return to DHCP button."
+
           **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
 
           <sub>Portable: [IPbind-Portable-beta.exe](${BASE}/IPbind-Portable-beta.exe)</sub>

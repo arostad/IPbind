@@ -895,8 +895,10 @@ namespace IPbind
         readonly Button closeButton;
         Bitmap iconBitmap;
         readonly List<Font> fonts = new List<Font>();
+        readonly List<Font> retiredFonts = new List<Font>();
         Font fontName, fontVersion, fontBody, fontPrivacy, fontStatus, fontButton, fontButtonBold;
         bool layingOut;
+        bool dpiChanging;
         bool settingLaunchCheck;
         UpdateInfo availableUpdate;
 
@@ -1308,7 +1310,10 @@ namespace IPbind
 
                 ClientSize = new Size(width, y + footerH);
 
-                foreach (Font font in previous) font.Dispose();
+                // Keep the previous fonts alive until the form is disposed.
+                // Disposing here can paint a button with a freed Font
+                // (GDI+ "Parameter is not valid") after a DPI change.
+                retiredFonts.AddRange(previous);
             }
             finally { layingOut = false; }
         }
@@ -1466,6 +1471,19 @@ namespace IPbind
         {
             if (m.Msg == WM_DPICHANGED)
             {
+                ApplyDpiChanged(ref m);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void ApplyDpiChanged(ref Message m)
+        {
+            if (dpiChanging) return;
+            dpiChanging = true;
+            try
+            {
+                SuspendLayout();
                 int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
                 if (dpi > 0)
                 {
@@ -1476,18 +1494,17 @@ namespace IPbind
                         LayoutContent();
                     }
                 }
-                RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-                int w = Width, h = Height;
-                int x = suggested.Left, y = suggested.Top;
-                Rectangle work = Screen.FromPoint(new Point(x, y)).WorkingArea;
-                if (x + w > work.Right) x = work.Right - w;
-                if (y + h > work.Bottom) y = work.Bottom - h;
-                if (x < work.Left) x = work.Left;
-                if (y < work.Top) y = work.Top;
-                Bounds = new Rectangle(x, y, w, h);
-                return;
+                // Use the rectangle Windows already computed so the window
+                // stays on the target monitor (do not clamp the old origin
+                // with the new size — that can bounce it back).
+                if (m.LParam != IntPtr.Zero)
+                {
+                    RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                    Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
+                }
+                ResumeLayout(true);
             }
-            base.WndProc(ref m);
+            finally { dpiChanging = false; }
         }
 
         protected override void Dispose(bool disposing)
@@ -1496,6 +1513,8 @@ namespace IPbind
             {
                 foreach (Font font in fonts) font.Dispose();
                 fonts.Clear();
+                foreach (Font font in retiredFonts) font.Dispose();
+                retiredFonts.Clear();
                 if (iconBitmap != null)
                 {
                     if (iconBox != null) iconBox.Image = null;
@@ -1869,12 +1888,16 @@ namespace IPbind
         readonly Panel footer;
         readonly CheckBox understandBox;
         readonly CheckBox dontShowBox;
+        readonly Label understandLabel;
+        readonly Label dontShowLabel;
         readonly Button continueButton;
         readonly Button exitButton;
 
         readonly List<Font> fonts = new List<Font>();
+        readonly List<Font> retiredFonts = new List<Font>();
         Font fontEyebrow, fontTitle, fontIntro, fontIntroBold, fontBody, fontBodyBold, fontSmall, fontButton, fontReplica;
         bool layingOut;
+        bool dpiChanging;
 
         public bool DontShowAgain { get { return dontShowBox.Checked; } }
 
@@ -2011,11 +2034,17 @@ namespace IPbind
             understandBox = new CheckBox();
             understandBox.UseMnemonic = false;
             understandBox.AutoSize = false;
+            understandBox.UseCompatibleTextRendering = false;
             understandBox.CheckedChanged += delegate { ApplyContinueState(); };
+            understandLabel = MakeLabel();
+            understandLabel.Click += delegate { understandBox.Checked = !understandBox.Checked; };
             dontShowBox = new CheckBox();
             dontShowBox.UseMnemonic = false;
             dontShowBox.AutoSize = false;
-            dontShowBox.Text = "Don\u2019t show this again";
+            dontShowBox.UseCompatibleTextRendering = false;
+            dontShowLabel = MakeLabel();
+            dontShowLabel.Text = "Don\u2019t show this again";
+            dontShowLabel.Click += delegate { dontShowBox.Checked = !dontShowBox.Checked; };
             continueButton = new Button();
             continueButton.Text = "Continue";
             continueButton.Enabled = false;
@@ -2030,7 +2059,9 @@ namespace IPbind
             exitButton.FlatAppearance.BorderSize = 1;
             exitButton.Cursor = Cursors.Hand;
             footer.Controls.Add(understandBox);
+            footer.Controls.Add(understandLabel);
             footer.Controls.Add(dontShowBox);
+            footer.Controls.Add(dontShowLabel);
             footer.Controls.Add(continueButton);
             footer.Controls.Add(exitButton);
             Controls.Add(footer);
@@ -2068,6 +2099,8 @@ namespace IPbind
         {
             foreach (Font font in fonts) font.Dispose();
             fonts.Clear();
+            foreach (Font font in retiredFonts) font.Dispose();
+            retiredFonts.Clear();
         }
 
         const TextFormatFlags WrapFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl |
@@ -2093,27 +2126,6 @@ namespace IPbind
                 if (size.Height < font.Height) size.Height = font.Height;
                 return size;
             }
-        }
-
-        // TextRenderer without NoPadding includes GDI padding and descent.
-        // WinForms CheckBox then insets that text, so MeasureCheckHeight adds
-        // 6 CSS pixels of inset (scaled) or the descenders are still clipped.
-        Size MeasureCheck(string text, Font font, int maxWidth)
-        {
-            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
-            {
-                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue),
-                    TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
-                if (size.Width < 1) size.Width = maxWidth;
-                if (size.Height < font.Height) size.Height = font.Height;
-                return size;
-            }
-        }
-
-        int MeasureCheckHeight(string text, Font font, int maxWidth, int minHeight)
-        {
-            Size size = MeasureCheck(text, font, maxWidth);
-            return Math.Max(minHeight, size.Height + U(6));
         }
 
         int MaxClientHeight()
@@ -2176,13 +2188,25 @@ namespace IPbind
                     rowDescs[i].Font = fontSmall;
                     rowDescs[i].ForeColor = muted;
                 }
-                understandBox.Font = MakeFont(14f, FontStyle.Regular);
+                Font fontCheck = MakeFont(14f, FontStyle.Regular);
+                understandBox.Font = fontCheck;
                 understandBox.ForeColor = fore;
                 understandBox.BackColor = footerBack;
-                understandBox.Text = "I\u2019ll click " + UiCopy.DhcpButton + " before I plug into a live network";
-                dontShowBox.Font = MakeFont(14f, FontStyle.Regular);
+                understandBox.Text = "";
+                understandLabel.Font = fontCheck;
+                understandLabel.ForeColor = fore;
+                understandLabel.BackColor = Color.Transparent;
+                understandLabel.Text = "I\u2019ll click " + UiCopy.DhcpButton + " before I plug into a live network";
+                understandBox.AccessibleName = understandLabel.Text;
+                dontShowBox.Font = fontCheck;
                 dontShowBox.ForeColor = muted;
                 dontShowBox.BackColor = footerBack;
+                dontShowBox.Text = "";
+                dontShowLabel.Font = fontCheck;
+                dontShowLabel.ForeColor = muted;
+                dontShowLabel.BackColor = Color.Transparent;
+                dontShowLabel.Text = "Don\u2019t show this again";
+                dontShowBox.AccessibleName = dontShowLabel.Text;
                 continueButton.Font = fontButton;
                 exitButton.Font = fontButton;
                 exitButton.BackColor = secondaryBack;
@@ -2294,21 +2318,15 @@ namespace IPbind
                     int chkBox = U(20);
                     int btnW = U(150);
                     int btnH = U(40);
-                    int ackTextW = width - 2 * footerPadX - chkBox - U(12);
-                    int ackH = MeasureCheckHeight(understandBox.Text, understandBox.Font, ackTextW, chkBox);
-                    int againH = MeasureCheckHeight(dontShowBox.Text, dontShowBox.Font, ackTextW, chkBox);
-                    int footerH = footerPadTop + ackH + U(8) + againH + footerGap + btnH + footerPadBot;
+                    int chkGap = U(8);
+                    int ackTextW = width - 2 * footerPadX - chkBox - chkGap;
+                    int ackH = LayoutCheckRow(understandBox, understandLabel, footerPadX, footerPadTop, ackTextW, chkBox);
+                    int againTop = footerPadTop + ackH + U(8);
+                    int againH = LayoutCheckRow(dontShowBox, dontShowLabel, footerPadX, againTop, ackTextW, chkBox);
+                    int footerH = againTop + againH + footerGap + btnH + footerPadBot;
                     footer.Location = new Point(0, bodyBottom);
                     footer.Size = new Size(width, footerH);
-                    understandBox.Location = new Point(footerPadX, footerPadTop);
-                    understandBox.Size = new Size(width - 2 * footerPadX, ackH);
-                    understandBox.CheckAlign = ContentAlignment.TopLeft;
-                    understandBox.TextAlign = ContentAlignment.MiddleLeft;
-                    dontShowBox.Location = new Point(footerPadX, understandBox.Bottom + U(8));
-                    dontShowBox.Size = new Size(width - 2 * footerPadX, againH);
-                    dontShowBox.CheckAlign = ContentAlignment.TopLeft;
-                    dontShowBox.TextAlign = ContentAlignment.MiddleLeft;
-                    int btnY = dontShowBox.Bottom + footerGap;
+                    int btnY = againTop + againH + footerGap;
                     exitButton.Size = new Size(btnW, btnH);
                     continueButton.Size = new Size(btnW, btnH);
                     exitButton.Location = new Point(width - footerPadX - btnW, btnY);
@@ -2323,9 +2341,29 @@ namespace IPbind
                     }
                     tighten = Math.Max(0f, tighten - 0.2f);
                 }
-                foreach (Font previous in previousFonts) previous.Dispose();
+                // Hold old fonts until Dispose. Freeing them here, while a
+                // button paint is still queued, throws GDI+ "Parameter is not valid".
+                retiredFonts.AddRange(previousFonts);
             }
             finally { layingOut = false; }
+        }
+
+        // Glyph centered on the first line of the label (MiddleLeft when the
+        // text is one line; first-line center when it wraps). The caption lives
+        // on a Label so it uses the same GDI TextRenderer and weight as body text.
+        int LayoutCheckRow(CheckBox box, Label caption, int x, int y, int textW, int chkBox)
+        {
+            Size need = MeasureWrap(caption.Text ?? "", caption.Font, textW);
+            int firstH = MeasureLine(caption.Text ?? "Ag", caption.Font).Height;
+            int rowH = Math.Max(chkBox, need.Height + U(6));
+            caption.Location = new Point(x + chkBox + U(8), y);
+            caption.Size = new Size(textW, rowH);
+            int boxY = y + Math.Max(0, (firstH - chkBox) / 2);
+            box.Size = new Size(chkBox, chkBox);
+            box.Location = new Point(x, boxY);
+            box.CheckAlign = ContentAlignment.MiddleLeft;
+            box.TextAlign = ContentAlignment.MiddleLeft;
+            return rowH;
         }
 
         int LerpPad(int full, int min, float tighten)
@@ -2429,6 +2467,19 @@ namespace IPbind
         {
             if (m.Msg == WM_DPICHANGED)
             {
+                ApplyDpiChanged(ref m);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void ApplyDpiChanged(ref Message m)
+        {
+            if (dpiChanging) return;
+            dpiChanging = true;
+            try
+            {
+                SuspendLayout();
                 int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
                 if (dpi > 0)
                 {
@@ -2439,18 +2490,17 @@ namespace IPbind
                         LayoutContent();
                     }
                 }
-                RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-                int w = Width, h = Height;
-                int x = suggested.Left, y = suggested.Top;
-                Rectangle work = Screen.FromPoint(new Point(x, y)).WorkingArea;
-                if (x + w > work.Right) x = work.Right - w;
-                if (y + h > work.Bottom) y = work.Bottom - h;
-                if (x < work.Left) x = work.Left;
-                if (y < work.Top) y = work.Top;
-                Bounds = new Rectangle(x, y, w, h);
-                return;
+                // Use the rectangle Windows already computed so the window
+                // stays on the target monitor (do not clamp the old origin
+                // with the new size — that can bounce it back).
+                if (m.LParam != IntPtr.Zero)
+                {
+                    RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                    Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
+                }
+                ResumeLayout(true);
             }
-            base.WndProc(ref m);
+            finally { dpiChanging = false; }
         }
 
         protected override void Dispose(bool disposing)
@@ -2773,6 +2823,9 @@ namespace IPbind
             }
 
             // Lays the words out within maxWidth and sizes the control to fit.
+            // Never mutate word.Text: a later FitWidth (the tighten loop) may
+            // put a word back on the previous line, and a trimmed leading
+            // space would be gone ("clickthe Return to DHCP").
             public void FitWidth(int maxWidth)
             {
                 int x = 0, y = 0, lineHeight = 0, widest = 0;
@@ -2780,14 +2833,13 @@ namespace IPbind
                 {
                     foreach (Word word in words)
                     {
-                        int fullWidth = Measure(g, word);
+                        int fullWidth = Measure(g, word.Text, word.Font);
                         if (x > 0 && x + fullWidth > maxWidth)
                         {
                             y += lineHeight;
                             x = 0;
                             lineHeight = 0;
-                            word.Text = word.Text.TrimStart(' ');
-                            fullWidth = Measure(g, word);
+                            fullWidth = Measure(g, DisplayText(word, true), word.Font);
                         }
                         word.Location = new Point(x, y);
                         x += fullWidth;
@@ -2798,16 +2850,24 @@ namespace IPbind
                 Size = new Size(Math.Min(maxWidth, Math.Max(widest + 2, 1)), y + lineHeight + 2);
             }
 
-            static int Measure(Graphics g, Word word)
+            static string DisplayText(Word word, bool lineStart)
             {
-                return TextRenderer.MeasureText(g, word.Text, word.Font, new Size(int.MaxValue, int.MaxValue), Flags).Width;
+                if (lineStart && word.Text != null && word.Text.Length > 0 && word.Text[0] == ' ')
+                    return word.Text.TrimStart(' ');
+                return word.Text;
+            }
+
+            static int Measure(Graphics g, string text, Font font)
+            {
+                return TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue), Flags).Width;
             }
 
             protected override void OnPaint(PaintEventArgs e)
             {
                 base.OnPaint(e);
                 foreach (Word word in words)
-                    TextRenderer.DrawText(e.Graphics, word.Text, word.Font, word.Location, word.Color, Flags);
+                    TextRenderer.DrawText(e.Graphics, DisplayText(word, word.Location.X == 0),
+                        word.Font, word.Location, word.Color, Flags);
             }
         }
     }
@@ -4482,10 +4542,44 @@ namespace IPbind
             return false;
         }
 
+        const int WM_DPICHANGED = 0x02E0;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        bool dpiChanging;
+
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                if (!dpiChanging)
+                {
+                    dpiChanging = true;
+                    try
+                    {
+                        // The process is system-DPI aware, so this message is
+                        // unusual (tests post it; a future per-monitor switch
+                        // would too). Do not dispose fonts or relayout here.
+                        SuspendLayout();
+                        if (m.LParam != IntPtr.Zero)
+                        {
+                            RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                            Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
+                        }
+                        ResumeLayout(true);
+                    }
+                    finally { dpiChanging = false; }
+                }
+                return;
+            }
+            base.WndProc(ref m);
         }
 
         protected override void OnShown(EventArgs e)

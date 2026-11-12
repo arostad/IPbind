@@ -34,7 +34,7 @@ param(
 )
 
 # ==============================================================
-$Version = '2.3.131'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.132'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -72,7 +72,7 @@ namespace IPbind
         public const string Channel = "$Channel";
         public static readonly bool IsBeta = Channel == "beta";
         // Shown in the title bar, About, footer, and log. Beta appends "b"
-        // (e.g. 2.3.131b). Parsed versions stay the numeric Version above.
+        // (e.g. 2.3.132b). Parsed versions stay the numeric Version above.
         public static readonly string DisplayVersion = IsBeta ? Version + "b" : Version;
         // Window/About name and the %APPDATA% / %LOCALAPPDATA% folder name.
         public const string AppName = "$appName";
