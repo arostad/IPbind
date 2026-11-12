@@ -1578,7 +1578,11 @@ namespace IPbind
             CancelButton = exitButton;
 
             LayoutContent();
-            Shown += delegate { understandBox.Focus(); };
+            Shown += delegate
+            {
+                FitOnScreen();
+                understandBox.Focus();
+            };
         }
 
         Label MakeLabel()
@@ -1647,7 +1651,7 @@ namespace IPbind
                 chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
                 chromeH = SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2;
             }
-            return Math.Max(U(360), work.Height - chromeH - 4);
+            return Math.Max(U(360), work.Height - chromeH - 16);
         }
 
         int U(int value) { return (int)Math.Round(value * sc); }
@@ -1845,6 +1849,19 @@ namespace IPbind
         int LerpPad(int full, int min, float tighten)
         {
             return U((int)Math.Round(min + (full - min) * tighten));
+        }
+
+        void FitOnScreen()
+        {
+            if (!IsHandleCreated) return;
+            LayoutContent();
+            Rectangle work = Screen.FromControl(this).WorkingArea;
+            int x = Left, y = Top, w = Width, h = Height;
+            if (x + w > work.Right) x = work.Right - w;
+            if (y + h > work.Bottom) y = work.Bottom - h;
+            if (x < work.Left) x = work.Left;
+            if (y < work.Top) y = work.Top;
+            Bounds = new Rectangle(x, y, Width, Height);
         }
 
         void ApplyContinueState()
