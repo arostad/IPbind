@@ -462,6 +462,24 @@ namespace IPbind
                 "The downloaded update failed its integrity check.");
         }
 
+        // Beta builds only: the prod Latest version, read straight from the GitHub
+        // latest release (never the Worker, so it adds no usage count). Used by About
+        // to show "Matches the current release" when beta and prod are the same version.
+        const string ProdLatestVersionUrl =
+            "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
+
+        public static bool BetaMatchesProdLatest()
+        {
+            if (!BuildInfo.IsBeta) return false;
+            string remoteText;
+            Version remote;
+            string error;
+            Version current;
+            if (!TryReadVersion(ProdLatestVersionUrl, out remoteText, out remote, out error)) return false;
+            if (!Version.TryParse(BuildInfo.Version, out current)) return false;
+            return remote.CompareTo(current) == 0;
+        }
+
         public static UpdateInfo Check()
         {
             string remoteText;
@@ -792,6 +810,8 @@ namespace IPbind
     {
         readonly Button checkButton;
         readonly Label statusLabel;
+        readonly Label matchLabel;
+        readonly bool checkMatchOnShow;
         readonly float sc;
         readonly bool dark;
         UpdateInfo availableUpdate;
@@ -827,6 +847,11 @@ namespace IPbind
             Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
             Label version = MakeLabel(
                 "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
+            // Beta only: small note under the version when this beta equals prod Latest.
+            // Hidden until the background check confirms it; prod builds never show it.
+            matchLabel = MakeLabel(
+                "Matches the current release", 8F, FontStyle.Regular, 24, 79, 382, 15);
+            matchLabel.Visible = false;
             Label tagline = MakeLabel(
                 "One-click Static IP Binder for easily accessing\r\n" +
                 "air-gapped equipment spread across multiple IP ranges",
@@ -870,6 +895,7 @@ namespace IPbind
 
             Controls.Add(title);
             Controls.Add(version);
+            Controls.Add(matchLabel);
             Controls.Add(tagline);
             Controls.Add(directed);
             Controls.Add(source);
@@ -902,6 +928,38 @@ namespace IPbind
                 statusLabel.BackColor = BackColor;
                 statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
             }
+            matchLabel.ForeColor = dark ? Color.FromArgb(150, 150, 150) : Color.FromArgb(110, 110, 110);
+
+            // Respect "manual": with launch checks off, only the Check button goes online.
+            checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            if (checkMatchOnShow) StartReleaseMatchCheck();
+        }
+
+        void StartReleaseMatchCheck()
+        {
+            if (!BuildInfo.IsBeta) return;
+            Thread thread = new Thread(delegate()
+            {
+                bool match;
+                try { match = UpdateChecker.BetaMatchesProdLatest(); }
+                catch { match = false; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed) return;
+                        matchLabel.Visible = match;
+                    });
+                }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -1068,6 +1126,7 @@ namespace IPbind
 
         void CheckUpdates(object sender, EventArgs e)
         {
+            StartReleaseMatchCheck();
             checkButton.Enabled = false;
             statusLabel.Text = "Checking...";
             Thread thread = new Thread(delegate()
