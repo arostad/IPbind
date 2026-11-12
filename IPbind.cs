@@ -1590,11 +1590,12 @@ namespace IPbind
             return label;
         }
 
-        Font MakeFont(float points, FontStyle style)
+        Font MakeFont(float px, FontStyle style)
         {
-            // Pixel fonts follow sc directly, so a test scale on a 96-DPI machine
-            // and a real system-DPI scale both render at the intended size.
-            Font font = new Font("Segoe UI", points * sc * 96f / 72f, style, GraphicsUnit.Pixel);
+            // Spec typography is in CSS pixels at 96 DPI. Multiply by sc so a
+            // test scale on a 96-DPI machine and a real system-DPI scale both
+            // render at the intended size (not points, which would be 33% larger).
+            Font font = new Font("Segoe UI", px * sc, style, GraphicsUnit.Pixel);
             fonts.Add(font);
             return font;
         }
@@ -1919,20 +1920,9 @@ namespace IPbind
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
-            try
-            {
-                int dpi = GetDpiForWindow(Handle);
-                if (dpi > 0)
-                {
-                    float windowSc = dpi / 96f;
-                    if (Math.Abs(windowSc - sc) > 0.02f)
-                    {
-                        sc = windowSc;
-                        LayoutContent();
-                    }
-                }
-            }
-            catch { }
+            // Scale stays at the value from the constructor (MainForm's system
+            // DPI, or a test scale). A later move to another monitor is handled
+            // by WM_DPICHANGED; do not overwrite a simulated scale here.
         }
 
         protected override void WndProc(ref Message m)
