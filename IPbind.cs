@@ -2132,7 +2132,10 @@ namespace IPbind
                 chromeW = SystemInformation.FixedFrameBorderSize.Width * 2;
                 chromeH = SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2;
             }
-            return Math.Max(U(360), work.Height - chromeH - 16);
+            // Also cap to a 1080p working area (1920x1040) so 200% still fits
+            // when the current screen is taller (CI runners often have no taskbar).
+            int workH = Math.Min(work.Height, 1040);
+            return Math.Max(U(360), workH - chromeH - 16);
         }
 
         int U(int value) { return (int)Math.Round(value * sc); }
