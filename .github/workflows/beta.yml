@@ -76,6 +76,7 @@ jobs:
             dist/IPbind-Installer-v*-beta.exe
             dist/IPbind-Installer-v*-beta.exe.sha256
           if-no-files-found: error
+          retention-days: 1
 
   release:
     needs: build

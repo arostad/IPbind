@@ -57,6 +57,7 @@ jobs:
             dist/IPbind-Installer-v*.exe.sha256
             dist/IPbind-Setup.exe
           if-no-files-found: error
+          retention-days: 1
 
       - name: Upload matching downloads to Latest release
         shell: pwsh
