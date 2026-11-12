@@ -269,12 +269,14 @@ begin
     'Also remove all {#AppTitle} data (saved IP lists, settings, and the setup reminder)';
   ShowWarn := KeepDhcpRecordExists;
 
-  Form := CreateCustomForm;
+  { Inno 6.6+: size is set here in 96-DPI design pixels (the function scales
+    it) and ClientWidth/ClientHeight are read-only afterwards. 320 is enough
+    for the Keep DHCP warning, wrapped checkbox text, and buttons. }
+  Form := CreateCustomForm(470, 320, True, True);
   try
     Form.Caption := 'Uninstall {#AppTitle}';
     Form.BorderStyle := bsDialog;
     Form.Position := poScreenCenter;
-    Form.ClientWidth := ScaleX(470);
     Form.Font.Name := 'Segoe UI';
     Form.Font.Size := 9;
     Form.Color := clBtnFace;
@@ -355,7 +357,9 @@ begin
     BtnH := ScaleY(28);
     BtnW1 := ButtonWidthFor(Form, 'Uninstall');
     BtnW2 := ButtonWidthFor(Form, 'Cancel');
-    BtnY := Y;
+    BtnY := Form.ClientHeight - MarginY - BtnH;
+    if BtnY < Y then
+      BtnY := Y;
     CancelBtn := TNewButton.Create(Form);
     CancelBtn.Parent := Form;
     CancelBtn.Caption := 'Cancel';
@@ -378,7 +382,6 @@ begin
     UninstallBtn.ModalResult := mrOk;
     UninstallBtn.TabOrder := 1;
 
-    Form.ClientHeight := BtnY + BtnH + MarginY;
     Form.ActiveControl := UninstallBtn;
 
     Result := Form.ShowModal = mrOk;
