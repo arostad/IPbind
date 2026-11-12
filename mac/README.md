@@ -17,4 +17,4 @@ Each Apply or Return to DHCP is a single `do shell script … with administrator
 
 ## Build
 
-On a Mac with Xcode 15 or later: `mac/build-app.sh`. The `Mac prototype` workflow builds it on `macos-14` for pushes to the `mac-prototype` branch.
+On a Mac with Xcode 15 or later: `mac/build-app.sh`. The `Mac prototype` workflow builds it on `macos-15` (Apple Silicon) for pushes to the `mac-prototype` branch.
