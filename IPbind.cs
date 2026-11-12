@@ -1302,6 +1302,333 @@ namespace IPbind
         }
     }
 
+    // Startup reminder: static addresses stay on the adapter until Return to DHCP.
+    // Shown at launch until the user clicks Continue with "Don't show this again"
+    // ticked (MainForm then writes dhcp-reminder-dismissed.txt in the settings folder).
+    // Continue, Enter, Esc and the title-bar close box all stay inactive until
+    // "I understand" is ticked. Laid out in code from the DPI scale like AboutForm.
+    sealed class DhcpReminderForm : Form
+    {
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool EnableMenuItem(IntPtr hMenu, uint uIDEnableItem, uint uEnable);
+        [System.Runtime.InteropServices.DllImport("comctl32.dll")]
+        static extern int LoadIconWithScaleDown(IntPtr hinst, IntPtr pszName, int cx, int cy, out IntPtr phico);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool DestroyIcon(IntPtr hIcon);
+
+        const uint SC_CLOSE = 0xF060;
+        const uint MF_BYCOMMAND = 0x0;
+        const uint MF_GRAYED = 0x1;
+        const uint MF_ENABLED = 0x0;
+
+        readonly float sc;
+        readonly bool dark;
+        readonly CheckBox understandBox;
+        readonly CheckBox dontShowBox;
+        readonly Button continueButton;
+        readonly Bitmap warningBitmap;
+
+        public bool DontShowAgain { get { return dontShowBox.Checked; } }
+
+        public DhcpReminderForm(Form owner, bool dark, float scale)
+        {
+            this.dark = dark;
+            sc = scale > 0f ? scale : 1f;
+            Text = BuildInfo.AppName;
+            Font = new Font("Segoe UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            try { Icon = owner.Icon; } catch { }
+
+            Color fore = dark ? Color.FromArgb(230, 230, 230) : SystemColors.ControlText;
+            Color amber = dark ? Color.FromArgb(242, 179, 61) : Color.FromArgb(156, 92, 0);
+            Font headingBold = new Font("Segoe UI", 12F, FontStyle.Bold);
+            Font headingRegular = new Font("Segoe UI", 12F, FontStyle.Regular);
+            Font bodyBold = new Font("Segoe UI", 9F, FontStyle.Bold);
+
+            int width = U(600);
+            int left = U(24);
+            int textWidth = width - 2 * left;
+            int y = U(20);
+
+            // Heading row: warning icon, then bold amber "Important:" and the regular rest.
+            int iconSize = U(24);
+            warningBitmap = LoadWarningBitmap(iconSize);
+            PictureBox icon = new PictureBox();
+            icon.SizeMode = PictureBoxSizeMode.Zoom;
+            icon.Size = new Size(iconSize, iconSize);
+            icon.Image = warningBitmap;
+            icon.TabStop = false;
+
+            int headingLeft = left + iconSize + U(10);
+            RunsLabel heading = new RunsLabel();
+            heading.AddRun("Important:", headingBold, amber);
+            heading.AddRun(" Return to DHCP when you\u2019re done", headingRegular, fore);
+            heading.Location = new Point(headingLeft, 0);
+            heading.FitWidth(width - headingLeft - left);
+            int rowHeight = Math.Max(iconSize, heading.Height);
+            icon.Location = new Point(left, y + (rowHeight - iconSize) / 2);
+            heading.Top = y + (rowHeight - heading.Height) / 2;
+            Controls.Add(icon);
+            Controls.Add(heading);
+            y += rowHeight + U(14);
+
+            Label intro = WrapLabel(
+                "IPbind gives your Ethernet adapter static IP addresses so you can reach field equipment. " +
+                "They stay in place until you click Return to DHCP.", left, y, textWidth);
+            y += intro.Height + U(12);
+
+            Label leadIn = WrapLabel(
+                "If you plug this adapter into an office, public, or home network while those addresses are still set:",
+                left, y, textWidth);
+            y += leadIn.Height + U(6);
+
+            string[] bullets = new string[]
+            {
+                "One of your addresses may already belong to a device on that network, and you could knock it offline",
+                "Your addresses may fall inside that network\u2019s DHCP pool and clash with addresses it hands out",
+                "You likely won\u2019t have internet or network access",
+                "You could trip network security alarms, which may get your laptop blocked by network admins"
+            };
+            int bulletIndent = U(20);
+            foreach (string item in bullets)
+            {
+                Label dot = new Label();
+                dot.Text = "\u2022";
+                dot.UseMnemonic = false;
+                dot.AutoSize = false;
+                dot.Location = new Point(left + U(4), y);
+                dot.Size = new Size(bulletIndent - U(4), U(20));
+                Controls.Add(dot);
+                Label text = WrapLabel(item, left + bulletIndent, y, textWidth - bulletIndent);
+                y += text.Height + U(4);
+            }
+            y += U(10);
+
+            RunsLabel closing = new RunsLabel();
+            closing.AddRun("Click ", Font, fore);
+            closing.AddRun("Return to DHCP", bodyBold, fore);
+            closing.AddRun(" before you unplug from your equipment.", Font, fore);
+            closing.Location = new Point(left, y);
+            closing.FitWidth(textWidth);
+            Controls.Add(closing);
+            y += closing.Height + U(18);
+
+            understandBox = new CheckBox();
+            understandBox.Text = "I understand";
+            understandBox.AutoSize = true;
+            understandBox.Location = new Point(left, y);
+            understandBox.CheckedChanged += delegate { UpdateCloseState(); };
+            Controls.Add(understandBox);
+            y += understandBox.PreferredSize.Height + U(6);
+
+            dontShowBox = new CheckBox();
+            dontShowBox.Text = "Don\u2019t show this again";
+            dontShowBox.AutoSize = true;
+            dontShowBox.Location = new Point(left, y);
+            Controls.Add(dontShowBox);
+            int checkBottom = y + dontShowBox.PreferredSize.Height;
+
+            continueButton = new Button();
+            continueButton.Text = "Continue";
+            continueButton.Size = Z(110, 32);
+            continueButton.Location = new Point(width - left - continueButton.Width,
+                checkBottom - continueButton.Height);
+            continueButton.Enabled = false;
+            continueButton.DialogResult = DialogResult.OK;
+            Controls.Add(continueButton);
+            AcceptButton = continueButton;
+
+            ClientSize = new Size(width, Math.Max(checkBottom, continueButton.Bottom) + U(20));
+
+            if (dark)
+            {
+                BackColor = Color.FromArgb(32, 32, 32);
+                ForeColor = fore;
+                foreach (Control control in Controls)
+                    if (!(control is RunsLabel)) control.ForeColor = fore;
+                continueButton.FlatStyle = FlatStyle.Flat;
+                continueButton.BackColor = Color.FromArgb(50, 50, 50);
+                continueButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+            }
+
+            Shown += delegate { understandBox.Focus(); };
+        }
+
+        Label WrapLabel(string text, int x, int y, int width)
+        {
+            Label label = new Label();
+            label.Text = text;
+            label.UseMnemonic = false;
+            label.AutoSize = false;
+            label.Font = Font;
+            label.Padding = Padding.Empty;
+            int height = label.GetPreferredSize(new Size(width, 0)).Height;
+            label.Location = new Point(x, y);
+            label.Size = new Size(width, height + U(2));
+            Controls.Add(label);
+            return label;
+        }
+
+        static Bitmap LoadWarningBitmap(int size)
+        {
+            // Crisp, DPI-sized stock warning icon (IDI_WARNING); falls back to SystemIcons.Warning.
+            try
+            {
+                IntPtr handle;
+                if (LoadIconWithScaleDown(IntPtr.Zero, new IntPtr(32515), size, size, out handle) == 0 &&
+                    handle != IntPtr.Zero)
+                {
+                    try
+                    {
+                        using (Icon stock = Icon.FromHandle(handle))
+                            return stock.ToBitmap();
+                    }
+                    finally { DestroyIcon(handle); }
+                }
+            }
+            catch { }
+            try
+            {
+                using (Icon sized = new Icon(SystemIcons.Warning, size, size))
+                    return sized.ToBitmap();
+            }
+            catch { return SystemIcons.Warning.ToBitmap(); }
+        }
+
+        void UpdateCloseState()
+        {
+            bool understood = understandBox.Checked;
+            continueButton.Enabled = understood;
+            if (!IsHandleCreated) return;
+            try
+            {
+                IntPtr menu = GetSystemMenu(Handle, false);
+                if (menu != IntPtr.Zero)
+                    EnableMenuItem(menu, SC_CLOSE, MF_BYCOMMAND | (understood ? MF_ENABLED : MF_GRAYED));
+            }
+            catch { }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            WindowTheme.ApplyTitleBar(this, dark);
+            UpdateCloseState();
+        }
+
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if (keyData == Keys.Escape)
+            {
+                // Esc closes only once "I understand" is ticked (and never saves the opt-out).
+                if (understandBox.Checked) DialogResult = DialogResult.Cancel;
+                return true;
+            }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // X / Alt+F4 are ignored until "I understand" is ticked. System closes
+            // (shutdown, Task Manager, owner closing) are always allowed.
+            if (e.CloseReason == CloseReason.UserClosing && !understandBox.Checked)
+                e.Cancel = true;
+            base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && warningBitmap != null) warningBitmap.Dispose();
+            base.Dispose(disposing);
+        }
+
+        int U(int value) { return (int)Math.Round(value * sc); }
+        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+
+        // A wrapped line made of differently styled runs (e.g. a bold phrase inside
+        // a sentence). Words are measured and drawn with GDI TextRenderer, the same
+        // renderer Labels use, so sizes follow the system DPI.
+        sealed class RunsLabel : Control
+        {
+            sealed class Word
+            {
+                public string Text;
+                public Font Font;
+                public Color Color;
+                public Point Location;
+            }
+
+            readonly List<Word> words = new List<Word>();
+            bool pendingSpace;
+
+            const TextFormatFlags Flags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix |
+                TextFormatFlags.SingleLine;
+
+            public RunsLabel()
+            {
+                SetStyle(ControlStyles.SupportsTransparentBackColor | ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+                SetStyle(ControlStyles.Selectable, false);
+                BackColor = Color.Transparent;
+                TabStop = false;
+            }
+
+            public void AddRun(string text, Font font, Color color)
+            {
+                int i = 0;
+                while (i < text.Length)
+                {
+                    if (text[i] == ' ') { pendingSpace = true; i++; continue; }
+                    int start = i;
+                    while (i < text.Length && text[i] != ' ') i++;
+                    Word word = new Word();
+                    word.Text = (pendingSpace && words.Count > 0 ? " " : "") + text.Substring(start, i - start);
+                    word.Font = font;
+                    word.Color = color;
+                    words.Add(word);
+                    pendingSpace = false;
+                }
+            }
+
+            // Lays the words out within maxWidth and sizes the control to fit.
+            public void FitWidth(int maxWidth)
+            {
+                int x = 0, y = 0, lineHeight = 0, widest = 0;
+                foreach (Word word in words)
+                {
+                    int fullWidth = TextRenderer.MeasureText(word.Text, word.Font, Size.Empty, Flags).Width;
+                    if (x > 0 && x + fullWidth > maxWidth)
+                    {
+                        y += lineHeight;
+                        x = 0;
+                        lineHeight = 0;
+                        word.Text = word.Text.TrimStart(' ');
+                        fullWidth = TextRenderer.MeasureText(word.Text, word.Font, Size.Empty, Flags).Width;
+                    }
+                    word.Location = new Point(x, y);
+                    x += fullWidth;
+                    widest = Math.Max(widest, x);
+                    lineHeight = Math.Max(lineHeight, word.Font.Height);
+                }
+                Size = new Size(Math.Min(maxWidth, widest + 2), y + lineHeight + 2);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                foreach (Word word in words)
+                    TextRenderer.DrawText(e.Graphics, word.Text, word.Font, word.Location, word.Color, Flags);
+            }
+        }
+    }
+
     class MainForm : Form
     {
         static readonly string AppVersion = BuildInfo.Version;
@@ -1340,6 +1667,7 @@ namespace IPbind
         readonly string AdapterFile;
         readonly string UpdateCheckFile;
         readonly string GatewayFile;
+        readonly string DhcpReminderFile;   // exists once "Don't show this again" was confirmed
 
         // Optional Gateway support: one listed address may carry a gateway and DNS.
         // The high metric keeps this route from beating Wi-Fi/corporate default routes.
@@ -1386,6 +1714,7 @@ namespace IPbind
             AdapterFile = Path.Combine(AppDir, "adapter.txt");
             UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
             GatewayFile = Path.Combine(AppDir, "gateway.txt");
+            DhcpReminderFile = Path.Combine(AppDir, "dhcp-reminder-dismissed.txt");
             BuildUi();
             LoadAdapters();
             LoadList();
@@ -2374,6 +2703,30 @@ namespace IPbind
                 DarkenScrollbars(this.Controls);
             }
             CheckForUpdatesOnLaunch();
+            // After the main window has painted: the Return-to-DHCP reminder.
+            BeginInvoke((MethodInvoker)ShowDhcpReminderIfNeeded);
+        }
+
+        // Shown at every launch until the user clicks Continue with "Don't show this
+        // again" ticked. The flag file is new in 2.3.125, so fresh installs and the first
+        // launch after updating from an older version both see it.
+        void ShowDhcpReminderIfNeeded()
+        {
+            if (IsDisposed) return;
+            try { if (File.Exists(DhcpReminderFile)) return; } catch { }
+            bool remember;
+            using (DhcpReminderForm reminder = new DhcpReminderForm(this, dark, sc))
+                remember = reminder.ShowDialog(this) == DialogResult.OK && reminder.DontShowAgain;
+            if (!remember) return;
+            try
+            {
+                EnsureAppDir();
+                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + AppVersion + "\r\n");
+            }
+            catch (Exception ex)
+            {
+                Log("Could not save the reminder setting: " + ex.Message, "WARN");
+            }
         }
 
         protected override void OnLocationChanged(EventArgs e)
