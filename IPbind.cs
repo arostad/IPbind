@@ -2834,6 +2834,9 @@ namespace IPbind
                     gwPlan.Ip + "/" + gwPlan.Prefix, "OK");
                 if (gwPlan.Dns1 != null)
                     Log("  DNS " + gwPlan.Dns1 + (gwPlan.Dns2 != null ? ", " + gwPlan.Dns2 : ""), "OK");
+                else if (!keep)
+                    Log("No DNS set. Website names may not work through this adapter. " +
+                        "Try your router's address (often the same as the gateway).", "WARN");
             }
             LogNetshOutput(outp);
 
