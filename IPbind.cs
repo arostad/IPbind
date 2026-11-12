@@ -856,18 +856,45 @@ namespace IPbind
 
     sealed class AboutForm : Form
     {
-        readonly Button checkButton;
-        readonly Label statusLabel;
-        readonly Label matchLabel;
-        readonly bool checkMatchOnShow;
-        readonly float sc;
+        const int WM_DPICHANGED = 0x02E0;
+        static readonly IntPtr DpiAwarenessPerMonitorV2 = new IntPtr(-4);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        float sc;
         readonly bool dark;
-        UpdateInfo availableUpdate;
         readonly string updateCheckFile;
-        readonly LinkLabel enableLaunchLink;
-        readonly CheckBox launchCheckBox;
         readonly bool portableCopy;
+        readonly bool checkMatchOnShow;
+        readonly Color bodyBack, footerBack, footerRule, fore, muted, quiet, linkColor, linkActive;
+        readonly Color secondaryBack, secondaryBorder, secondaryFore, primaryBack, primaryFore;
+
+        readonly PictureBox iconBox;
+        readonly Label nameLabel;
+        readonly Label versionLabel;
+        readonly LinkLabel website;
+        readonly Label matchLabel;
+        readonly Label tagline;
+        readonly LinkLabel creditLink;
+        readonly LinkLabel sourceLink;
+        readonly LinkLabel licenseLink;
+        readonly CheckBox launchCheckBox;
+        readonly LinkLabel enableLaunchLink;
+        readonly Label statusLabel;
+        readonly Label privacyLabel;
+        readonly Panel footer;
+        readonly Button checkButton;
+        readonly Button closeButton;
+        Bitmap iconBitmap;
+        readonly List<Font> fonts = new List<Font>();
+        Font fontName, fontVersion, fontBody, fontPrivacy, fontStatus, fontButton, fontButtonBold;
+        bool layingOut;
         bool settingLaunchCheck;
+        UpdateInfo availableUpdate;
 
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
@@ -875,122 +902,539 @@ namespace IPbind
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = "About " + BuildInfo.AppName;
-            Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            // Installed copies: a "turn on" link only while update-check.txt = manual.
-            // Portable copies: a "Check for updates at launch" checkbox, always shown.
-            // The form is taller only while one of the two is shown.
-            portableCopy = !IsInstalledCopy();
-            bool launchEnabled = ReadLaunchCheckEnabled();
-            bool manualOnly = !portableCopy && !launchEnabled;
-            bool showRow = portableCopy || manualOnly;
-            ClientSize = Z(430, showRow ? 408 : 380);
             try { Icon = owner.Icon; } catch { }
 
-            Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
-            Label version = MakeLabel(
-                "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
-            LinkLabel website = MakeLink(
-                "ipbind.com", "ipbind.com", "https://ipbind.com/", 24, 80, 382, 19);
-            website.Font = version.Font;
-            // Beta only: small note under the website link when this beta equals prod Latest.
-            // Hidden until the background check confirms it; prod builds never show it.
-            matchLabel = MakeLabel(
-                "Matches the current release", 8F, FontStyle.Regular, 24, 99, 382, 15);
+            portableCopy = !IsInstalledCopy();
+            bool launchEnabled = ReadLaunchCheckEnabled();
+            checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
+
+            if (dark)
+            {
+                bodyBack = Color.FromArgb(0x2B, 0x2B, 0x2B);
+                footerBack = Color.FromArgb(0x20, 0x20, 0x20);
+                footerRule = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                fore = Color.White;
+                muted = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                quiet = Color.FromArgb(0x9A, 0x9A, 0x9A);
+                linkColor = Color.FromArgb(0x60, 0xCD, 0xFF);
+                linkActive = Color.FromArgb(0x82, 0xD8, 0xFF);
+                secondaryBack = Color.FromArgb(0x33, 0x33, 0x33);
+                secondaryBorder = Color.FromArgb(0x4A, 0x4A, 0x4A);
+                secondaryFore = Color.White;
+                primaryBack = Color.FromArgb(0x60, 0xCD, 0xFF);
+                primaryFore = Color.FromArgb(0x10, 0x10, 0x10);
+            }
+            else
+            {
+                bodyBack = Color.White;
+                footerBack = Color.FromArgb(0xF3, 0xF3, 0xF3);
+                footerRule = Color.FromArgb(0xE5, 0xE5, 0xE5);
+                fore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                muted = Color.FromArgb(0x3B, 0x3B, 0x3B);
+                quiet = Color.FromArgb(0x6B, 0x6B, 0x6B);
+                linkColor = Color.FromArgb(0x00, 0x5F, 0xB8);
+                linkActive = Color.FromArgb(0x00, 0x47, 0x8A);
+                secondaryBack = Color.White;
+                secondaryBorder = Color.FromArgb(0xD0, 0xD0, 0xD0);
+                secondaryFore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                primaryBack = Color.FromArgb(0x00, 0x5F, 0xB8);
+                primaryFore = Color.White;
+            }
+
+            BackColor = bodyBack;
+            ForeColor = fore;
+
+            iconBox = new PictureBox();
+            iconBox.BackColor = Color.Transparent;
+            iconBox.SizeMode = PictureBoxSizeMode.Normal;
+            iconBox.TabStop = false;
+            nameLabel = MakeLabel();
+            nameLabel.Text = BuildInfo.AppName;
+            versionLabel = MakeLabel();
+            versionLabel.Text = "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : "");
+            website = MakeLink("ipbind.com", "ipbind.com", "https://ipbind.com/");
+            matchLabel = MakeLabel();
+            matchLabel.Text = "Matches the current release";
             matchLabel.Visible = false;
-            Label tagline = MakeLabel(
-                "One-click Static IP Binder for easily accessing\r\n" +
-                "air-gapped equipment spread across multiple IP ranges",
-                9F, FontStyle.Regular, 24, 114, 382, 58);
-
-            LinkLabel directed = MakeLink(
-                "App created by Andy Rostad",
-                "Andy Rostad", "https://github.com/arostad", 24, 186, 382, 22);
-            LinkLabel source = MakeLink(
-                "GitHub Project Page", "GitHub Project Page",
-                "https://github.com/arostad/IPbind", 24, 214, 382, 22);
-            LinkLabel license = MakeLink(
-                "Released under the MIT License", "MIT License",
-                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 242, 382, 22);
-
-            checkButton = new Button();
-            checkButton.Text = "Check for updates";
-            checkButton.Location = P(120, 274);
-            checkButton.Size = Z(190, 34);
-            checkButton.Click += CheckUpdates;
-
-            // Installed copies: only offered when the user chose manual updates
-            // (installer task unticked); there is no way to turn checks off here.
-            enableLaunchLink = new LinkLabel();
-            enableLaunchLink.Text = "Turn on automatic update checks…";
-            enableLaunchLink.Location = P(24, 316);
-            enableLaunchLink.Size = Z(382, 22);
-            enableLaunchLink.TextAlign = ContentAlignment.MiddleCenter;
-            enableLaunchLink.LinkColor = Color.FromArgb(25, 90, 160);
-            enableLaunchLink.Visible = manualOnly;
-            enableLaunchLink.LinkClicked += EnableLaunchChecks;
+            tagline = MakeLabel();
+            tagline.Text = "One-click Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges";
+            creditLink = MakeLink("App created by Andy Rostad", "Andy Rostad", "https://github.com/arostad");
+            sourceLink = MakeLink("GitHub Project Page", "GitHub Project Page", "https://github.com/arostad/IPbind");
+            licenseLink = MakeLink("Released under the MIT License", "MIT License",
+                "https://github.com/arostad/IPbind/blob/main/LICENSE");
 
             launchCheckBox = new CheckBox();
             launchCheckBox.Text = "Check for updates at launch";
-            launchCheckBox.AutoSize = true;
+            launchCheckBox.UseMnemonic = false;
+            launchCheckBox.AutoSize = false;
             launchCheckBox.Checked = launchEnabled;
             launchCheckBox.Visible = portableCopy;
             launchCheckBox.CheckedChanged += LaunchCheckChanged;
 
-            statusLabel = MakeLabel(
-                "", 8.5F, FontStyle.Regular, 24, showRow ? 344 : 312, 382, 48);
+            enableLaunchLink = MakeLink("Turn on automatic update checks\u2026",
+                "Turn on automatic update checks\u2026", null);
+            // The installed "turn on" link runs the privacy-consent flow, not a URL.
+            enableLaunchLink.Links[0].LinkData = "launch-checks";
+            enableLaunchLink.Visible = !portableCopy && !launchEnabled;
+            enableLaunchLink.LinkClicked += EnableLaunchChecks;
 
-            Controls.Add(title);
-            Controls.Add(version);
+            statusLabel = MakeLabel();
+            statusLabel.Text = "";
+            privacyLabel = MakeLabel();
+            privacyLabel.Text = "Checking for updates sends one anonymous request.\r\n"
+                + "Only the request\u2019s country code is counted; no identifiers or cookies.";
+
+            footer = new Panel();
+            footer.BackColor = footerBack;
+            footer.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                using (Pen pen = new Pen(footerRule))
+                    e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
+            };
+            checkButton = new Button();
+            checkButton.Text = "Check for updates";
+            checkButton.FlatStyle = FlatStyle.Flat;
+            checkButton.FlatAppearance.BorderSize = 1;
+            checkButton.Cursor = Cursors.Hand;
+            checkButton.Click += CheckUpdates;
+            closeButton = new Button();
+            closeButton.Text = "Close";
+            closeButton.FlatStyle = FlatStyle.Flat;
+            closeButton.FlatAppearance.BorderSize = 1;
+            closeButton.Cursor = Cursors.Hand;
+            closeButton.DialogResult = DialogResult.OK;
+            footer.Controls.Add(checkButton);
+            footer.Controls.Add(closeButton);
+            CancelButton = closeButton;
+
+            Controls.Add(iconBox);
+            Controls.Add(nameLabel);
+            Controls.Add(versionLabel);
             Controls.Add(website);
             Controls.Add(matchLabel);
             Controls.Add(tagline);
-            Controls.Add(directed);
-            Controls.Add(source);
-            Controls.Add(license);
-            Controls.Add(checkButton);
-            Controls.Add(enableLaunchLink);
+            Controls.Add(creditLink);
+            Controls.Add(sourceLink);
+            Controls.Add(licenseLink);
             Controls.Add(launchCheckBox);
+            Controls.Add(enableLaunchLink);
             Controls.Add(statusLabel);
-            // Centre the auto-sized checkbox under the button (device pixels).
-            launchCheckBox.Location = new Point(
-                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(316));
+            Controls.Add(privacyLabel);
+            Controls.Add(footer);
 
-            if (dark)
+            LayoutContent();
+            Shown += delegate
             {
-                BackColor = Color.FromArgb(32, 32, 32);
-                ForeColor = Color.FromArgb(230, 230, 230);
-                foreach (Control control in Controls)
-                {
-                    control.ForeColor = ForeColor;
-                    LinkLabel link = control as LinkLabel;
-                    if (link != null)
-                    {
-                        link.LinkColor = Color.FromArgb(90, 160, 240);
-                        link.ActiveLinkColor = Color.FromArgb(130, 185, 255);
-                    }
-                }
-                checkButton.FlatStyle = FlatStyle.Flat;
-                checkButton.BackColor = Color.FromArgb(50, 50, 50);
-                checkButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-                statusLabel.BackColor = BackColor;
-                statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
-            }
-            matchLabel.ForeColor = dark ? Color.FromArgb(150, 150, 150) : Color.FromArgb(110, 110, 110);
-
-            // Respect "manual": with launch checks off, only the Check button goes online.
-            checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
+                FitOnScreen();
+                if (checkMatchOnShow) StartReleaseMatchCheck();
+            };
         }
 
-        protected override void OnShown(EventArgs e)
+        Label MakeLabel()
         {
-            base.OnShown(e);
-            if (checkMatchOnShow) StartReleaseMatchCheck();
+            Label label = new Label();
+            label.AutoSize = false;
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
+            return label;
+        }
+
+        LinkLabel MakeLink(string text, string linkedText, string url)
+        {
+            LinkLabel label = new LinkLabel();
+            label.AutoSize = false;
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
+            label.Text = text;
+            label.LinkBehavior = LinkBehavior.AlwaysUnderline;
+            int start = text.IndexOf(linkedText, StringComparison.Ordinal);
+            if (start < 0) start = 0;
+            label.LinkArea = new LinkArea(start, linkedText.Length);
+            Uri safeUrl;
+            label.Links[0].LinkData = TryGetHttpsUrl(url, out safeUrl) ? safeUrl.AbsoluteUri : url;
+            if (url != null && url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
+                {
+                    try
+                    {
+                        Uri destination;
+                        if (!TryGetHttpsUrl(e.Link.LinkData as string, out destination))
+                            return;
+                        ProcessStartInfo info = new ProcessStartInfo(destination.AbsoluteUri);
+                        info.UseShellExecute = true;
+                        Process.Start(info);
+                    }
+                    catch { }
+                };
+            }
+            return label;
+        }
+
+        Font MakeFont(float px, FontStyle style)
+        {
+            Font font = new Font("Segoe UI", px * sc, style, GraphicsUnit.Pixel);
+            fonts.Add(font);
+            return font;
+        }
+
+        const TextFormatFlags WrapFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl |
+            TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+        const TextFormatFlags LineFlags = TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding |
+            TextFormatFlags.SingleLine;
+
+        Size MeasureWrap(string text, Font font, int maxWidth)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue), WrapFlags);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        Size MeasureLine(string text, Font font)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue), LineFlags);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        int U(int value) { return (int)Math.Round(value * sc); }
+
+        void LayoutContent()
+        {
+            if (layingOut) return;
+            layingOut = true;
+            try
+            {
+                List<Font> previous = new List<Font>(fonts);
+                fonts.Clear();
+                fontName = MakeFont(22f, FontStyle.Bold);
+                fontVersion = MakeFont(14f, FontStyle.Bold);
+                fontBody = MakeFont(14f, FontStyle.Regular);
+                fontPrivacy = MakeFont(12f, FontStyle.Regular);
+                fontStatus = MakeFont(13f, FontStyle.Regular);
+                fontButton = MakeFont(14f, FontStyle.Regular);
+                fontButtonBold = MakeFont(14f, FontStyle.Bold);
+                Font = MakeFont(9f, FontStyle.Regular);
+
+                nameLabel.Font = fontName; nameLabel.ForeColor = fore;
+                versionLabel.Font = fontVersion; versionLabel.ForeColor = fore;
+                website.Font = fontBody;
+                StyleLink(website);
+                matchLabel.Font = MakeFont(12f, FontStyle.Regular);
+                matchLabel.ForeColor = quiet;
+                tagline.Font = fontBody; tagline.ForeColor = muted;
+                StyleLink(creditLink); creditLink.Font = fontBody; creditLink.ForeColor = fore;
+                StyleLink(sourceLink); sourceLink.Font = fontBody; sourceLink.ForeColor = fore;
+                StyleLink(licenseLink); licenseLink.Font = fontBody; licenseLink.ForeColor = fore;
+                launchCheckBox.Font = fontBody;
+                launchCheckBox.ForeColor = fore;
+                launchCheckBox.BackColor = bodyBack;
+                StyleLink(enableLaunchLink); enableLaunchLink.Font = fontBody;
+                statusLabel.Font = fontStatus; statusLabel.ForeColor = quiet;
+                privacyLabel.Font = fontPrivacy; privacyLabel.ForeColor = quiet;
+                checkButton.Font = fontButton;
+                checkButton.BackColor = secondaryBack;
+                checkButton.ForeColor = secondaryFore;
+                checkButton.FlatAppearance.BorderColor = secondaryBorder;
+                closeButton.Font = fontButtonBold;
+                closeButton.BackColor = primaryBack;
+                closeButton.ForeColor = primaryFore;
+                closeButton.FlatAppearance.BorderColor = primaryBack;
+
+                int iconPx = Math.Max(1, U(64));
+                Bitmap newIcon = LoadAppIcon(iconPx);
+                Image oldImage = iconBox.Image;
+                iconBox.Image = newIcon;
+                if (iconBitmap != null && iconBitmap != oldImage) iconBitmap.Dispose();
+                if (oldImage != null && oldImage != newIcon && oldImage != iconBitmap) oldImage.Dispose();
+                iconBitmap = newIcon;
+
+                int width = U(500);
+                int padX = U(28);
+                int padTop = U(22);
+                int padBot = U(20);
+                int inner = width - 2 * padX;
+                int y = padTop;
+
+                iconBox.Location = new Point(padX, y);
+                iconBox.Size = new Size(iconPx, iconPx);
+                int stackX = padX + iconPx + U(16);
+                int stackW = width - padX - stackX;
+                Size nameSize = MeasureLine(nameLabel.Text, fontName);
+                Size verSize = MeasureLine(versionLabel.Text, fontVersion);
+                Size siteSize = MeasureLine(website.Text, fontBody);
+                int stackH = nameSize.Height + U(2) + verSize.Height + U(2) + siteSize.Height;
+                if (matchLabel.Visible)
+                    stackH += U(2) + MeasureLine(matchLabel.Text, matchLabel.Font).Height;
+                int heroH = Math.Max(iconPx, stackH);
+                iconBox.Top = y + (heroH - iconPx) / 2;
+                int stackY = y + (heroH - stackH) / 2;
+                nameLabel.Location = new Point(stackX, stackY);
+                nameLabel.Size = new Size(stackW, nameSize.Height);
+                versionLabel.Location = new Point(stackX, nameLabel.Bottom + U(2));
+                versionLabel.Size = new Size(stackW, verSize.Height);
+                website.Location = new Point(stackX, versionLabel.Bottom + U(2));
+                website.Size = new Size(Math.Min(stackW, siteSize.Width + 2), siteSize.Height);
+                int afterHero = Math.Max(iconBox.Bottom, website.Bottom);
+                if (matchLabel.Visible)
+                {
+                    Size matchSize = MeasureLine(matchLabel.Text, matchLabel.Font);
+                    matchLabel.Location = new Point(stackX, website.Bottom + U(2));
+                    matchLabel.Size = new Size(stackW, matchSize.Height);
+                    afterHero = Math.Max(iconBox.Bottom, matchLabel.Bottom);
+                }
+                y = afterHero + U(16);
+
+                Size tagSize = MeasureWrap(tagline.Text, fontBody, inner);
+                tagline.Location = new Point(padX, y);
+                tagline.Size = new Size(inner, tagSize.Height);
+                y = tagline.Bottom + U(18);
+
+                int gap = U(28);
+                LinkLabel[] row = new LinkLabel[] { creditLink, sourceLink, licenseLink };
+                int x = padX;
+                int rowH = 0;
+                int rowTop = y;
+                foreach (LinkLabel link in row)
+                {
+                    Size need = MeasureLine(link.Text, fontBody);
+                    int w = need.Width + 2;
+                    if (x > padX && x + w > padX + inner)
+                    {
+                        y = rowTop + rowH + U(8);
+                        x = padX;
+                        rowTop = y;
+                        rowH = 0;
+                    }
+                    link.Location = new Point(x, rowTop);
+                    link.Size = new Size(w, need.Height);
+                    x += w + gap;
+                    rowH = Math.Max(rowH, need.Height);
+                }
+                y = rowTop + rowH;
+
+                if (launchCheckBox.Visible)
+                {
+                    y += U(16);
+                    Size boxNeed = MeasureWrap(launchCheckBox.Text, fontBody, inner - U(24));
+                    int boxH = Math.Max(U(20), boxNeed.Height);
+                    launchCheckBox.Location = new Point(padX, y);
+                    launchCheckBox.Size = new Size(inner, boxH);
+                    launchCheckBox.CheckAlign = ContentAlignment.MiddleLeft;
+                    launchCheckBox.TextAlign = ContentAlignment.MiddleLeft;
+                    y = launchCheckBox.Bottom;
+                }
+                if (enableLaunchLink.Visible)
+                {
+                    y += U(16);
+                    Size linkNeed = MeasureLine(enableLaunchLink.Text, fontBody);
+                    enableLaunchLink.Location = new Point(padX, y);
+                    enableLaunchLink.Size = new Size(Math.Min(inner, linkNeed.Width + 2), linkNeed.Height);
+                    y = enableLaunchLink.Bottom;
+                }
+                if (!string.IsNullOrEmpty(statusLabel.Text))
+                {
+                    y += U(16);
+                    Size st = MeasureWrap(statusLabel.Text, fontStatus, inner);
+                    statusLabel.Location = new Point(padX, y);
+                    statusLabel.Size = new Size(inner, st.Height);
+                    statusLabel.Visible = true;
+                    y = statusLabel.Bottom;
+                }
+                else
+                {
+                    statusLabel.Visible = false;
+                    statusLabel.Size = new Size(inner, 0);
+                }
+
+                y += U(18);
+                Size priv = MeasureWrap(privacyLabel.Text, fontPrivacy, inner);
+                privacyLabel.Location = new Point(padX, y);
+                privacyLabel.Size = new Size(inner, priv.Height);
+                y = privacyLabel.Bottom + padBot;
+
+                int footerPadX = U(28);
+                int footerPadTop = U(16);
+                int footerPadBot = U(18);
+                int btnH = U(32);
+                Size checkNeed = MeasureLine(checkButton.Text, fontButton);
+                Size closeNeed = MeasureLine(closeButton.Text, fontButtonBold);
+                int checkW = Math.Max(U(96), checkNeed.Width + U(32));
+                int closeW = Math.Max(U(96), closeNeed.Width + U(32));
+                int footerH = footerPadTop + btnH + footerPadBot;
+                footer.Location = new Point(0, y);
+                footer.Size = new Size(width, footerH);
+                checkButton.Size = new Size(checkW, btnH);
+                closeButton.Size = new Size(closeW, btnH);
+                checkButton.Location = new Point(footerPadX, footerPadTop);
+                closeButton.Location = new Point(width - footerPadX - closeW, footerPadTop);
+
+                ClientSize = new Size(width, y + footerH);
+
+                foreach (Font font in previous) font.Dispose();
+            }
+            finally { layingOut = false; }
+        }
+
+        void StyleLink(LinkLabel label)
+        {
+            label.LinkColor = linkColor;
+            label.ActiveLinkColor = linkActive;
+            label.VisitedLinkColor = linkColor;
+            label.DisabledLinkColor = quiet;
+        }
+
+        void SetStatus(string text)
+        {
+            statusLabel.Text = text ?? "";
+            LayoutContent();
+        }
+
+        void FitOnScreen()
+        {
+            if (!IsHandleCreated) return;
+            Rectangle work = Screen.FromControl(this).WorkingArea;
+            int x = Left, y = Top, w = Width, h = Height;
+            if (x + w > work.Right) x = work.Right - w;
+            if (y + h > work.Bottom) y = work.Bottom - h;
+            if (x < work.Left) x = work.Left;
+            if (y < work.Top) y = work.Top;
+            Location = new Point(x, y);
+        }
+
+        Bitmap LoadAppIcon(int px)
+        {
+            try
+            {
+                Stream stream = typeof(AboutForm).Assembly.GetManifestResourceStream("IPbind.app.ico");
+                if (stream != null)
+                {
+                    using (stream)
+                    using (Icon src = new Icon(stream))
+                    using (Icon sized = new Icon(src, Math.Max(px, 256), Math.Max(px, 256)))
+                    using (Bitmap raw = sized.ToBitmap())
+                    {
+                        if (raw.Width == px && raw.Height == px)
+                            return new Bitmap(raw);
+                        Bitmap dest = new Bitmap(px, px);
+                        dest.SetResolution(96f * sc, 96f * sc);
+                        using (Graphics g = Graphics.FromImage(dest))
+                        {
+                            g.Clear(Color.Transparent);
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            g.SmoothingMode = SmoothingMode.HighQuality;
+                            g.DrawImage(raw, 0, 0, px, px);
+                        }
+                        return dest;
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                Icon src = Icon ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (src != null)
+                {
+                    using (Icon sized = new Icon(src, Math.Max(px, 256), Math.Max(px, 256)))
+                    using (Bitmap raw = sized.ToBitmap())
+                    {
+                        Bitmap dest = new Bitmap(px, px);
+                        using (Graphics g = Graphics.FromImage(dest))
+                        {
+                            g.Clear(Color.Transparent);
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            g.DrawImage(raw, 0, 0, px, px);
+                        }
+                        return dest;
+                    }
+                }
+            }
+            catch { }
+            return new Bitmap(px, px);
+        }
+
+        protected override void CreateHandle()
+        {
+            IntPtr previous = IntPtr.Zero;
+            bool changed = false;
+            try
+            {
+                previous = SetThreadDpiAwarenessContext(DpiAwarenessPerMonitorV2);
+                changed = previous != IntPtr.Zero && previous != DpiAwarenessPerMonitorV2;
+            }
+            catch { }
+            try { base.CreateHandle(); }
+            finally
+            {
+                if (changed)
+                {
+                    try { SetThreadDpiAwarenessContext(previous); } catch { }
+                }
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            WindowTheme.ApplyTitleBar(this, dark);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (dpi > 0)
+                {
+                    float newSc = dpi / 96f;
+                    if (Math.Abs(newSc - sc) > 0.001f)
+                    {
+                        sc = newSc;
+                        LayoutContent();
+                    }
+                }
+                RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                int w = Width, h = Height;
+                int x = suggested.Left, y = suggested.Top;
+                Rectangle work = Screen.FromPoint(new Point(x, y)).WorkingArea;
+                if (x + w > work.Right) x = work.Right - w;
+                if (y + h > work.Bottom) y = work.Bottom - h;
+                if (x < work.Left) x = work.Left;
+                if (y < work.Top) y = work.Top;
+                Bounds = new Rectangle(x, y, w, h);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                foreach (Font font in fonts) font.Dispose();
+                fonts.Clear();
+                if (iconBitmap != null)
+                {
+                    if (iconBox != null) iconBox.Image = null;
+                    iconBitmap.Dispose();
+                    iconBitmap = null;
+                }
+            }
+            base.Dispose(disposing);
         }
 
         void StartReleaseMatchCheck()
@@ -1006,7 +1450,9 @@ namespace IPbind
                     BeginInvoke((MethodInvoker)delegate
                     {
                         if (IsDisposed) return;
+                        if (matchLabel.Visible == match) return;
                         matchLabel.Visible = match;
+                        LayoutContent();
                     });
                 }
                 catch { }
@@ -1014,16 +1460,6 @@ namespace IPbind
             thread.IsBackground = true;
             thread.Start();
         }
-
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            WindowTheme.ApplyTitleBar(this, dark);
-        }
-
-        int U(int value) { return (int)Math.Round(value * sc); }
-        Point P(int x, int y) { return new Point(U(x), U(y)); }
-        Size Z(int width, int height) { return new Size(U(width), U(height)); }
 
         bool ReadLaunchCheckEnabled()
         {
@@ -1047,7 +1483,7 @@ namespace IPbind
             }
             catch (Exception ex)
             {
-                statusLabel.Text = "Could not save the update setting: " + ex.Message;
+                SetStatus("Could not save the update setting: " + ex.Message);
                 return false;
             }
         }
@@ -1090,7 +1526,7 @@ namespace IPbind
                     SetLaunchCheckSilently(false);
                     return;
                 }
-                statusLabel.Text = "Updates will now be checked at launch.";
+                SetStatus("Updates will now be checked at launch.");
             }
             else
             {
@@ -1099,7 +1535,7 @@ namespace IPbind
                     SetLaunchCheckSilently(true);
                     return;
                 }
-                statusLabel.Text = "Automatic update checks are off. Use Check for updates any time.";
+                SetStatus("Automatic update checks are off. Use Check for updates any time.");
             }
         }
 
@@ -1113,53 +1549,7 @@ namespace IPbind
             if (!agreed || !WriteLaunchCheckMode("auto")) return;
 
             enableLaunchLink.Visible = false;
-            statusLabel.Location = P(24, 312);
-            ClientSize = Z(430, 380);
-            statusLabel.Text = "Updates will now be checked at launch.";
-        }
-
-        Label MakeLabel(
-            string text, float size, FontStyle style, int x, int y, int width, int height)
-        {
-            Label label = new Label();
-            label.Text = text;
-            label.Font = new Font("Segoe UI", size, style);
-            label.Location = P(x, y);
-            label.Size = Z(width, height);
-            label.TextAlign = ContentAlignment.MiddleCenter;
-            return label;
-        }
-
-        LinkLabel MakeLink(
-            string text, string linkedText, string url, int x, int y, int width, int height)
-        {
-            LinkLabel label = new LinkLabel();
-            label.Text = text;
-            label.Location = P(x, y);
-            label.Size = Z(width, height);
-            label.TextAlign = ContentAlignment.MiddleCenter;
-            label.LinkColor = Color.FromArgb(25, 90, 160);
-            int start = text.IndexOf(linkedText, StringComparison.Ordinal);
-            label.LinkArea = new LinkArea(start, linkedText.Length);
-            Uri safeUrl;
-            label.Links[0].LinkData = TryGetHttpsUrl(url, out safeUrl)
-                ? safeUrl.AbsoluteUri
-                : null;
-            label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
-            {
-                try
-                {
-                    Uri destination;
-                    if (!TryGetHttpsUrl(e.Link.LinkData as string, out destination))
-                        return;
-
-                    ProcessStartInfo info = new ProcessStartInfo(destination.AbsoluteUri);
-                    info.UseShellExecute = true;
-                    Process.Start(info);
-                }
-                catch { }
-            };
-            return label;
+            SetStatus("Updates will now be checked at launch.");
         }
 
         static bool TryGetHttpsUrl(string value, out Uri uri)
@@ -1181,7 +1571,7 @@ namespace IPbind
         {
             StartReleaseMatchCheck();
             checkButton.Enabled = false;
-            statusLabel.Text = "Checking...";
+            SetStatus("Checking...");
             Thread thread = new Thread(delegate()
             {
                 UpdateInfo info;
@@ -1202,18 +1592,18 @@ namespace IPbind
                         checkButton.Enabled = true;
                         if (!info.IsNewer)
                         {
-                            statusLabel.Text = string.IsNullOrEmpty(info.Error)
+                            SetStatus(string.IsNullOrEmpty(info.Error)
                                 ? "You're on the latest version (" + BuildInfo.Version + ")."
-                                : info.Error;
+                                : info.Error);
                             return;
                         }
 
                         availableUpdate = info;
-                        statusLabel.Text =
-                            "Version " + info.RemoteVersion + " is available.";
+                        SetStatus("Version " + info.RemoteVersion + " is available.");
                         checkButton.Text = "Update now";
                         checkButton.Click -= CheckUpdates;
                         checkButton.Click += UpdateNow;
+                        LayoutContent();
                     });
                 }
                 catch { }
@@ -1226,7 +1616,7 @@ namespace IPbind
         {
             if (availableUpdate == null) return;
             checkButton.Enabled = false;
-            statusLabel.Text = "Downloading. The app will restart when it is ready.";
+            SetStatus("Downloading. The app will restart when it is ready.");
             Thread thread = new Thread(delegate()
             {
                 try
@@ -1242,7 +1632,7 @@ namespace IPbind
                         BeginInvoke((MethodInvoker)delegate
                         {
                             if (IsDisposed) return;
-                            statusLabel.Text = UpdateChecker.DescribeError(ex);
+                            SetStatus(UpdateChecker.DescribeError(ex));
                             checkButton.Enabled = true;
                         });
                     }
