@@ -887,34 +887,38 @@ namespace IPbind
             bool launchEnabled = ReadLaunchCheckEnabled();
             bool manualOnly = !portableCopy && !launchEnabled;
             bool showRow = portableCopy || manualOnly;
-            ClientSize = Z(430, showRow ? 388 : 360);
+            ClientSize = Z(430, showRow ? 408 : 380);
             try { Icon = owner.Icon; } catch { }
 
             Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
             Label version = MakeLabel(
                 "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
-            // Beta only: small note under the version when this beta equals prod Latest.
+            LinkLabel website = MakeLink(
+                "ipbind.com", "ipbind.com", "https://ipbind.com/", 24, 80, 382, 19);
+            website.Font = version.Font;
+            // Beta only: small note under the website link when this beta equals prod Latest.
             // Hidden until the background check confirms it; prod builds never show it.
             matchLabel = MakeLabel(
-                "Matches the current release", 8F, FontStyle.Regular, 24, 79, 382, 15);
+                "Matches the current release", 8F, FontStyle.Regular, 24, 99, 382, 15);
             matchLabel.Visible = false;
             Label tagline = MakeLabel(
                 "One-click Static IP Binder for easily accessing\r\n" +
                 "air-gapped equipment spread across multiple IP ranges",
-                9F, FontStyle.Regular, 24, 94, 382, 58);
+                9F, FontStyle.Regular, 24, 114, 382, 58);
 
             LinkLabel directed = MakeLink(
                 "App created by Andy Rostad",
-                "Andy Rostad", "https://github.com/arostad", 24, 166, 382, 22);
+                "Andy Rostad", "https://github.com/arostad", 24, 186, 382, 22);
             LinkLabel source = MakeLink(
-                "Source", "Source", "https://github.com/arostad/IPbind", 24, 194, 382, 22);
+                "GitHub project page", "GitHub project page",
+                "https://github.com/arostad/IPbind", 24, 214, 382, 22);
             LinkLabel license = MakeLink(
                 "Released under the MIT License", "MIT License",
-                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 222, 382, 22);
+                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 242, 382, 22);
 
             checkButton = new Button();
             checkButton.Text = "Check for updates";
-            checkButton.Location = P(120, 254);
+            checkButton.Location = P(120, 274);
             checkButton.Size = Z(190, 34);
             checkButton.Click += CheckUpdates;
 
@@ -922,7 +926,7 @@ namespace IPbind
             // (installer task unticked); there is no way to turn checks off here.
             enableLaunchLink = new LinkLabel();
             enableLaunchLink.Text = "Turn on automatic update checks…";
-            enableLaunchLink.Location = P(24, 296);
+            enableLaunchLink.Location = P(24, 316);
             enableLaunchLink.Size = Z(382, 22);
             enableLaunchLink.TextAlign = ContentAlignment.MiddleCenter;
             enableLaunchLink.LinkColor = Color.FromArgb(25, 90, 160);
@@ -937,10 +941,11 @@ namespace IPbind
             launchCheckBox.CheckedChanged += LaunchCheckChanged;
 
             statusLabel = MakeLabel(
-                "", 8.5F, FontStyle.Regular, 24, showRow ? 324 : 292, 382, 48);
+                "", 8.5F, FontStyle.Regular, 24, showRow ? 344 : 312, 382, 48);
 
             Controls.Add(title);
             Controls.Add(version);
+            Controls.Add(website);
             Controls.Add(matchLabel);
             Controls.Add(tagline);
             Controls.Add(directed);
@@ -952,7 +957,7 @@ namespace IPbind
             Controls.Add(statusLabel);
             // Centre the auto-sized checkbox under the button (device pixels).
             launchCheckBox.Location = new Point(
-                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(296));
+                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(316));
 
             if (dark)
             {
@@ -1106,8 +1111,8 @@ namespace IPbind
             if (!agreed || !WriteLaunchCheckMode("auto")) return;
 
             enableLaunchLink.Visible = false;
-            statusLabel.Location = P(24, 292);
-            ClientSize = Z(430, 360);
+            statusLabel.Location = P(24, 312);
+            ClientSize = Z(430, 380);
             statusLabel.Text = "Updates will now be checked at launch.";
         }
 
@@ -1344,7 +1349,7 @@ namespace IPbind
                 }
             }
             catch { }
-            return "The privacy notice could not be loaded. See the Privacy section at https://github.com/arostad/IPbind";
+            return "The privacy notice could not be loaded. See the Privacy section at https://ipbind.com/#privacy";
         }
     }
 
