@@ -92,7 +92,7 @@ public enum AddressList {
     public static func parse(_ text: String) -> Parsed {
         var out = Parsed()
         var seen = Set<IPv4>()
-        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+        for raw in text.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }
             guard let e = CidrEntry(line) else { out.skipped.append((line, "not a valid IPv4/prefix")); continue }
