@@ -1011,6 +1011,7 @@ namespace IPbind
             closeButton.DialogResult = DialogResult.OK;
             footer.Controls.Add(checkButton);
             footer.Controls.Add(closeButton);
+            AcceptButton = closeButton;
             CancelButton = closeButton;
 
             Controls.Add(iconBox);
@@ -1157,8 +1158,7 @@ namespace IPbind
                 Bitmap newIcon = LoadAppIcon(iconPx);
                 Image oldImage = iconBox.Image;
                 iconBox.Image = newIcon;
-                if (iconBitmap != null && iconBitmap != oldImage) iconBitmap.Dispose();
-                if (oldImage != null && oldImage != newIcon && oldImage != iconBitmap) oldImage.Dispose();
+                if (oldImage != null && oldImage != newIcon) oldImage.Dispose();
                 iconBitmap = newIcon;
 
                 int width = U(500);
@@ -1202,12 +1202,13 @@ namespace IPbind
                 tagline.Size = new Size(inner, tagSize.Height);
                 y = tagline.Bottom + U(18);
 
+                // Credit and GitHub share a wrapping row; the license always starts the next line.
                 int gap = U(28);
-                LinkLabel[] row = new LinkLabel[] { creditLink, sourceLink, licenseLink };
                 int x = padX;
                 int rowH = 0;
                 int rowTop = y;
-                foreach (LinkLabel link in row)
+                LinkLabel[] pair = new LinkLabel[] { creditLink, sourceLink };
+                foreach (LinkLabel link in pair)
                 {
                     Size need = MeasureLine(link.Text, fontBody);
                     int w = need.Width + 2;
@@ -1223,7 +1224,11 @@ namespace IPbind
                     x += w + gap;
                     rowH = Math.Max(rowH, need.Height);
                 }
-                y = rowTop + rowH;
+                y = rowTop + rowH + U(8);
+                Size licNeed = MeasureLine(licenseLink.Text, fontBody);
+                licenseLink.Location = new Point(padX, y);
+                licenseLink.Size = new Size(Math.Min(inner, licNeed.Width + 2), licNeed.Height);
+                y = licenseLink.Bottom;
 
                 if (launchCheckBox.Visible)
                 {
