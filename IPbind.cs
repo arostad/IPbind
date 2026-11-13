@@ -12,12 +12,15 @@
 // relying on WinForms auto-scaling. Version metadata is generated per-build in Version.cs.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Globalization;
 using System.IO;
+using Microsoft.Win32;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -49,14 +52,669 @@ namespace IPbind
         [STAThread]
         static void Main(string[] args)
         {
-            if (UpdateChecker.TryRunApplyUpdate(args)) return;
-            UpdateChecker.BeginHelperCleanup(args);
-            InstalledVersionSync.Run();
+            DebugLog.Start();
+            try
+            {
+                if (UpdateChecker.TryRunApplyUpdate(args)) return;
+                UpdateChecker.BeginHelperCleanup(args);
+                InstalledVersionSync.Run();
 
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            WindowTheme.ApplyPreferredAppMode();
-            Application.Run(new MainForm());
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                WindowTheme.ApplyPreferredAppMode();
+                Application.Run(new MainForm());
+            }
+            finally
+            {
+                DebugLog.Stop();
+            }
+        }
+    }
+
+    static class DebugLog
+    {
+        public static readonly bool Enabled = BuildInfo.IsBeta;
+
+        const int KeepDays = 14;
+        const long MaxTotalBytes = 10L * 1024L * 1024L;
+        const int UiStallMs = 250;
+        const int PaintWarnPerMinute = 300;
+        const int FirstChanceMaxPerWindow = 20;
+        const int FirstChanceWindowMs = 10000;
+
+        static readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+        static readonly AutoResetEvent pulse = new AutoResetEvent(false);
+        static readonly object startGate = new object();
+        static Thread writer;
+        static volatile bool started;
+        static volatile bool stopping;
+        static string logDir;
+        static SynchronizationContext uiContext;
+        static int lastUiTick;
+        static int lastStallLogTick;
+        static Thread watchdog;
+        static System.Threading.Timer metricsTimer;
+        static System.Threading.Timer paintTimer;
+        static readonly List<PaintHook> paintHooks = new List<PaintHook>();
+        static readonly object hookGate = new object();
+        static readonly Queue<long> workingSets = new Queue<long>();
+        static readonly Queue<int> gdiCounts = new Queue<int>();
+        static readonly Queue<int> userCounts = new Queue<int>();
+        static int firstChanceCount;
+        static int firstChanceWindowStart;
+        static bool firstChanceSuppressed;
+        static readonly Dictionary<string, string> linkState = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        [DllImport("user32.dll")]
+        static extern int GetGuiResources(IntPtr hProcess, int flags);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buf, int len, out int ret);
+        [DllImport("shcore.dll")]
+        static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X, Y; }
+        [DllImport("user32.dll")]
+        static extern IntPtr MonitorFromPoint(POINT pt, int flags);
+
+        public static void Start()
+        {
+            if (!Enabled) return;
+            lock (startGate)
+            {
+                if (started) return;
+                started = true;
+            }
+            try
+            {
+                logDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    BuildInfo.AppName, "logs");
+                Directory.CreateDirectory(logDir);
+            }
+            catch (Exception ex)
+            {
+                started = false;
+                try { System.Diagnostics.Debug.WriteLine("DebugLog start failed: " + ex.Message); } catch { }
+                return;
+            }
+
+            writer = new Thread(WriterLoop);
+            writer.IsBackground = true;
+            writer.Name = "IPbind-DebugLog";
+            writer.Start();
+
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += OnThreadException;
+            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+            AppDomain.CurrentDomain.FirstChanceException += OnFirstChance;
+
+            try
+            {
+                NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+                NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+            }
+            catch { }
+            try
+            {
+                SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+                SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+                SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            }
+            catch { }
+
+            lastUiTick = Environment.TickCount;
+            watchdog = new Thread(WatchdogLoop);
+            watchdog.IsBackground = true;
+            watchdog.Name = "IPbind-UiWatchdog";
+            watchdog.Start();
+
+            metricsTimer = new System.Threading.Timer(delegate { SampleMetrics(); }, null, 30 * 1000, 5 * 60 * 1000);
+            paintTimer = new System.Threading.Timer(delegate { ReportPaints(); }, null, 60 * 1000, 60 * 1000);
+
+            Write("INFO", "Debug log started (local only, never sent). fileDir=" + logDir);
+            LogStartup();
+            LogElevation();
+        }
+
+        public static void Stop()
+        {
+            if (!Enabled || !started) return;
+            stopping = true;
+            try
+            {
+                Application.ThreadException -= OnThreadException;
+                AppDomain.CurrentDomain.UnhandledException -= OnUnhandledException;
+                AppDomain.CurrentDomain.FirstChanceException -= OnFirstChance;
+                NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
+                NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+                SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+                SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+                SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            }
+            catch { }
+            try { if (metricsTimer != null) metricsTimer.Dispose(); } catch { }
+            try { if (paintTimer != null) paintTimer.Dispose(); } catch { }
+            pulse.Set();
+            try { if (writer != null) writer.Join(2000); } catch { }
+            FlushToDisk();
+        }
+
+        public static void Write(string level, string message)
+        {
+            if (!Enabled || !started) return;
+            if (message == null) message = "";
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)
+                + " " + level + " " + message;
+            queue.Enqueue(line);
+            pulse.Set();
+        }
+
+        public static void Debug(string message) { Write("DEBUG", message); }
+        public static void Info(string message) { Write("INFO", message); }
+        public static void Warn(string message) { Write("WARN", message); }
+        public static void Error(string message) { Write("ERROR", message); }
+
+        public static void Exception(string where, System.Exception ex)
+        {
+            if (!Enabled || !started) return;
+            if (ex == null) { Write("ERROR", where + ": (null exception)"); return; }
+            Write("ERROR", where + ": " + ex.GetType().FullName + ": " + ex.Message + "\r\n" + ex.ToString());
+        }
+
+        public static void Flush()
+        {
+            if (!Enabled || !started) return;
+            pulse.Set();
+            int spins = 0;
+            while (!queue.IsEmpty && spins < 200)
+            {
+                Thread.Sleep(10);
+                spins++;
+            }
+        }
+
+        public static IDisposable Time(string name)
+        {
+            return new ActionTimer(name);
+        }
+
+        public static void WatchForm(Form form)
+        {
+            if (!Enabled || !started || form == null) return;
+            form.Load += delegate
+            {
+                uiContext = SynchronizationContext.Current;
+                LogForm("open", form);
+                HookPaints(form);
+                try { form.BeginInvoke(new MethodInvoker(delegate { Heartbeat(); })); } catch { }
+            };
+            form.FormClosed += delegate { LogForm("close", form); };
+            form.Shown += delegate { LogForm("shown", form); };
+        }
+
+        public static void Heartbeat()
+        {
+            lastUiTick = Environment.TickCount;
+            if (uiContext == null) uiContext = SynchronizationContext.Current;
+        }
+
+        public static void LogSettingsFile(string path, string action)
+        {
+            if (!Enabled || !started) return;
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    Write("INFO", "settings " + action + " missing " + path);
+                    return;
+                }
+                string body = File.ReadAllText(path);
+                if (body.Length > 8000) body = body.Substring(0, 8000) + "\r\n...[truncated]";
+                Write("INFO", "settings " + action + " " + path + " (" + body.Length + " chars)\r\n" + body);
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "settings " + action + " " + path + " failed: " + ex.Message);
+            }
+        }
+
+        public static void LogProc(string file, string args, int exit, string output, string stderr, long ms)
+        {
+            if (!Enabled || !started) return;
+            string err = string.IsNullOrEmpty(stderr) ? "" : " stderr=" + OneLine(stderr);
+            string outp = string.IsNullOrEmpty(output) ? "" : " stdout=" + OneLine(output);
+            Write("DEBUG", "proc " + file + " " + args + " exit=" + exit + " " + ms + "ms" + err + outp);
+        }
+
+        public static void LogHttp(string url, int status, string detail)
+        {
+            if (!Enabled || !started) return;
+            Write("INFO", "http GET " + url + " status=" + status + (string.IsNullOrEmpty(detail) ? "" : " " + detail));
+        }
+
+        static string OneLine(string s)
+        {
+            if (s == null) return "";
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (s.Length > 2000) s = s.Substring(0, 2000) + "...";
+            return s;
+        }
+
+        static int MonitorDpi(Screen screen)
+        {
+            try
+            {
+                POINT pt = new POINT();
+                pt.X = screen.Bounds.X + 1;
+                pt.Y = screen.Bounds.Y + 1;
+                IntPtr mon = MonitorFromPoint(pt, 2);
+                uint x, y;
+                if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0, out x, out y) == 0 && x > 0)
+                    return (int)x;
+            }
+            catch { }
+            return DpiWindow.SystemDpi();
+        }
+
+        static void LogStartup()
+        {
+            try
+            {
+                OperatingSystem os = Environment.OSVersion;
+                string osBuild = "";
+                try
+                {
+                    object v = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber", "");
+                    object ubr = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR", null);
+                    osBuild = (v ?? "").ToString();
+                    if (ubr != null) osBuild += "." + ubr.ToString();
+                }
+                catch { }
+                Write("INFO", "startup version=" + BuildInfo.DisplayVersion
+                    + " channel=" + BuildInfo.Channel
+                    + " os=" + os.VersionString
+                    + " build=" + osBuild
+                    + " bitness=" + (Environment.Is64BitProcess ? "64" : "32")
+                    + " clr=" + Environment.Version);
+                foreach (Screen screen in Screen.AllScreens)
+                {
+                    int dpi = MonitorDpi(screen);
+                    Write("INFO", "monitor " + (screen.Primary ? "primary" : "secondary")
+                        + " bounds=" + screen.Bounds
+                        + " work=" + screen.WorkingArea
+                        + " dpi=" + dpi
+                        + " scale=" + (dpi / 96f).ToString("0.##", CultureInfo.InvariantCulture));
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "startup probe failed: " + ex.Message);
+            }
+        }
+
+        static void LogElevation()
+        {
+            try
+            {
+                WindowsIdentity id = WindowsIdentity.GetCurrent();
+                WindowsPrincipal principal = new WindowsPrincipal(id);
+                bool admin = principal.IsInRole(WindowsBuiltInRole.Administrator);
+                int elevType = 0;
+                try
+                {
+                    int ret;
+                    IntPtr buf = Marshal.AllocHGlobal(4);
+                    try
+                    {
+                        if (GetTokenInformation(id.Token, 18, buf, 4, out ret) && ret >= 4)
+                            elevType = Marshal.ReadInt32(buf);
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+                catch { }
+                string typeName = elevType == 1 ? "Default" : elevType == 2 ? "Full" : elevType == 3 ? "Limited" : ("unknown-" + elevType);
+                Write("INFO", "elevation isAdmin=" + admin + " tokenType=" + typeName + " user=" + id.Name);
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "elevation probe failed: " + ex.Message);
+            }
+        }
+
+        static void LogForm(string action, Form form)
+        {
+            try
+            {
+                string title = form.Text ?? form.GetType().Name;
+                Rectangle b = form.Bounds;
+                Screen screen = null;
+                try { screen = Screen.FromControl(form); } catch { }
+                int dpi = DpiWindow.SystemDpi();
+                try { if (form.IsHandleCreated) { int w = DpiWindow.WindowDpi(form.Handle); if (w > 0) dpi = w; } } catch { }
+                Write("INFO", "form " + action + " type=" + form.GetType().Name
+                    + " title='" + title + "'"
+                    + " bounds=" + b
+                    + " monitor=" + (screen == null ? "?" : screen.DeviceName + " " + screen.Bounds)
+                    + " dpi=" + dpi
+                    + " scale=" + (dpi / 96f).ToString("0.##", CultureInfo.InvariantCulture));
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "form " + action + " log failed: " + ex.Message);
+            }
+        }
+
+        static void WriterLoop()
+        {
+            while (true)
+            {
+                pulse.WaitOne(1000);
+                FlushToDisk();
+                if (stopping && queue.IsEmpty) break;
+            }
+        }
+
+        static void FlushToDisk()
+        {
+            if (string.IsNullOrEmpty(logDir)) return;
+            string name = "ipbind-beta-" + DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".log";
+            string path = Path.Combine(logDir, name);
+            StringBuilder batch = new StringBuilder();
+            string line;
+            while (queue.TryDequeue(out line))
+                batch.Append(line).Append("\r\n");
+            if (batch.Length == 0) return;
+            try
+            {
+                File.AppendAllText(path, batch.ToString());
+                Rotate(path);
+            }
+            catch { }
+        }
+
+        static void Rotate(string currentPath)
+        {
+            try
+            {
+                DateTime cutoff = DateTime.Now.Date.AddDays(-KeepDays);
+                List<FileInfo> files = new List<FileInfo>();
+                foreach (string f in Directory.GetFiles(logDir, "ipbind-beta-*.log"))
+                    files.Add(new FileInfo(f));
+                files.Sort(delegate(FileInfo a, FileInfo b) { return a.LastWriteTime.CompareTo(b.LastWriteTime); });
+                long total = 0;
+                foreach (FileInfo fi in files) total += fi.Length;
+                foreach (FileInfo fi in files)
+                {
+                    bool old = fi.LastWriteTime < cutoff;
+                    bool over = total > MaxTotalBytes && !string.Equals(fi.FullName, currentPath, StringComparison.OrdinalIgnoreCase);
+                    if (!old && !over) continue;
+                    try
+                    {
+                        total -= fi.Length;
+                        fi.Delete();
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        static void WatchdogLoop()
+        {
+            while (!stopping)
+            {
+                Thread.Sleep(50);
+                HeartbeatKick();
+                if (uiContext == null) continue;
+                int idle = Environment.TickCount - lastUiTick;
+                if (idle > UiStallMs && lastUiTick != 0)
+                {
+                    int now = Environment.TickCount;
+                    if (now - lastStallLogTick > 2000)
+                    {
+                        lastStallLogTick = now;
+                        Write("WARN", "UI thread stall " + idle + "ms (threshold " + UiStallMs + "ms)");
+                    }
+                }
+            }
+        }
+
+        static void HeartbeatKick()
+        {
+            SynchronizationContext ctx = uiContext;
+            if (ctx == null) return;
+            try { ctx.Post(delegate { Heartbeat(); }, null); } catch { }
+        }
+
+        static void SampleMetrics()
+        {
+            if (stopping) return;
+            try
+            {
+                Process proc = Process.GetCurrentProcess();
+                proc.Refresh();
+                long ws = proc.WorkingSet64;
+                int gdi = 0, user = 0;
+                try { gdi = GetGuiResources(proc.Handle, 0); } catch { }
+                try { user = GetGuiResources(proc.Handle, 1); } catch { }
+                Write("DEBUG", "metrics workingSet=" + ws + " gdi=" + gdi + " user=" + user
+                    + " handles=" + proc.HandleCount + " threads=" + proc.Threads.Count);
+                lock (hookGate)
+                {
+                    workingSets.Enqueue(ws);
+                    gdiCounts.Enqueue(gdi);
+                    userCounts.Enqueue(user);
+                    while (workingSets.Count > 3) { workingSets.Dequeue(); gdiCounts.Dequeue(); userCounts.Dequeue(); }
+                    if (workingSets.Count == 3 && IsRising(workingSets) && IsRisingInt(gdiCounts) && IsRisingInt(userCounts))
+                        Write("WARN", "possible leak: working set, GDI, and USER handles all kept growing over the last 15 minutes (ws=" + ws + " gdi=" + gdi + " user=" + user + ")");
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("DEBUG", "metrics failed: " + ex.Message);
+            }
+        }
+
+        static bool IsRising(Queue<long> q)
+        {
+            long prev = -1;
+            foreach (long v in q)
+            {
+                if (prev >= 0 && v <= prev) return false;
+                prev = v;
+            }
+            return true;
+        }
+
+        static bool IsRisingInt(Queue<int> q)
+        {
+            int prev = -1;
+            foreach (int v in q)
+            {
+                if (prev >= 0 && v <= prev) return false;
+                prev = v;
+            }
+            return true;
+        }
+
+        static void ReportPaints()
+        {
+            if (stopping) return;
+            List<PaintHook> hooks;
+            lock (hookGate) hooks = new List<PaintHook>(paintHooks);
+            StringBuilder sb = new StringBuilder();
+            foreach (PaintHook hook in hooks)
+            {
+                int n = Interlocked.Exchange(ref hook.Count, 0);
+                if (n <= 0) continue;
+                sb.Append(hook.Name).Append("=").Append(n).Append(" ");
+                if (n >= PaintWarnPerMinute)
+                    Write("WARN", "paint loop? " + hook.Name + " painted " + n + " times in the last minute (threshold " + PaintWarnPerMinute + ")");
+            }
+            if (sb.Length > 0) Write("DEBUG", "paints/min " + sb.ToString().Trim());
+        }
+
+        public static void HookPaints(Control root)
+        {
+            if (!Enabled || !started || root == null) return;
+            HookOne(root);
+            foreach (Control child in root.Controls) HookPaints(child);
+        }
+
+        static void HookOne(Control c)
+        {
+            try
+            {
+                if (c.IsHandleCreated) AttachHook(c);
+                c.HandleCreated += delegate { AttachHook(c); };
+            }
+            catch { }
+        }
+
+        static void AttachHook(Control c)
+        {
+            try
+            {
+                if (!c.IsHandleCreated) return;
+                PaintHook hook = new PaintHook();
+                hook.Name = c.GetType().Name + (string.IsNullOrEmpty(c.Name) ? (string.IsNullOrEmpty(c.Text) ? "" : (":" + TrimName(c.Text))) : (":" + c.Name));
+                hook.AssignHandle(c.Handle);
+                lock (hookGate) paintHooks.Add(hook);
+            }
+            catch { }
+        }
+
+        static string TrimName(string s)
+        {
+            s = (s ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+            if (s.Length > 40) s = s.Substring(0, 40);
+            return s;
+        }
+
+        sealed class PaintHook : NativeWindow
+        {
+            public string Name = "";
+            public int Count;
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == 0x000F) Interlocked.Increment(ref Count);
+                base.WndProc(ref m);
+            }
+        }
+
+        sealed class ActionTimer : IDisposable
+        {
+            readonly string name;
+            readonly Stopwatch watch;
+            public ActionTimer(string name)
+            {
+                this.name = name;
+                watch = Stopwatch.StartNew();
+            }
+            public void Dispose()
+            {
+                watch.Stop();
+                Write("DEBUG", "ui action '" + name + "' " + watch.ElapsedMilliseconds + "ms");
+                Heartbeat();
+            }
+        }
+
+        static void OnThreadException(object sender, ThreadExceptionEventArgs e)
+        {
+            Exception("Application.ThreadException", e.Exception);
+        }
+
+        static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            System.Exception ex = e.ExceptionObject as System.Exception;
+            if (ex == null) ex = new System.Exception(Convert.ToString(e.ExceptionObject));
+            Exception("AppDomain.UnhandledException (term=" + e.IsTerminating + ")", ex);
+        }
+
+        static void OnFirstChance(object sender, System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs e)
+        {
+            if (!Enabled || !started || e == null || e.Exception == null) return;
+            int now = Environment.TickCount;
+            if (now - firstChanceWindowStart > FirstChanceWindowMs)
+            {
+                firstChanceWindowStart = now;
+                firstChanceCount = 0;
+                firstChanceSuppressed = false;
+            }
+            firstChanceCount++;
+            if (firstChanceCount > FirstChanceMaxPerWindow)
+            {
+                if (!firstChanceSuppressed)
+                {
+                    firstChanceSuppressed = true;
+                    Write("DEBUG", "first-chance exceptions rate-limited (" + FirstChanceMaxPerWindow + " / " + (FirstChanceWindowMs / 1000) + "s)");
+                }
+                return;
+            }
+            System.Exception ex = e.Exception;
+            string loc = "?";
+            if (ex.TargetSite != null)
+                loc = (ex.TargetSite.DeclaringType != null ? ex.TargetSite.DeclaringType.FullName + "." : "") + ex.TargetSite.Name;
+            Write("DEBUG", "first-chance " + ex.GetType().FullName + " at " + loc + ": " + ex.Message);
+        }
+
+        static void OnNetworkAddressChanged(object sender, EventArgs e)
+        {
+            Write("INFO", "NetworkChange.NetworkAddressChanged");
+            LogLinkStates();
+        }
+
+        static void OnNetworkAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
+        {
+            Write("INFO", "NetworkChange.NetworkAvailabilityChanged available=" + e.IsAvailable);
+        }
+
+        static void LogLinkStates()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    string st = ni.OperationalStatus.ToString();
+                    string prev;
+                    lock (linkState)
+                    {
+                        if (!linkState.TryGetValue(ni.Id, out prev)) prev = null;
+                        linkState[ni.Id] = st;
+                    }
+                    if (prev != st)
+                        Write("INFO", "link " + (st == "Up" ? "up" : (st == "Down" ? "down" : st))
+                            + " name='" + ni.Name + "' id=" + ni.Id + " type=" + ni.NetworkInterfaceType
+                            + (prev == null ? " (first seen)" : (" was " + prev)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("DEBUG", "link probe failed: " + ex.Message);
+            }
+        }
+
+        static void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            Write("INFO", "SystemEvents.DisplaySettingsChanged");
+            LogStartup();
+        }
+
+        static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category == UserPreferenceCategory.VisualStyle
+                || e.Category == UserPreferenceCategory.Color
+                || e.Category == UserPreferenceCategory.General)
+            {
+                bool highContrast = false;
+                try { highContrast = SystemInformation.HighContrast; } catch { }
+                Write("INFO", "SystemEvents.UserPreferenceChanged category=" + e.Category + " highContrast=" + highContrast);
+            }
+        }
+
+        static void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            Write("INFO", "SystemEvents.PowerModeChanged " + e.Mode);
         }
     }
 
@@ -435,6 +1093,7 @@ namespace IPbind
                 {
                     byte[] buffer = new byte[81920];
                     long total = 0;
+                    long lastLogged = 0;
                     int read;
                     while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
                     {
@@ -443,7 +1102,13 @@ namespace IPbind
                             throw new InvalidOperationException(
                                 "The update download was unexpectedly large.");
                         output.Write(buffer, 0, read);
+                        if (total - lastLogged >= 256 * 1024)
+                        {
+                            lastLogged = total;
+                            DebugLog.Debug("updater download progress " + total + " bytes");
+                        }
                     }
+                    DebugLog.Info("updater download finished bytes=" + total);
                 }
             }
         }
@@ -526,8 +1191,11 @@ namespace IPbind
                     long size = new FileInfo(pending).Length;
                     if (size < MinExeBytes)
                         throw new InvalidOperationException("Download failed.");
+                    string actual = Sha256(pending);
+                    DebugLog.Info("updater sha256 expected=" + expectedHash + " actual=" + actual
+                        + (string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase) ? " ok" : " MISMATCH"));
                     if (string.Equals(
-                        Sha256(pending), expectedHash, StringComparison.OrdinalIgnoreCase))
+                        actual, expectedHash, StringComparison.OrdinalIgnoreCase))
                         return pending;
 
                     try { File.Delete(pending); } catch { }
@@ -576,10 +1244,13 @@ namespace IPbind
                 Version current;
                 if (!Version.TryParse(BuildInfo.Version, out current))
                     current = new Version(0, 0);
+                bool newer = remote.CompareTo(current) > 0;
+                DebugLog.Info("update check current=" + BuildInfo.Version + " remote=" + remoteText
+                    + " compare=" + (newer ? "newer" : "same-or-older"));
                 return new UpdateInfo
                 {
                     RemoteVersion = remoteText,
-                    IsNewer = remote.CompareTo(current) > 0,
+                    IsNewer = newer,
                     Error = null
                 };
             }
@@ -602,6 +1273,7 @@ namespace IPbind
             {
                 using (HttpResponseMessage response = GetTrusted(url))
                 {
+                    DebugLog.LogHttp(url, (int)response.StatusCode, "update-check");
                     response.EnsureSuccessStatusCode();
                     string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                     if (string.IsNullOrWhiteSpace(body))
@@ -774,11 +1446,13 @@ namespace IPbind
                 }
 
                 ApplyUpdate(args);
+                DebugLog.Info("update helper ApplyUpdate completed target=" + target);
                 if (!string.IsNullOrEmpty(errorFile))
                     try { File.Delete(errorFile); } catch { }
             }
             catch (Exception ex)
             {
+                DebugLog.Exception("update helper ApplyUpdate", ex);
                 if (!string.IsNullOrEmpty(errorFile))
                 {
                     try
@@ -1548,7 +2222,12 @@ namespace IPbind
                     suggested = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
                 }
                 if (suggested.IsEmpty && IsHandleCreated) suggested = DpiWindow.Bounds(Handle);
+                Size oldSize = Size;
+                int oldDpi = 0;
+                try { oldDpi = DpiWindow.WindowDpi(Handle); } catch { }
                 OnDpiMessage(dpi, suggested);
+                DebugLog.Info("WM_DPICHANGED " + GetType().Name + " oldDpi=" + oldDpi + " newDpi=" + dpi
+                    + " oldSize=" + oldSize + " newSize=" + Size + " suggested=" + suggested);
                 m.Result = IntPtr.Zero;
                 return;
             }
@@ -1696,14 +2375,105 @@ namespace IPbind
     // a drag to a monitor at a different scale (Andy, 2.3.135, About on a 100%
     // secondary). This control paints the box and check from the HWND's current
     // pixel size so a stale scale cannot overflow the square.
+    // Shared dark-mode checkbox chrome. Unchecked boxes use a dark gray fill
+    // and a slightly lighter border; hover is a touch lighter; disabled is
+    // dimmer. Checked stays the caller's blue with a white (or given) check.
+    // Painted once onto the WM_PAINT DC; callers must never Invalidate from paint.
+    static class CheckBoxChrome
+    {
+        public static readonly Color DarkFill = Color.FromArgb(0x3A, 0x3A, 0x3C);
+        public static readonly Color DarkBorder = Color.FromArgb(0x6E, 0x6E, 0x73);
+        public static readonly Color DarkHoverFill = Color.FromArgb(0x48, 0x48, 0x4A);
+        public static readonly Color DarkHoverBorder = Color.FromArgb(0x8E, 0x8E, 0x93);
+        public static readonly Color DarkDisabledFill = Color.FromArgb(0x2C, 0x2C, 0x2E);
+        public static readonly Color DarkDisabledBorder = Color.FromArgb(0x55, 0x55, 0x58);
+        public static readonly Color DarkDisabledCheck = Color.FromArgb(0x40, 0x7A, 0x9A);
+        public static readonly Color LightFill = Color.White;
+        public static readonly Color LightBorder = Color.FromArgb(0x5A, 0x5A, 0x5A);
+
+        public static void DrawBox(Graphics g, Rectangle box, int radius, float penWidth,
+            bool isChecked, bool hot, bool enabled, bool dark, Color checkedFill, Color checkMark)
+        {
+            Color fill, border;
+            if (isChecked)
+            {
+                fill = enabled ? checkedFill : (dark ? DarkDisabledCheck : Color.FromArgb(0xA0, 0xA0, 0xA0));
+                border = fill;
+            }
+            else if (!enabled)
+            {
+                fill = dark ? DarkDisabledFill : Color.FromArgb(0xF0, 0xF0, 0xF0);
+                border = dark ? DarkDisabledBorder : Color.FromArgb(0xB0, 0xB0, 0xB0);
+            }
+            else if (hot)
+            {
+                fill = dark ? DarkHoverFill : Color.FromArgb(0xF3, 0xF3, 0xF3);
+                border = dark ? DarkHoverBorder : LightBorder;
+            }
+            else
+            {
+                fill = dark ? DarkFill : LightFill;
+                border = dark ? DarkBorder : LightBorder;
+            }
+            using (GraphicsPath path = Rounded(box, radius))
+            {
+                using (SolidBrush brush = new SolidBrush(fill)) g.FillPath(brush, path);
+                using (Pen pen = new Pen(border, Math.Max(1f, penWidth)))
+                    g.DrawPath(pen, path);
+            }
+            if (isChecked) DrawCheck(g, box, enabled ? checkMark : Color.FromArgb(0xE0, 0xE0, 0xE0));
+        }
+
+        public static void DrawCheck(Graphics g, Rectangle box, Color color)
+        {
+            float w = box.Width, h = box.Height;
+            PointF[] mark = new PointF[]
+            {
+                new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
+                new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
+                new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
+            };
+            using (Pen pen = new Pen(color, Math.Max(1.6f, box.Width * 2f / 20f)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                g.DrawLines(pen, mark);
+            }
+        }
+
+        public static GraphicsPath Rounded(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
     sealed class RoundCheckBox : CheckBox
     {
         public const int DesignBox = 20;
         public const int DesignRing = 3;
         public const int DesignSide = DesignBox + 2 * DesignRing;
+        const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
+        const int WM_PRINTCLIENT = 0x0318;
 
         public Color Surface = Color.Black, BoxFill = Color.White, BoxBorder = Color.Gray;
         public Color CheckedFill = Color.DodgerBlue, CheckMark = Color.Black, FocusColor = Color.White;
+        public Color HoverFill, HoverBorder, DisabledFill, DisabledBorder;
+        public bool DarkChrome;
+        bool hot;
 
         public static int RingFor(float scale) { return Math.Max(2, (int)Math.Round(DesignRing * scale)); }
 
@@ -1726,8 +2496,25 @@ namespace IPbind
         public void ApplyDialogColors(Color surface, Color fore, Color checkedFill, Color checkMark, bool dark)
         {
             Surface = surface;
-            BoxFill = Color.White;
-            BoxBorder = dark ? Color.FromArgb(0x76, 0x76, 0x76) : Color.FromArgb(0x5A, 0x5A, 0x5A);
+            DarkChrome = dark;
+            if (dark)
+            {
+                BoxFill = CheckBoxChrome.DarkFill;
+                BoxBorder = CheckBoxChrome.DarkBorder;
+                HoverFill = CheckBoxChrome.DarkHoverFill;
+                HoverBorder = CheckBoxChrome.DarkHoverBorder;
+                DisabledFill = CheckBoxChrome.DarkDisabledFill;
+                DisabledBorder = CheckBoxChrome.DarkDisabledBorder;
+            }
+            else
+            {
+                BoxFill = CheckBoxChrome.LightFill;
+                BoxBorder = CheckBoxChrome.LightBorder;
+                HoverFill = Color.FromArgb(0xF3, 0xF3, 0xF3);
+                HoverBorder = CheckBoxChrome.LightBorder;
+                DisabledFill = Color.FromArgb(0xF0, 0xF0, 0xF0);
+                DisabledBorder = Color.FromArgb(0xB0, 0xB0, 0xB0);
+            }
             CheckedFill = checkedFill;
             CheckMark = checkMark;
             FocusColor = fore;
@@ -1742,8 +2529,66 @@ namespace IPbind
 
         protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
         protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (!hot) { hot = true; Invalidate(); } }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (hot) { hot = false; Invalidate(); } }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        // Paint once on the WM_PAINT DC. Do not call base (which would let the
+        // system paint a bright-white box) and never Invalidate from paint.
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (m.Msg == WM_PAINT)
+            {
+                ThemedComboBoxPaint(Handle);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    PaintBoxOn(g);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // BeginPaint/EndPaint live on ThemedComboBox; use the same pattern locally.
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+        void ThemedComboBoxPaint(IntPtr hwnd)
+        {
+            PAINTSTRUCT ps = new PAINTSTRUCT();
+            IntPtr hdc = BeginPaint(hwnd, ref ps);
+            try
+            {
+                if (hdc != IntPtr.Zero)
+                {
+                    using (Graphics g = Graphics.FromHdc(hdc))
+                        PaintBoxOn(g);
+                }
+            }
+            finally { EndPaint(hwnd, ref ps); }
+        }
+
+        void PaintBoxOn(Graphics dest)
         {
             int width = Width, height = Height;
             IntPtr prev = IntPtr.Zero;
@@ -1756,9 +2601,20 @@ namespace IPbind
             }
             try
             {
-                PaintBox(e.Graphics, width, height);
+                if (width <= 0 || height <= 0) return;
+                using (Bitmap bmp = new Bitmap(width, height))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    PaintBox(g, width, height);
+                    dest.DrawImageUnscaled(bmp, 0, 0);
+                }
             }
             finally { DpiWindow.LeaveContext(prev); }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            // WM_PAINT is handled in WndProc so the system never paints a white box.
         }
 
         void PaintBox(Graphics g, int width, int height)
@@ -1770,43 +2626,16 @@ namespace IPbind
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             int side = Math.Min(width, height);
             if (side < 8) return;
-            // Geometry comes from the pixels we are painting into, not a remembered DPI.
             float paintScale = side / (float)DesignSide;
             int ring = Math.Max(2, (int)Math.Round(DesignRing * paintScale));
             int boxSide = Math.Max(4, side - 2 * ring - 1);
             Rectangle box = new Rectangle((width - boxSide) / 2, (height - boxSide) / 2, boxSide, boxSide);
             int rad = Math.Max(2, (int)Math.Round(3 * paintScale));
-            using (GraphicsPath path = RoundedBox(box, rad))
-            {
-                if (Checked)
-                {
-                    using (SolidBrush fill = new SolidBrush(CheckedFill)) g.FillPath(fill, path);
-                    float w = box.Width, h = box.Height;
-                    PointF[] mark = new PointF[]
-                    {
-                        new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
-                        new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
-                        new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
-                    };
-                    using (Pen pen = new Pen(CheckMark, Math.Max(1.6f, boxSide * 2f / DesignBox)))
-                    {
-                        pen.StartCap = LineCap.Round;
-                        pen.EndCap = LineCap.Round;
-                        pen.LineJoin = LineJoin.Round;
-                        g.DrawLines(pen, mark);
-                    }
-                }
-                else
-                {
-                    using (SolidBrush fill = new SolidBrush(BoxFill)) g.FillPath(fill, path);
-                    using (Pen pen = new Pen(BoxBorder, Math.Max(1f, paintScale)))
-                        g.DrawPath(pen, path);
-                }
-            }
+            CheckBoxChrome.DrawBox(g, box, rad, paintScale, Checked, hot, Enabled, DarkChrome, CheckedFill, CheckMark);
             if (Focused && ShowFocusCues)
             {
                 Rectangle outer = new Rectangle(0, 0, width - 1, height - 1);
-                using (GraphicsPath focus = RoundedBox(outer, rad + ring))
+                using (GraphicsPath focus = CheckBoxChrome.Rounded(outer, rad + ring))
                 using (Pen pen = new Pen(FocusColor, Math.Max(1f, paintScale)))
                     g.DrawPath(pen, focus);
             }
@@ -1827,6 +2656,136 @@ namespace IPbind
             path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
             path.CloseFigure();
             return path;
+        }
+    }
+
+    // Main-window checkbox (Keep DHCP, Gateway support, Show all adapters).
+    // In dark mode the box is owner-drawn with CheckBoxChrome; in light mode
+    // the system checkbox is left alone so layout and TextInkRight stay the same.
+    // Paint once on the WM_PAINT DC; never Invalidate from paint.
+    sealed class ThemedCheckBox : CheckBox
+    {
+        const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
+        const int WM_PRINTCLIENT = 0x0318;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+        public bool UseDarkChrome;
+        bool hot;
+
+        public void ApplyDark(bool dark)
+        {
+            UseDarkChrome = dark;
+            Invalidate();
+        }
+
+        protected override void OnCheckedChanged(EventArgs e) { base.OnCheckedChanged(e); Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            if (UseDarkChrome && !hot) { hot = true; Invalidate(); }
+        }
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (UseDarkChrome && hot) { hot = false; Invalidate(); }
+        }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); if (UseDarkChrome) Invalidate(); }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (!UseDarkChrome)
+            {
+                base.WndProc(ref m);
+                return;
+            }
+            if (m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (m.Msg == WM_PAINT)
+            {
+                PAINTSTRUCT ps = new PAINTSTRUCT();
+                IntPtr hdc = BeginPaint(Handle, ref ps);
+                try
+                {
+                    if (hdc != IntPtr.Zero)
+                    {
+                        using (Graphics g = Graphics.FromHdc(hdc))
+                            PaintChrome(g);
+                    }
+                }
+                finally { EndPaint(Handle, ref ps); }
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    PaintChrome(g);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void PaintChrome(Graphics dest)
+        {
+            Rectangle client = ClientRectangle;
+            if (client.Width <= 0 || client.Height <= 0) return;
+            try
+            {
+                using (Bitmap bmp = new Bitmap(Math.Max(1, client.Width), Math.Max(1, client.Height)))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(BackColor);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    int glyph = Math.Max(13, (int)Math.Round(13f * (g.DpiX / 96f)));
+                    if (glyph > client.Height - 2) glyph = Math.Max(12, client.Height - 2);
+                    int boxY = client.Top + (client.Height - glyph) / 2;
+                    Rectangle box = new Rectangle(client.Left + 1, boxY, glyph, glyph);
+                    int rad = Math.Max(2, (int)Math.Round(2f * g.DpiX / 96f));
+                    Color checkFill = Color.FromArgb(0x00, 0x63, 0xB1);
+                    CheckBoxChrome.DrawBox(g, box, rad, 1f, Checked, hot, Enabled, true, checkFill, Color.White);
+                    int textX = box.Right + Math.Max(3, (int)Math.Round(3f * g.DpiX / 96f));
+                    Rectangle textBounds = new Rectangle(textX, client.Top, Math.Max(0, client.Right - textX), client.Height);
+                    Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
+                    if (!string.IsNullOrEmpty(Text) && textBounds.Width > 0)
+                    {
+                        TextRenderer.DrawText(g, Text, Font, textBounds, fore,
+                            TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                            TextFormatFlags.NoPadding);
+                    }
+                    if (Focused && ShowFocusCues && textBounds.Width > 4)
+                    {
+                        Size ts = TextRenderer.MeasureText(g, Text ?? "", Font,
+                            textBounds.Size, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                        Rectangle focus = new Rectangle(textBounds.X, textBounds.Y + Math.Max(0, (textBounds.Height - ts.Height) / 2),
+                            Math.Min(ts.Width + 2, textBounds.Width), ts.Height);
+                        ControlPaint.DrawFocusRectangle(g, focus, fore, BackColor);
+                    }
+                    dest.DrawImageUnscaled(bmp, 0, 0);
+                }
+            }
+            catch { }
         }
     }
 
@@ -1878,6 +2837,7 @@ namespace IPbind
 
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
+            DebugLog.WatchForm(this);
             this.updateCheckFile = updateCheckFile;
             this.dark = dark;
             InitScale(scale);
@@ -2637,6 +3597,7 @@ namespace IPbind
 
         public PrivacyConsentForm(bool dark, float scale)
         {
+            DebugLog.WatchForm(this);
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = BuildInfo.AppName + " privacy";
@@ -2785,6 +3746,7 @@ namespace IPbind
 
         public DhcpReminderForm(Form owner, bool dark, float scale)
         {
+            DebugLog.WatchForm(this);
             this.dark = dark;
             InitScale(scale);
             Text = BuildInfo.AppName;
@@ -3796,6 +4758,8 @@ namespace IPbind
                 Log("Default address list updated to the latest defaults.", "INFO");
             if (BuildInfo.IsBeta)
                 Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
+            DebugLog.WatchForm(this);
+            LogAdaptersRaw();
         }
 
         // scale helper: design pixels -> device pixels
@@ -3812,11 +4776,18 @@ namespace IPbind
         void Log(string msg) { Log(msg, "INFO"); }
         void Log(string msg, string level)
         {
+            string fileLevel = level == "ERR" ? "ERROR" : (string.IsNullOrEmpty(level) ? "INFO" : level);
+            DebugLog.Write(fileLevel, msg);
             if (console.InvokeRequired)
             {
-                console.BeginInvoke((Action<string, string>)Log, msg, level);
+                console.BeginInvoke((Action<string, string>)LogConsole, msg, level);
                 return;
             }
+            LogConsole(msg, level);
+        }
+
+        void LogConsole(string msg, string level)
+        {
             string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
             console.AppendText(line);
             console.SelectionStart = console.TextLength;
@@ -3869,7 +4840,7 @@ namespace IPbind
         {
             EnsureAppDir();
             string[] lines = CanonicalList();
-            File.WriteAllLines(StoreFile, lines);
+            File.WriteAllLines(StoreFile, lines); DebugLog.LogSettingsFile(StoreFile, "save-iplist");
             txtIPs.Lines = lines;
             if (!quiet) Log("Saved " + lines.Length + " address(es) to disk.", "OK");
         }
@@ -3928,6 +4899,7 @@ namespace IPbind
             if (File.Exists(StoreFile))
             {
                 List<string> lines = new List<string>();
+                DebugLog.LogSettingsFile(StoreFile, "load-iplist");
                 foreach (string l in File.ReadAllLines(StoreFile))
                 {
                     string t = (l ?? "").Trim();
@@ -3975,7 +4947,7 @@ namespace IPbind
             Log("Restored defaults (added " + added + " missing; kept custom entries).", "OK");
         }
 
-        void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); }
+        void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); DebugLog.LogSettingsFile(AdapterFile, "save-adapter"); }
         string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
 
         // update-check.txt is written by the installer: "auto" (default) or "manual".
@@ -4008,6 +4980,7 @@ namespace IPbind
                 {
                     if (File.Exists(GatewayFile))
                     {
+                        DebugLog.LogSettingsFile(GatewayFile, "load-gateway");
                         foreach (string raw in File.ReadAllLines(GatewayFile))
                         {
                             string l = (raw ?? "").Trim();
@@ -4051,7 +5024,7 @@ namespace IPbind
                     "gateway=" + txtGateway.Text.Trim(),
                     "dns1=" + txtDns1.Text.Trim(),
                     "dns2=" + txtDns2.Text.Trim()
-                });
+                }); DebugLog.LogSettingsFile(GatewayFile, "save-gateway");
             }
             catch { }
         }
@@ -4316,6 +5289,7 @@ namespace IPbind
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             psi.CreateNoWindow = true;
+            Stopwatch sw = Stopwatch.StartNew();
             try
             {
                 using (Process p = Process.Start(psi))
@@ -4323,11 +5297,19 @@ namespace IPbind
                     string o = p.StandardOutput.ReadToEnd();
                     string e = p.StandardError.ReadToEnd();
                     p.WaitForExit();
+                    sw.Stop();
                     output = (o + e).Trim();
+                    DebugLog.LogProc(file, args, p.ExitCode, o, e, sw.ElapsedMilliseconds);
                     return p.ExitCode;
                 }
             }
-            catch (Exception ex) { output = ex.Message; return -1; }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                output = ex.Message;
+                DebugLog.LogProc(file, args, -1, "", ex.Message, sw.ElapsedMilliseconds);
+                return -1;
+            }
         }
 
         int Netsh(string args, out string output) { return RunProc("netsh", args, out output); }
@@ -4420,6 +5402,85 @@ namespace IPbind
             public readonly List<string> Gateways = new List<string>();
         }
 
+        void LogAdaptersRaw()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    DebugLog.Debug("adapter raw name='" + ni.Name + "' desc='" + ni.Description
+                        + "' id=" + ni.Id + " type=" + ni.NetworkInterfaceType
+                        + " status=" + ni.OperationalStatus);
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Debug("adapter enumeration failed: " + ex.Message);
+            }
+        }
+
+        string CaptureAdapterState(string alias)
+        {
+            if (string.IsNullOrEmpty(alias)) return "(no adapter)";
+            try
+            {
+                AdapterInfo info = GetAdapterInfo(alias);
+                if (info == null) return alias + ": (not found)";
+                StringBuilder sb = new StringBuilder();
+                sb.Append(alias).Append(" dhcp=").Append(info.Dhcp);
+                sb.Append(" ips=");
+                for (int i = 0; i < info.V4.Count; i++)
+                {
+                    if (i > 0) sb.Append(",");
+                    UnicastIPAddressInformation ua = info.V4[i];
+                    sb.Append(ua.Address).Append("/").Append(ua.PrefixLength).Append("(").Append(ua.PrefixOrigin).Append(")");
+                }
+                sb.Append(" gateway=").Append(info.Gateways.Count == 0 ? "-" : string.Join(",", info.Gateways.ToArray()));
+                string dns = "-";
+                try
+                {
+                    foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (ni.Name != alias) continue;
+                        System.Collections.Generic.List<string> d = new System.Collections.Generic.List<string>();
+                        foreach (System.Net.IPAddress a in ni.GetIPProperties().DnsAddresses)
+                            if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                                d.Add(a.ToString());
+                        if (d.Count > 0) dns = string.Join(",", d.ToArray());
+                        break;
+                    }
+                }
+                catch { }
+                string metric = "?";
+                if (info.Index > 0)
+                {
+                    string outp;
+                    Netsh("interface ipv4 show interface " + info.Index, out outp);
+                    foreach (string raw in (outp ?? "").Split(new char[] { '\n', '\r' }))
+                    {
+                        string line = raw.Trim();
+                        int idx = line.LastIndexOf("Metric", StringComparison.OrdinalIgnoreCase);
+                        if (idx < 0) continue;
+                        string rest = line.Substring(idx + 6).Trim().TrimStart(':').Trim();
+                        int m;
+                        if (int.TryParse(rest.Split(' ')[0], out m)) { metric = m.ToString(); break; }
+                    }
+                }
+                sb.Append(" dns=").Append(dns).Append(" metric=").Append(metric);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return alias + ": (" + ex.Message + ")";
+            }
+        }
+
+        void LogAdapterDiff(string when, string before, string after)
+        {
+            DebugLog.Info("adapter state " + when + " before: " + before);
+            DebugLog.Info("adapter state " + when + " after:  " + after);
+            if (before == after) DebugLog.Info("adapter state " + when + " diff: (unchanged)");
+            else DebugLog.Info("adapter state " + when + " diff: changed");
+        }
+
         AdapterInfo GetAdapterInfo(string alias)
         {
             try
@@ -4461,7 +5522,10 @@ namespace IPbind
             try
             {
                 if (File.Exists(KeepDhcpFile))
+                {
+                    DebugLog.LogSettingsFile(KeepDhcpFile, "load-keepdhcp");
                     keepDhcpPref = File.ReadAllText(KeepDhcpFile).Trim() != "0";
+                }
             }
             catch { keepDhcpPref = true; }
             settingKeepDhcp = true;
@@ -4471,7 +5535,7 @@ namespace IPbind
 
         void SaveKeepDhcpPref()
         {
-            try { EnsureAppDir(); File.WriteAllText(KeepDhcpFile, keepDhcpPref ? "1" : "0"); }
+            try { EnsureAppDir(); File.WriteAllText(KeepDhcpFile, keepDhcpPref ? "1" : "0"); DebugLog.LogSettingsFile(KeepDhcpFile, "save-keepdhcp"); }
             catch { }
         }
 
@@ -5399,10 +6463,14 @@ namespace IPbind
             WindowTheme.ApplyTitleBar(this, dark);
         }
 
+        const int WM_DISPLAYCHANGE = 0x007E;
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_DPICHANGED)
             {
+                int oldDpi = DpiWindow.WindowDpi(Handle);
+                Size oldSize = Size;
                 if (!dpiChanging)
                 {
                     dpiChanging = true;
@@ -5421,8 +6489,13 @@ namespace IPbind
                     }
                     finally { dpiChanging = false; }
                 }
+                int newDpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                DebugLog.Info("WM_DPICHANGED main oldDpi=" + oldDpi + " newDpi=" + newDpi
+                    + " oldSize=" + oldSize + " newSize=" + Size + " bounds=" + Bounds);
                 return;
             }
+            if (m.Msg == WM_DISPLAYCHANGE)
+                DebugLog.Info("WM_DISPLAYCHANGE wParam=" + m.WParam.ToInt64());
             base.WndProc(ref m);
         }
 
@@ -5465,7 +6538,7 @@ namespace IPbind
             try
             {
                 EnsureAppDir();
-                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + AppVersion + "\r\n");
+                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + AppVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
             }
             catch (Exception ex)
             {
@@ -5678,7 +6751,12 @@ namespace IPbind
                     ll.ForeColor = SubCol;
                     ll.LinkColor = Color.FromArgb(90, 160, 240);
                 }
-                else if (c is CheckBox) { c.ForeColor = FgCol; }
+                else if (c is CheckBox)
+                {
+                    c.ForeColor = FgCol;
+                    ThemedCheckBox themedBox = c as ThemedCheckBox;
+                    if (themedBox != null) themedBox.ApplyDark(true);
+                }
                 else if (c is Label)
                 {
                     // italic = the subtitle; keep it dimmer for hierarchy. Others full strength.
@@ -5759,7 +6837,7 @@ namespace IPbind
             // Keep DHCP and Gateway support share one row above Refresh, 28 px apart
             // as before. The pair is placed below, once Refresh exists, so the last
             // letter of "Gateway support" ends at Refresh's right edge.
-            chkKeepDhcp = new CheckBox();
+            chkKeepDhcp = new ThemedCheckBox();
             chkKeepDhcp.Text = "Keep DHCP";
             chkKeepDhcp.Font = UiFont(8F, FontStyle.Regular);
             chkKeepDhcp.Size = new Size(OptionWidth(chkKeepDhcp), U(20));
@@ -5784,10 +6862,10 @@ namespace IPbind
             keepDhcpTip.SetToolTip(chkKeepDhcp, KeepDhcpTipOn);
 
             Button btnRefresh = MakeButton("Refresh", 448, 93, 92, 26);
-            btnRefresh.Click += delegate { LoadAdapters(); };
+            btnRefresh.Click += delegate { using (DebugLog.Time("Refresh")) LoadAdapters(); };
             Controls.Add(btnRefresh);
 
-            chkAll = new CheckBox();
+            chkAll = new ThemedCheckBox();
             chkAll.Text = "Show all adapters (include virtual / cellular / VPN)";
             chkAll.Font = UiFont(8F, FontStyle.Regular);
             chkAll.Location = P(20, 122);
@@ -5795,7 +6873,7 @@ namespace IPbind
             chkAll.CheckedChanged += delegate { LoadAdapters(); };
             Controls.Add(chkAll);
 
-            chkGateway = new CheckBox();
+            chkGateway = new ThemedCheckBox();
             chkGateway.Text = "Gateway support";
             chkGateway.Font = UiFont(8F, FontStyle.Regular);
             chkGateway.Size = new Size(OptionWidth(chkGateway), U(20));
@@ -5877,9 +6955,12 @@ namespace IPbind
             Button btnShow = MakeButton("Show Current", 374, 372, 166, 28);
             btnShow.Click += delegate
             {
-                string a = GetSelectedAlias();
-                if (a == null) { Log("No interface selected.", "WARN"); return; }
-                ShowCurrentConfig(a);
+                using (DebugLog.Time("Show Current"))
+                {
+                    string a = GetSelectedAlias();
+                    if (a == null) { Log("No interface selected.", "WARN"); return; }
+                    ShowCurrentConfig(a);
+                }
             };
             Controls.Add(btnShow);
 
@@ -5891,10 +6972,16 @@ namespace IPbind
             btnBind.FlatAppearance.BorderSize = 0;
             btnBind.Click += delegate
             {
-                SetBusy("Applying static IPs...");
-                bool ok = InvokeBind();
-                EndBusy(ok, "Static IPs applied",
-                            "Failed to apply static IPs");
+                using (DebugLog.Time("Apply"))
+                {
+                    string alias = GetSelectedAlias();
+                    string before = CaptureAdapterState(alias);
+                    SetBusy("Applying static IPs...");
+                    bool ok = InvokeBind();
+                    EndBusy(ok, "Static IPs applied",
+                                "Failed to apply static IPs");
+                    LogAdapterDiff("Apply", before, CaptureAdapterState(alias));
+                }
             };
             Controls.Add(btnBind);
 
@@ -5906,10 +6993,16 @@ namespace IPbind
             btnDhcp.FlatAppearance.BorderSize = 0;
             btnDhcp.Click += delegate
             {
-                SetBusy("Returning to DHCP...");
-                bool ok = InvokeDhcp();
-                EndBusy(ok, "Returned to DHCP",
-                            "Failed to return to DHCP");
+                using (DebugLog.Time("Return to DHCP"))
+                {
+                    string alias = GetSelectedAlias();
+                    string before = CaptureAdapterState(alias);
+                    SetBusy("Returning to DHCP...");
+                    bool ok = InvokeDhcp();
+                    EndBusy(ok, "Returned to DHCP",
+                                "Failed to return to DHCP");
+                    LogAdapterDiff("Return", before, CaptureAdapterState(alias));
+                }
             };
             Controls.Add(btnDhcp);
 
@@ -5972,6 +7065,7 @@ namespace IPbind
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
+                using (DebugLog.Time("About"))
                 using (AboutForm about = new AboutForm(this, dark, sc, UpdateCheckFile))
                     about.ShowDialog(this);
             };
