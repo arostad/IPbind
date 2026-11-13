@@ -983,9 +983,27 @@ namespace IPbind
     sealed class ThemedComboBox : ComboBox
     {
         const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
         const int WM_PRINTCLIENT = 0x0318;
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
         public bool UseDarkChrome;
+        public int DebugPaintCount;
 
         public ThemedComboBox()
         {
@@ -1026,24 +1044,61 @@ namespace IPbind
             Invalidate();
         }
 
+        // Dark closed chrome must be painted once, on the WM_PAINT DC.
+        // The 2.3.136 path called base.WndProc (system paints the light/hot
+        // chrome, then EndPaint) and then overpainted with Graphics.FromHwnd
+        // after EndPaint. A focused DropDownList is also repainted on
+        // mouse-move hot-track, so that two-pass paint flashed continuously
+        // and FromHwnd-after-EndPaint could invalidate and loop.
         protected override void WndProc(ref Message m)
         {
+            if (UseDarkChrome && m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (UseDarkChrome && m.Msg == WM_PAINT)
+            {
+                DebugPaintCount++;
+                PAINTSTRUCT ps = new PAINTSTRUCT();
+                IntPtr hdc = BeginPaint(Handle, ref ps);
+                try
+                {
+                    if (hdc != IntPtr.Zero)
+                    {
+                        using (Graphics g = Graphics.FromHdc(hdc))
+                            DrawClosedChrome(g);
+                    }
+                }
+                finally
+                {
+                    EndPaint(Handle, ref ps);
+                }
+                return;
+            }
+            if (UseDarkChrome && m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                DebugPaintCount++;
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    DrawClosedChrome(g);
+                return;
+            }
             base.WndProc(ref m);
-            if (UseDarkChrome && (m.Msg == WM_PAINT || m.Msg == WM_PRINTCLIENT))
-                PaintDarkChrome();
         }
 
-        void PaintDarkChrome()
+        void DrawClosedChrome(Graphics dest)
         {
             if (!IsHandleCreated) return;
-            WindowTheme.ComboBoxInfo info;
-            bool have = WindowTheme.TryGetComboBoxInfo(Handle, out info);
+            Rectangle client = ClientRectangle;
+            if (client.Width <= 0 || client.Height <= 0) return;
             try
             {
-                using (Graphics g = Graphics.FromHwnd(Handle))
+                using (Bitmap bmp = new Bitmap(client.Width, client.Height))
+                using (Graphics g = Graphics.FromImage(bmp))
                 {
-                    Rectangle client = ClientRectangle;
-                    if (client.Width <= 0 || client.Height <= 0) return;
+                    g.Clear(BackColor);
+                    WindowTheme.ComboBoxInfo info;
+                    bool have = WindowTheme.TryGetComboBoxInfo(Handle, out info);
                     Color field = BackColor;
                     Color border = Color.FromArgb(80, 80, 80);
                     Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
@@ -1058,7 +1113,6 @@ namespace IPbind
                                 button = new Rectangle(
                                     client.Right - Math.Max(16, client.Height),
                                     client.Top, Math.Max(16, client.Height), client.Height);
-                            // Keep the arrow well dark even if the theme paints it light.
                             g.FillRectangle(brush, button);
                             DrawChevron(g, button, fore);
                         }
@@ -1083,6 +1137,7 @@ namespace IPbind
                             TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
                             TextFormatFlags.NoPadding);
                     }
+                    dest.DrawImageUnscaled(bmp, 0, 0);
                 }
             }
             catch { }
@@ -1809,7 +1864,7 @@ namespace IPbind
         UpdateInfo availableUpdate;
 
         const string PrivacyLine1 = "Each update check sends one anonymous request to the IPbind update server.";
-        const string PrivacyLine2 = "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. No identifiers, cookies, or telemetry are used.";
+        const string PrivacyLine2 = "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. Your IP address is never stored, and no identifiers, cookies, or telemetry are used.";
 
         // Fixed design-pixel gaps (Andy, 2.3.136). If the privacy note needs
         // more room, only the window height grows. These are never reduced.
