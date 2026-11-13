@@ -4822,7 +4822,7 @@ namespace IPbind
     {
         public static readonly TimeSpan CheckEvery = TimeSpan.FromMilliseconds(250);
         static readonly List<AutoHideScrollBox> areas = new List<AutoHideScrollBox>();
-        static Timer timer;
+        static System.Windows.Forms.Timer timer;
         static bool filterAdded;
 
         public static void Register(AutoHideScrollBox box)
@@ -4831,7 +4831,7 @@ namespace IPbind
             areas.Add(box);
             if (timer == null)
             {
-                timer = new Timer();
+                timer = new System.Windows.Forms.Timer();
                 timer.Interval = (int)CheckEvery.TotalMilliseconds;
                 timer.Tick += OnTick;
                 timer.Start();
