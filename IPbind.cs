@@ -545,7 +545,7 @@ namespace IPbind
             StringBuilder sb = new StringBuilder();
             foreach (PaintHook hook in hooks)
             {
-                int n = Interlocked.Exchange(ref hook.Count, 0);
+                int n = Interlocked.Exchange(ref hook.Counter.Value, 0);
                 if (n <= 0) continue;
                 sb.Append(hook.Name).Append("=").Append(n).Append(" ");
                 if (n >= PaintWarnPerMinute)
@@ -591,13 +591,19 @@ namespace IPbind
             return s;
         }
 
+        sealed class PaintCount
+        {
+            public int Value;
+        }
+
         sealed class PaintHook : NativeWindow
         {
             public string Name = "";
-            public int Count;
+            public readonly PaintCount Counter = new PaintCount();
+            public int Count { get { return Counter.Value; } set { Counter.Value = value; } }
             protected override void WndProc(ref Message m)
             {
-                if (m.Msg == 0x000F) Interlocked.Increment(ref Count);
+                if (m.Msg == 0x000F) Interlocked.Increment(ref Counter.Value);
                 base.WndProc(ref m);
             }
         }
@@ -2686,6 +2692,11 @@ namespace IPbind
 
         public bool UseDarkChrome;
         bool hot;
+        int cachedTextLeft = -1;
+        int cachedBearing = 0;
+        int cacheW, cacheH;
+        string cacheText;
+        Font cacheFont;
 
         public void ApplyDark(bool dark)
         {
@@ -2707,6 +2718,9 @@ namespace IPbind
             if (UseDarkChrome && hot) { hot = false; Invalidate(); }
         }
         protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnSizeChanged(EventArgs e) { cachedTextLeft = -1; base.OnSizeChanged(e); }
+        protected override void OnFontChanged(EventArgs e) { cachedTextLeft = -1; base.OnFontChanged(e); }
+        protected override void OnTextChanged(EventArgs e) { cachedTextLeft = -1; base.OnTextChanged(e); }
 
         protected override void WndProc(ref Message m)
         {
@@ -2764,7 +2778,8 @@ namespace IPbind
                     int rad = Math.Max(2, (int)Math.Round(2f * g.DpiX / 96f));
                     Color checkFill = Color.FromArgb(0x00, 0x63, 0xB1);
                     CheckBoxChrome.DrawBox(g, box, rad, 1f, Checked, hot, Enabled, true, checkFill, Color.White);
-                    int textX = box.Right + Math.Max(3, (int)Math.Round(3f * g.DpiX / 96f));
+                    int textX = SystemTextOrigin();
+                    if (textX < box.Right) textX = box.Right + Math.Max(3, (int)Math.Round(3f * g.DpiX / 96f));
                     Rectangle textBounds = new Rectangle(textX, client.Top, Math.Max(0, client.Right - textX), client.Height);
                     Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
                     if (!string.IsNullOrEmpty(Text) && textBounds.Width > 0)
@@ -2786,6 +2801,90 @@ namespace IPbind
                 }
             }
             catch { }
+        }
+
+        // Match the system checkbox caption origin so "Gateway support" still
+        // lines up with Refresh. Measured off a stock CheckBox of the same size.
+        int SystemTextOrigin()
+        {
+            if (cachedTextLeft >= 0 && cacheW == Width && cacheH == Height
+                && cacheText == Text && object.ReferenceEquals(cacheFont, Font))
+                return cachedTextLeft - cachedBearing;
+            cachedTextLeft = MeasureStockTextLeft();
+            cachedBearing = MeasureDrawTextBearing();
+            cacheW = Width;
+            cacheH = Height;
+            cacheText = Text;
+            cacheFont = Font;
+            if (cachedTextLeft < 0)
+                cachedTextLeft = 16;
+            return cachedTextLeft - cachedBearing;
+        }
+
+        int MeasureStockTextLeft()
+        {
+            try
+            {
+                int w = Math.Max(1, Width);
+                int h = Math.Max(1, Height);
+                using (CheckBox probe = new CheckBox())
+                using (Bitmap withText = new Bitmap(w, h))
+                using (Bitmap noText = new Bitmap(w, h))
+                {
+                    probe.Text = Text;
+                    probe.Font = Font;
+                    probe.Size = new Size(w, h);
+                    probe.CheckAlign = CheckAlign;
+                    probe.TextAlign = TextAlign;
+                    probe.FlatStyle = FlatStyle;
+                    probe.BackColor = Color.White;
+                    probe.ForeColor = Color.Black;
+                    probe.DrawToBitmap(withText, new Rectangle(0, 0, w, h));
+                    probe.Text = "";
+                    probe.DrawToBitmap(noText, new Rectangle(0, 0, w, h));
+                    for (int x = 0; x < w; x++)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            Color a = withText.GetPixel(x, y);
+                            Color b = noText.GetPixel(x, y);
+                            if ((a.R + a.G + a.B) + 40 < (b.R + b.G + b.B))
+                                return x;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        int MeasureDrawTextBearing()
+        {
+            if (string.IsNullOrEmpty(Text) || Width <= 0 || Height <= 0) return 0;
+            try
+            {
+                int w = Math.Max(1, Width);
+                int h = Math.Max(1, Height);
+                using (Bitmap bmp = new Bitmap(w, h))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.White);
+                    TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, w, h), Color.Black,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                    for (int x = 0; x < w; x++)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            Color c = bmp.GetPixel(x, y);
+                            if (c.R + c.G + c.B < 765 - 300)
+                                return x;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return 0;
         }
     }
 
