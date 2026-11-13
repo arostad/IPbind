@@ -1,0 +1,60 @@
+# Throwaway: real-user walkthrough of the published Beta 2.3.136 installer.
+name: walk release 136
+on:
+  push:
+    branches: [test-walk-136]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  walk:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build setscale helper
+        shell: pwsh
+        run: |
+          $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          $cargs = @(
+            '/nologo','/target:winexe','/win32manifest:app.manifest',
+            '/r:System.dll','/r:System.Core.dll','/r:System.Drawing.dll','/r:System.Net.Http.dll',
+            '/r:System.Windows.Forms.dll','/main:IPbindTest.UiShot',
+            '/resource:installer\privacy.txt,IPbind.privacy.txt',
+            '/resource:app-beta.ico,IPbind.app.ico','/out:uishot.exe'
+          )
+          & $csc @cargs IPbind.cs Version.cs .github\test\UiShot.cs .github\test\ScaleControl.cs
+          if ($LASTEXITCODE -ne 0) { throw 'uishot compile failed' }
+      - name: Verify 2.3.135 fixture and download published 2.3.136 installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $fix = 'fixtures\v2.3.135-beta\IPbind-Installer-v2.3.135-beta.exe'
+          $want = (Get-Content 'fixtures\v2.3.135-beta\IPbind-Installer-v2.3.135-beta.exe.sha256').Split()[0].Trim().ToLower()
+          $got = (Get-FileHash $fix -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($got -ne $want) { throw "135 fixture hash $got != $want" }
+          New-Item -ItemType Directory -Force published | Out-Null
+          gh release download beta -R arostad/IPbind --dir published --pattern 'IPbind-Installer-v2.3.136-beta.exe*' --clobber
+          $inst = 'published\IPbind-Installer-v2.3.136-beta.exe'
+          if (-not (Test-Path $inst)) { throw 'published 136 installer missing' }
+          $want136 = (Get-Content "$inst.sha256").Split()[0].Trim().ToLower()
+          $got136 = (Get-FileHash $inst -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($got136 -ne $want136) { throw "136 installer hash $got136 != $want136" }
+          Write-Host "136 installer ok $got136"
+      - name: Real-user walkthrough of the published installer
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ea Stop } catch { Write-Host $_ }
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' AppsUseLightTheme 0 -Type DWord
+          New-Item -ItemType Directory -Force shots | Out-Null
+          powershell -ExecutionPolicy Bypass -File .\.github\test\walk-release-136.ps1 `
+            -Installer135 (Resolve-Path 'fixtures\v2.3.135-beta\IPbind-Installer-v2.3.135-beta.exe').Path `
+            -Installer136 (Resolve-Path 'published\IPbind-Installer-v2.3.136-beta.exe').Path `
+            -Out "$PWD\shots" `
+            -SetScale "$PWD\uishot.exe"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: walk-release-136
+          path: shots/
+          retention-days: 1
