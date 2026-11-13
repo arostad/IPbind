@@ -65,12 +65,35 @@ if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test compile failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test failed' }
 
 # Beta-channel compile: coalesced INFO writes, immediate ERROR/Stop flush.
+# Do not reuse a pre-existing Version.cs — the Build workflow may have
+# written a prod one earlier in the same job.
+$betaVer = @'
+using System.Reflection;
+[assembly: AssemblyTitle("IPbind Beta")]
+[assembly: AssemblyProduct("IPbind Beta")]
+[assembly: AssemblyVersion("2.3.140")]
+[assembly: AssemblyFileVersion("2.3.140")]
+[assembly: AssemblyInformationalVersion("2.3.140b")]
+namespace IPbind
+{
+    internal static class BuildInfo
+    {
+        public const string Version = "2.3.140";
+        public const string Channel = "beta";
+        public static readonly bool IsBeta = Channel == "beta";
+        public static readonly string DisplayVersion = IsBeta ? Version + "b" : Version;
+        public const string AppName = "IPbind Beta";
+        public const string ReleaseTag = "beta";
+    }
+}
+'@
+Set-Content -Path .\Version-beta-test.cs -Value $betaVer -Encoding UTF8
 $logBetaArgs = @(
   '/nologo', '/warnaserror+', '/target:exe', '/out:debug-log-batch-tests.exe',
   '/main:IPbindTest.DebugLogBatchTest',
   '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
   '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
-  'IPbind.cs', 'Version.cs', '.github\test\DebugLogBatchTest.cs'
+  'IPbind.cs', 'Version-beta-test.cs', '.github\test\DebugLogBatchTest.cs'
 )
 & $csc @logBetaArgs
 if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test compile failed' }
