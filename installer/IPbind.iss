@@ -251,142 +251,165 @@ begin
   end;
 end;
 
+{ Builds the prompt's controls on Form and returns the client height the
+  content needs. Run once on a throw-away form to measure, then on the real
+  form, so the dialog is exactly as tall as its text (no empty band). }
+function BuildUninstallPrompt(Form: TSetupForm; ShowWarn: Boolean; FormH: Integer): Integer;
+var
+  Title, Body, Warn, DataLabel: TNewStaticText;
+  UninstallBtn, CancelBtn: TNewButton;
+  MarginX, MarginY, InnerW, Y, BoxSize, LabelLeft, LabelW, NeedH, LineH: Integer;
+  BtnW1, BtnW2, BtnH, BtnY: Integer;
+begin
+  MarginX := ScaleX(20);
+  MarginY := ScaleY(16);
+  InnerW := Form.ClientWidth - (MarginX * 2);
+  Y := MarginY;
+
+  Title := TNewStaticText.Create(Form);
+  Title.Parent := Form;
+  Title.Left := MarginX;
+  Title.Top := Y;
+  Title.Width := InnerW;
+  Title.AutoSize := True;
+  Title.WordWrap := True;
+  Title.Font.Name := 'Segoe UI';
+  Title.Font.Size := 11;
+  Title.Font.Style := [fsBold];
+  Title.Caption := 'Uninstall {#AppTitle}?';
+  Y := Title.Top + Title.Height + ScaleY(10);
+
+  Body := TNewStaticText.Create(Form);
+  Body.Parent := Form;
+  Body.Left := MarginX;
+  Body.Top := Y;
+  Body.Width := InnerW;
+  Body.AutoSize := True;
+  Body.WordWrap := True;
+  Body.Caption := 'This removes the app and its shortcuts. Saved IP lists and settings stay on this PC unless you also choose to remove them.';
+  Y := Body.Top + Body.Height + ScaleY(12);
+
+  if ShowWarn then
+  begin
+    Warn := TNewStaticText.Create(Form);
+    Warn.Parent := Form;
+    Warn.Left := MarginX;
+    Warn.Top := Y;
+    Warn.Width := InnerW;
+    Warn.AutoSize := True;
+    Warn.WordWrap := True;
+    Warn.Caption := '{#AppTitle} still has a Keep DHCP record. If those addresses are still applied, use Return to DHCP first. Uninstall will also delete the record used to remove them.';
+    Y := Warn.Top + Warn.Height + ScaleY(14);
+  end;
+
+  BoxSize := ScaleY(18);
+  if BoxSize < ScaleX(16) then
+    BoxSize := ScaleX(16);
+  LabelLeft := MarginX + BoxSize + ScaleX(8);
+  LabelW := Form.ClientWidth - MarginX - LabelLeft;
+  NeedH := MeasureWrappedHeight(Form, 'Also remove all {#AppTitle} data (saved IP lists, settings, and the setup reminder)', LabelW);
+  LineH := MeasureWrappedHeight(Form, 'Ag', LabelW);
+  { Extra room so descenders are not clipped, at every DPI. }
+  if NeedH < BoxSize then
+    NeedH := BoxSize;
+  NeedH := NeedH + ScaleY(4);
+
+  { The box is centred on the first line of its caption. }
+  RemoveDataCheckBox := TNewCheckBox.Create(Form);
+  RemoveDataCheckBox.Parent := Form;
+  RemoveDataCheckBox.Caption := '';
+  RemoveDataCheckBox.Left := MarginX;
+  RemoveDataCheckBox.Top := Y + ((LineH - BoxSize) div 2);
+  RemoveDataCheckBox.Width := BoxSize;
+  RemoveDataCheckBox.Height := BoxSize;
+  RemoveDataCheckBox.Checked := RemoveDataRequested;
+  RemoveDataCheckBox.TabOrder := 0;
+
+  DataLabel := TNewStaticText.Create(Form);
+  DataLabel.Parent := Form;
+  DataLabel.Left := LabelLeft;
+  DataLabel.Top := Y;
+  DataLabel.Width := LabelW;
+  DataLabel.AutoSize := True;
+  DataLabel.WordWrap := True;
+  DataLabel.Caption := 'Also remove all {#AppTitle} data (saved IP lists, settings, and the setup reminder)';
+  DataLabel.OnClick := @DataLabelClick;
+  Y := Y + NeedH + ScaleY(20);
+
+  BtnH := ScaleY(28);
+  BtnW1 := ButtonWidthFor(Form, 'Uninstall');
+  BtnW2 := ButtonWidthFor(Form, 'Cancel');
+  BtnY := Y;
+  if FormH > 0 then
+    BtnY := FormH - MarginY - BtnH;
+  if BtnY < Y then
+    BtnY := Y;
+  CancelBtn := TNewButton.Create(Form);
+  CancelBtn.Parent := Form;
+  CancelBtn.Caption := 'Cancel';
+  CancelBtn.Width := BtnW2;
+  CancelBtn.Height := BtnH;
+  CancelBtn.Left := Form.ClientWidth - MarginX - BtnW2;
+  CancelBtn.Top := BtnY;
+  CancelBtn.Cancel := True;
+  CancelBtn.ModalResult := mrCancel;
+  CancelBtn.TabOrder := 2;
+
+  UninstallBtn := TNewButton.Create(Form);
+  UninstallBtn.Parent := Form;
+  UninstallBtn.Caption := 'Uninstall';
+  UninstallBtn.Width := BtnW1;
+  UninstallBtn.Height := BtnH;
+  UninstallBtn.Left := CancelBtn.Left - ScaleX(8) - BtnW1;
+  UninstallBtn.Top := BtnY;
+  UninstallBtn.Default := False;
+  UninstallBtn.ModalResult := mrOk;
+  UninstallBtn.TabOrder := 1;
+
+  { Focus starts on the checkbox, not Uninstall, so a stray Enter or a
+    double-click carried over from Installed apps does not remove anything. }
+  Form.ActiveControl := RemoveDataCheckBox;
+  Result := BtnY + BtnH + MarginY;
+end;
+
+function NewPromptForm(DesignH: Integer): TSetupForm;
+begin
+  { Inno 6.6+: size in 96-DPI design pixels (scaled by the function);
+    ClientWidth/ClientHeight are read-only afterwards. }
+  Result := CreateCustomForm(470, DesignH, True, True);
+  Result.Caption := 'Uninstall {#AppTitle}';
+  Result.BorderStyle := bsDialog;
+  Result.Position := poScreenCenter;
+  Result.Font.Name := 'Segoe UI';
+  Result.Font.Size := 9;
+  Result.Color := clBtnFace;
+end;
+
+{ Blocking first step of an interactive uninstall. Nothing has been removed
+  while it is up; Cancel returns False and InitializeUninstall aborts. }
 function ShowUninstallDataPrompt: Boolean;
 var
   Form: TSetupForm;
-  Title, Body, Warn, DataLabel: TNewStaticText;
-  UninstallBtn, CancelBtn: TNewButton;
-  MarginX, MarginY, InnerW, Y, BoxSize, LabelLeft, LabelW, NeedH: Integer;
-  BtnW1, BtnW2, BtnH, BtnY: Integer;
-  BodyText, WarnText, CheckText: String;
   ShowWarn: Boolean;
+  NeedPx, DesignH: Integer;
 begin
-  BodyText :=
-    'This removes the app and its shortcuts. Saved IP lists and settings stay on this PC unless you also choose to remove them.';
-  WarnText :=
-    '{#AppTitle} still has a Keep DHCP record. If those addresses are still applied, use Return to DHCP first. Uninstall will also delete the record used to remove them.';
-  CheckText :=
-    'Also remove all {#AppTitle} data (saved IP lists, settings, and the setup reminder)';
   ShowWarn := KeepDhcpRecordExists;
-
-  { Inno 6.6+: size is set here in 96-DPI design pixels (the function scales
-    it) and ClientWidth/ClientHeight are read-only afterwards. 320 is enough
-    for the Keep DHCP warning, wrapped checkbox text, and buttons. }
-  Form := CreateCustomForm(470, 320, True, True);
+  Form := NewPromptForm(400);
   try
-    Form.Caption := 'Uninstall {#AppTitle}';
-    Form.BorderStyle := bsDialog;
-    Form.Position := poScreenCenter;
-    Form.Font.Name := 'Segoe UI';
-    Form.Font.Size := 9;
-    Form.Color := clBtnFace;
-
-    MarginX := ScaleX(20);
-    MarginY := ScaleY(16);
-    InnerW := Form.ClientWidth - (MarginX * 2);
-    Y := MarginY;
-
-    Title := TNewStaticText.Create(Form);
-    Title.Parent := Form;
-    Title.Left := MarginX;
-    Title.Top := Y;
-    Title.Width := InnerW;
-    Title.AutoSize := True;
-    Title.WordWrap := True;
-    Title.Font.Name := 'Segoe UI';
-    Title.Font.Size := 11;
-    Title.Font.Style := [fsBold];
-    Title.Caption := 'Uninstall {#AppTitle}?';
-    Y := Title.Top + Title.Height + ScaleY(10);
-
-    Body := TNewStaticText.Create(Form);
-    Body.Parent := Form;
-    Body.Left := MarginX;
-    Body.Top := Y;
-    Body.Width := InnerW;
-    Body.AutoSize := True;
-    Body.WordWrap := True;
-    Body.Caption := BodyText;
-    Y := Body.Top + Body.Height + ScaleY(12);
-
-    if ShowWarn then
-    begin
-      Warn := TNewStaticText.Create(Form);
-      Warn.Parent := Form;
-      Warn.Left := MarginX;
-      Warn.Top := Y;
-      Warn.Width := InnerW;
-      Warn.AutoSize := True;
-      Warn.WordWrap := True;
-      Warn.Caption := WarnText;
-      Y := Warn.Top + Warn.Height + ScaleY(14);
-    end;
-
-    BoxSize := ScaleY(18);
-    if BoxSize < ScaleX(16) then
-      BoxSize := ScaleX(16);
-    LabelLeft := MarginX + BoxSize + ScaleX(8);
-    LabelW := Form.ClientWidth - MarginX - LabelLeft;
-    NeedH := MeasureWrappedHeight(Form, CheckText, LabelW);
-    { Extra room so descenders are not clipped, at every DPI. }
-    if NeedH < BoxSize then
-      NeedH := BoxSize;
-    NeedH := NeedH + ScaleY(6);
-
-    RemoveDataCheckBox := TNewCheckBox.Create(Form);
-    RemoveDataCheckBox.Parent := Form;
-    RemoveDataCheckBox.Caption := '';
-    RemoveDataCheckBox.Left := MarginX;
-    RemoveDataCheckBox.Top := Y + ((NeedH - BoxSize) div 2);
-    RemoveDataCheckBox.Width := BoxSize;
-    RemoveDataCheckBox.Height := BoxSize;
-    RemoveDataCheckBox.Checked := RemoveDataRequested;
-    RemoveDataCheckBox.TabOrder := 0;
-
-    DataLabel := TNewStaticText.Create(Form);
-    DataLabel.Parent := Form;
-    DataLabel.Left := LabelLeft;
-    DataLabel.Top := Y;
-    DataLabel.Width := LabelW;
-    DataLabel.AutoSize := True;
-    DataLabel.WordWrap := True;
-    DataLabel.Caption := CheckText;
-    DataLabel.OnClick := @DataLabelClick;
-    Y := Y + NeedH + ScaleY(18);
-
-    BtnH := ScaleY(28);
-    BtnW1 := ButtonWidthFor(Form, 'Uninstall');
-    BtnW2 := ButtonWidthFor(Form, 'Cancel');
-    BtnY := Form.ClientHeight - MarginY - BtnH;
-    if BtnY < Y then
-      BtnY := Y;
-    CancelBtn := TNewButton.Create(Form);
-    CancelBtn.Parent := Form;
-    CancelBtn.Caption := 'Cancel';
-    CancelBtn.Width := BtnW2;
-    CancelBtn.Height := BtnH;
-    CancelBtn.Left := Form.ClientWidth - MarginX - BtnW2;
-    CancelBtn.Top := BtnY;
-    CancelBtn.Cancel := True;
-    CancelBtn.ModalResult := mrCancel;
-    CancelBtn.TabOrder := 2;
-
-    UninstallBtn := TNewButton.Create(Form);
-    UninstallBtn.Parent := Form;
-    UninstallBtn.Caption := 'Uninstall';
-    UninstallBtn.Width := BtnW1;
-    UninstallBtn.Height := BtnH;
-    UninstallBtn.Left := CancelBtn.Left - ScaleX(8) - BtnW1;
-    UninstallBtn.Top := BtnY;
-    UninstallBtn.Default := True;
-    UninstallBtn.ModalResult := mrOk;
-    UninstallBtn.TabOrder := 1;
-
-    Form.ActiveControl := UninstallBtn;
-
+    NeedPx := BuildUninstallPrompt(Form, ShowWarn, 0);
+  finally
+    RemoveDataCheckBox := nil;
+    Form.Free;
+  end;
+  { Back to design pixels, rounded up. }
+  DesignH := (NeedPx * 1000 + ScaleY(1000) - 1) div ScaleY(1000);
+  Form := NewPromptForm(DesignH);
+  try
+    BuildUninstallPrompt(Form, ShowWarn, Form.ClientHeight);
     Result := Form.ShowModal = mrOk;
     if Result then
       RemoveDataRequested := RemoveDataCheckBox.Checked;
+    Log('Uninstall prompt: ' + IntToStr(Ord(Result)) + ', remove data: ' + IntToStr(Ord(RemoveDataRequested)));
   finally
     RemoveDataCheckBox := nil;
     Form.Free;

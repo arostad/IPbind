@@ -3654,7 +3654,7 @@ namespace IPbind
         void ApplyGatewayLayout()
         {
             bool on = chkGateway.Checked;
-            txtIPs.Height = U(on ? 106 : 168);
+            txtIPs.Height = U(on ? 134 : 196);
             lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
             foreach (Control c in new Control[] {
                 lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
@@ -4881,6 +4881,42 @@ namespace IPbind
             return text.Width + U(24);
         }
 
+        // Distance from a check box's left edge to the right edge of its drawn text
+        // (glyph, gap and text as Windows actually renders them at this DPI). Drawn
+        // on a stand-alone copy so MainForm's handle is not created early.
+        int TextInkRight(CheckBox box)
+        {
+            try
+            {
+                using (CheckBox probe = new CheckBox())
+                {
+                    probe.Text = box.Text;
+                    probe.Font = box.Font;
+                    probe.Size = box.Size;
+                    probe.CheckAlign = box.CheckAlign;
+                    probe.TextAlign = box.TextAlign;
+                    probe.FlatStyle = box.FlatStyle;
+                    probe.BackColor = Color.White;
+                    probe.ForeColor = Color.Black;
+                    using (Bitmap bmp = new Bitmap(probe.Width, probe.Height))
+                    {
+                        probe.DrawToBitmap(bmp, new Rectangle(Point.Empty, probe.Size));
+                        for (int x = bmp.Width - 1; x >= 0; x--)
+                            for (int y = 0; y < bmp.Height; y++)
+                            {
+                                Color c = bmp.GetPixel(x, y);
+                                // Any pixel clearly darker than the white background
+                                // counts, so the anti-aliased edge of the last letter is
+                                // included, as it is on screen.
+                                if (c.R + c.G + c.B < 765 - 300) return x + 1;
+                            }
+                    }
+                }
+            }
+            catch { }
+            return box.Width - U(6);
+        }
+
         Label MakeRowLabel(string text, int x, int y)
         {
             Label l = new Label();
@@ -5252,8 +5288,10 @@ namespace IPbind
             Label lblTitle = new Label();
             lblTitle.Text = BuildInfo.AppName;
             lblTitle.Font = UiFont(16F, FontStyle.Bold);
-            lblTitle.Location = P(20, 10);
-            lblTitle.Size = Z(520, 28);
+            // 8 to 38, ending exactly where the subtitle starts, so the 16 pt title
+            // is not clipped at 150% and never overlaps the subtitle after rounding.
+            lblTitle.Location = P(20, 8);
+            lblTitle.Size = new Size(U(520), U(38) - U(8));
             lblTitle.TextAlign = ContentAlignment.MiddleCenter;
             Controls.Add(lblTitle);
 
@@ -5288,12 +5326,12 @@ namespace IPbind
             };
             Controls.Add(combo);
 
-            // Keep DHCP and Gateway support share one row, left-aligned with the IP
-            // list, between the list buttons and Apply / Return to DHCP.
+            // Keep DHCP and Gateway support share one row above Refresh, 28 px apart
+            // as before. The pair is placed below, once Refresh exists, so the last
+            // letter of "Gateway support" ends at Refresh's right edge.
             chkKeepDhcp = new CheckBox();
             chkKeepDhcp.Text = "Keep DHCP";
             chkKeepDhcp.Font = UiFont(8F, FontStyle.Regular);
-            chkKeepDhcp.Location = P(20, 380);
             chkKeepDhcp.Size = new Size(OptionWidth(chkKeepDhcp), U(20));
             chkKeepDhcp.CheckAlign = ContentAlignment.MiddleLeft;
             chkKeepDhcp.TextAlign = ContentAlignment.MiddleLeft;
@@ -5330,7 +5368,6 @@ namespace IPbind
             chkGateway = new CheckBox();
             chkGateway.Text = "Gateway support";
             chkGateway.Font = UiFont(8F, FontStyle.Regular);
-            chkGateway.Location = new Point(chkKeepDhcp.Right + U(28), U(380));
             chkGateway.Size = new Size(OptionWidth(chkGateway), U(20));
             chkGateway.CheckAlign = ContentAlignment.MiddleLeft;
             chkGateway.TextAlign = ContentAlignment.MiddleLeft;
@@ -5344,6 +5381,10 @@ namespace IPbind
                         : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
             };
             Controls.Add(chkGateway);
+            // Row y 72-92: under the subtitle (which ends at 72), above Refresh (93),
+            // level with "Select your LAN interface below:".
+            chkGateway.Location = new Point(btnRefresh.Right - TextInkRight(chkGateway), U(72));
+            chkKeepDhcp.Location = new Point(chkGateway.Left - U(28) - chkKeepDhcp.Width, U(72));
 
             // Gateway support is off by default; warn before someone turns it on.
             gatewayTip = new ToolTip();
@@ -5365,16 +5406,16 @@ namespace IPbind
             txtIPs.Multiline = true;
             txtIPs.ScrollBars = ScrollBars.Vertical;
             txtIPs.Location = P(20, 170);
-            txtIPs.Size = Z(520, 168);
+            txtIPs.Size = Z(520, 196);
             txtIPs.Font = new Font("Consolas", 10F);
             txtIPs.TextChanged += delegate { RefreshGatewayChoices(); };
             Controls.Add(txtIPs);
 
             // Gateway rows (hidden until Gateway support is on). They sit in the bottom
             // 62px of the IP list's normal area, which the list gives up when shown.
-            lblGwOn = MakeRowLabel("Use gateway on:", 20, 282);
+            lblGwOn = MakeRowLabel("Use gateway on:", 20, 310);
             cboGwIp = new ComboBox();
-            cboGwIp.Location = P(122, 282);
+            cboGwIp.Location = P(122, 310);
             cboGwIp.Size = Z(150, 24);
             cboGwIp.DropDownStyle = ComboBoxStyle.DropDownList;
             cboGwIp.DrawMode = DrawMode.OwnerDrawFixed;
@@ -5387,23 +5428,23 @@ namespace IPbind
                 SaveGatewaySettings();
             };
             Controls.Add(cboGwIp);
-            lblGateway = MakeRowLabel("Gateway:", 284, 282);
-            txtGateway = MakeIpBox(352, 282);
-            lblDns1 = MakeRowLabel("DNS 1:", 20, 311);
-            txtDns1 = MakeIpBox(122, 311);
+            lblGateway = MakeRowLabel("Gateway:", 284, 310);
+            txtGateway = MakeIpBox(352, 310);
+            lblDns1 = MakeRowLabel("DNS 1:", 20, 339);
+            txtDns1 = MakeIpBox(122, 339);
             txtDns1.Width = U(150);
-            lblDns2 = MakeRowLabel("DNS 2:", 284, 311);
-            txtDns2 = MakeIpBox(352, 311);
+            lblDns2 = MakeRowLabel("DNS 2:", 284, 339);
+            txtDns2 = MakeIpBox(352, 339);
 
-            Button btnSaveList = MakeButton("Save List", 20, 344, 166, 28);
+            Button btnSaveList = MakeButton("Save List", 20, 372, 166, 28);
             btnSaveList.Click += delegate { SaveList(false); };
             Controls.Add(btnSaveList);
 
-            Button btnRestore = MakeButton("Restore Defaults", 197, 344, 166, 28);
+            Button btnRestore = MakeButton("Restore Defaults", 197, 372, 166, 28);
             btnRestore.Click += delegate { RestoreDefaults(); };
             Controls.Add(btnRestore);
 
-            Button btnShow = MakeButton("Show Current", 374, 344, 166, 28);
+            Button btnShow = MakeButton("Show Current", 374, 372, 166, 28);
             btnShow.Click += delegate
             {
                 string a = GetSelectedAlias();
