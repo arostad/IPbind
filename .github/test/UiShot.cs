@@ -310,6 +310,10 @@ namespace IPbindTest
                 t.Stop();
                 Capture(f.Handle, png);
                 CheckLayout(f, lines, "popup sc=" + scale + " dark=" + dark);
+                Label[] heads = (Label[])typeof(IPbind.DhcpReminderForm).GetField("rowHeads", F).GetValue(f);
+                lines.Add("bullet0='" + (heads != null && heads.Length > 0 ? heads[0].Text : "") + "' " + (heads != null && heads.Length > 0 ? heads[0].Bounds.ToString() : ""));
+                if (heads == null || heads.Length < 1 || heads[0].Text != "Your laptop may not have internet")
+                    lines.Add("BULLET WORDING");
                 CheckGlyphAlignment(f, lines, scale);
                 DumpFonts(f, lines);
                 Size layout = f.LayoutClientSize;
@@ -328,7 +332,8 @@ namespace IPbindTest
                 File.WriteAllLines(report, lines.ToArray());
                 foreach (string line in lines)
                     if ((line.StartsWith("PROBLEMS=") && line != "PROBLEMS=0") || line.IndexOf("GLYPH NOT CENTERED") >= 0
-                        || line.IndexOf("CLIENT MISMATCH") >= 0 || line.IndexOf("UNEXPECTED BOLD") >= 0) rc = 1;
+                        || line.IndexOf("CLIENT MISMATCH") >= 0 || line.IndexOf("UNEXPECTED BOLD") >= 0
+                        || line.IndexOf("BULLET WORDING") >= 0 || line.IndexOf("TEXT CLIPPED") >= 0) rc = 1;
                 f.Close(); owner.Close();
             };
             f.Shown += delegate { f.Activate(); t.Start(); };
@@ -788,7 +793,6 @@ namespace IPbindTest
 
         static int CheckAboutGaps(IPbind.AboutForm f, List<string> lines, float scale)
         {
-            int U(int v) { return (int)Math.Round(v * scale); }
             int slop = 1;
             int faults = 0;
             Label tagline = (Label)typeof(IPbind.AboutForm).GetField("tagline", F).GetValue(f);
@@ -805,7 +809,13 @@ namespace IPbindTest
                 priv.Top - (status.Visible ? status.Bottom : cap.Bottom),
                 footer.Top - priv.Bottom
             };
-            int[] want = new int[] { U(18), U(8), U(16), U(18), U(20) };
+            int[] want = new int[] {
+                (int)Math.Round(18 * scale),
+                (int)Math.Round(8 * scale),
+                (int)Math.Round(16 * scale),
+                (int)Math.Round(18 * scale),
+                (int)Math.Round(20 * scale)
+            };
             string[] names = new string[] { "tagline-credit", "credit-license", "license-checkbox", "checkbox-privacy", "privacy-footer" };
             for (int i = 0; i < got.Length; i++)
             {
