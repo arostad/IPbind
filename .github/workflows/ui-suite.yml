@@ -55,6 +55,7 @@ jobs:
           powershell -ExecutionPolicy Bypass -File .\.github\test\run-apply-safety-tests.ps1
           powershell -ExecutionPolicy Bypass -File .\.github\test\run-display-version-tests.ps1
           powershell -ExecutionPolicy Bypass -File .\.github\test\copy-check.ps1
+          powershell -ExecutionPolicy Bypass -File .\.github\test\run-clip-fixtures.ps1
       - name: Build installer
         shell: pwsh
         run: |
@@ -80,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [static-shots, aboutcheck, simdpi, realdpi, dpirtrip, main, scrollhide, flicker, walk-100, walk-150, installer-clip]
+        suite: [static-shots, aboutcheck, simdpi, realdpi, dpirtrip, dpirtrip-139, main, scrollhide, flicker, walk-100, walk-150, walk-175, installer-clip, installer-clip-139]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -111,12 +112,17 @@ jobs:
           function SetScale([string]$pct, [string]$tag) {
             $r = Start-Process .\uishot.exe -ArgumentList @('setscale',$pct,"$PWD\shots\setscale-$tag.txt") -PassThru -Wait
             Start-Sleep -Seconds 3
-            Write-Host "setscale $pct -> $(Get-Content shots\setscale-$tag.txt -ErrorAction SilentlyContinue)"
+            $txt = ''
+            if (Test-Path "shots\setscale-$tag.txt") { $txt = Get-Content "shots\setscale-$tag.txt" -Raw }
+            Write-Host "setscale $pct -> $txt"
+            # Runner displays max out at 175%. Never request 200% and then keep
+            # going with a lower scale under a 200% label.
+            if ($txt -match 'UNAVAILABLE') { throw "setscale $pct unavailable: $txt (CI runner max is 175%)" }
           }
           switch ($suite) {
             'static-shots' {
               $fails = 0
-              foreach ($pct in @('100','150','175','200')) {
+              foreach ($pct in @('100','150','175')) {
                 SetScale $pct $pct
                 $sc = [string]([math]::Round([int]$pct / 100.0, 2))
                 foreach ($theme in @('dark','light')) {
@@ -220,13 +226,26 @@ jobs:
               powershell -ExecutionPolicy Bypass -File .\.github\test\walk.ps1 -Installer $inst -Out "$PWD\shots\walk" -Tag w150
               if ($LASTEXITCODE -ne 0) { throw "walk 150 failed ($LASTEXITCODE)" }
             }
+            'walk-175' {
+              $d = Join-Path $env:APPDATA 'IPbind Beta'
+              if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+              Set-ItemProperty $pers AppsUseLightTheme 0 -Type DWord
+              SetScale '175' 'walk-175'
+              $inst = (Get-ChildItem .\dist\IPbind-Installer-v*-beta.exe).FullName
+              powershell -ExecutionPolicy Bypass -File .\.github\test\walk.ps1 -Installer $inst -Out "$PWD\shots\walk" -Tag w175
+              if ($LASTEXITCODE -ne 0) { throw "walk 175 failed ($LASTEXITCODE)" }
+            }
+            'dpirtrip-139' {
+              powershell -ExecutionPolicy Bypass -File .\.github\test\run-dpirtrip-139-regression.ps1
+              if ($LASTEXITCODE -ne 0) { throw "dpirtrip-139 regression failed ($LASTEXITCODE)" }
+            }
             'installer-clip' {
               $d = Join-Path $env:APPDATA 'IPbind Beta'
               if (Test-Path $d) { Remove-Item -Recurse -Force $d }
               Set-ItemProperty $pers AppsUseLightTheme 0 -Type DWord
               $inst = (Get-ChildItem .\dist\IPbind-Installer-v*-beta.exe).FullName
               $fails = 0
-              foreach ($pct in @('100','150','200')) {
+              foreach ($pct in @('100','150','175')) {
                 SetScale $pct "installer-clip-$pct"
                 $t = "ic$pct"
                 $p = Start-Process powershell -ArgumentList @('-ExecutionPolicy','Bypass','-File','.\.github\test\installer-checkboxes.ps1','-Installer',$inst,'-Out',"$PWD\shots\installer-clip",'-Tag',$t) -PassThru -Wait
@@ -235,6 +254,29 @@ jobs:
                 if ($p.ExitCode -ne 0) { $fails++; Write-Host "::error::installer-clip $pct exit $($p.ExitCode)" }
               }
               if ($fails -gt 0) { throw "installer-clip failed $fails" }
+            }
+            'installer-clip-139' {
+              $d = Join-Path $env:APPDATA 'IPbind Beta'
+              if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+              Set-ItemProperty $pers AppsUseLightTheme 0 -Type DWord
+              $inst = (Resolve-Path .\.github\test\fixtures\IPbind-Installer-v2.3.139-beta.exe).Path
+              $expect = Get-Content .\.github\test\fixtures\IPbind-Installer-v2.3.139-beta.exe.sha256 -Raw
+              $got = (Get-FileHash $inst -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($expect -notmatch $got) { throw "139 fixture hash $got did not match $expect" }
+              $fails = 0
+              # Live 139 installer at 150% and 175% (runner max). Andy's clip is at 225%,
+              # which SetScale cannot reach. These runs record the detector honestly;
+              # they must reach Tasks and Finish. The required 139 fail is the frozen
+              # Finish-page fixture (run-clip-fixtures.ps1 in prepare).
+              foreach ($pct in @('150','175')) {
+                SetScale $pct "installer-clip-139-$pct"
+                $t = "ic139-$pct"
+                $p = Start-Process powershell -ArgumentList @('-ExecutionPolicy','Bypass','-File','.\.github\test\installer-checkboxes.ps1','-Installer',$inst,'-Out',"$PWD\shots\installer-clip-139",'-Tag',$t,'-AllowClip') -PassThru -Wait
+                $log = "$PWD\shots\installer-clip-139\installer-checkboxes-$t.txt"
+                if (Test-Path $log) { Get-Content $log }
+                if ($p.ExitCode -ne 0) { $fails++; Write-Host "::error::installer-clip-139 $pct exit $($p.ExitCode)" }
+              }
+              if ($fails -gt 0) { throw "installer-clip-139 failed $fails (wizard must reach Tasks and Finish; the required 139 clip fail is the Finish fixture in prepare)" }
             }
             default { throw "unknown suite $suite" }
 

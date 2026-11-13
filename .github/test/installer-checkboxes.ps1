@@ -1,6 +1,6 @@
 # Open the IPbind Beta installer and uninstaller, screenshot the Tasks page,
 # Finish page, and uninstall prompt, and fail if any Inno checkbox is clipped.
-param([Parameter(Mandatory=$true)][string]$Installer, [Parameter(Mandatory=$true)][string]$Out, [string]$Tag='ic')
+param([Parameter(Mandatory=$true)][string]$Installer, [Parameter(Mandatory=$true)][string]$Out, [string]$Tag='ic', [switch]$ExpectClip, [switch]$AllowClip)
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
 Add-Type @'
@@ -42,7 +42,31 @@ function Shot($win, [string]$name) {
   L "shot $name ($w x $hh) $path"
   $clipScript = Join-Path $PSScriptRoot 'check-inno-checkbox-clip.ps1'
   & powershell -ExecutionPolicy Bypass -File $clipScript -Path $path -Log $log
-  if ($LASTEXITCODE -gt 0) { L "FAIL $name Inno checkbox left edge clipped ($LASTEXITCODE)" }
+  $clipExit = $LASTEXITCODE
+  $candLine = @(Select-String -Path $log -Pattern "INNO_CHECKBOX_CLIP=\d+ candidates=(\d+) file=$([regex]::Escape($path))" -ErrorAction SilentlyContinue | Select-Object -Last 1)
+  $cands = -1
+  if ($candLine) {
+    if ($candLine.Line -match 'candidates=(\d+)') { $cands = [int]$Matches[1] }
+  }
+  if ($clipExit -gt 1) { L "FAIL $name clip-detector error (exit $clipExit)" }
+  elseif ($AllowClip) {
+    if ($clipExit -ge 1) { L "NOTE $name clipped at this scale (exit $clipExit candidates=$cands) — recorded, not a job fail" }
+    elseif (($name -eq 'tasks' -or $name -eq 'finish') -and $cands -eq 0) { L "FAIL $name clip check found no checkbox candidates" }
+    else { L "NOTE $name unclipped at this scale (candidates=$cands)" }
+  }
+  elseif ($ExpectClip) {
+    # The uninstall prompt is not the TNewCheckListBox that Andy's bug hit;
+    # only Tasks and Finish are required to fail on the 2.3.139 installer.
+    if ($name -eq 'uninstall-prompt') {
+      L "OK $name detector exit $clipExit candidates=$cands (uninstall not required to clip)"
+    }
+    elseif ($clipExit -ge 1) { L "OK $name clipped as expected on 2.3.139 (exit $clipExit candidates=$cands)" }
+    else { L "FAIL $name expected a clipped 2.3.139 checkbox, detector exit $clipExit candidates=$cands" }
+  }
+  else {
+    if (($name -eq 'tasks' -or $name -eq 'finish') -and $cands -eq 0) { L "FAIL $name clip check found no checkbox candidates" }
+    if ($clipExit -gt 0) { L "FAIL $name Inno checkbox left edge clipped ($clipExit)" }
+  }
 }
 function All($win) { $win.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
 $CT = [System.Windows.Automation.ControlType]
@@ -134,6 +158,20 @@ if (Test-Path $unins) {
 }
 Get-Process 'IPbind Beta' -ea SilentlyContinue | Stop-Process -Force -ea SilentlyContinue
 $fails = @(Select-String -Path $log -Pattern '\bFAIL\b' -ErrorAction SilentlyContinue).Count
+if ($AllowClip) {
+  $detErr = @(Select-String -Path $log -Pattern 'clip-detector error' -ErrorAction SilentlyContinue).Count
+  $noCand = @(Select-String -Path $log -Pattern 'found no checkbox candidates' -ErrorAction SilentlyContinue).Count
+  L "INSTALLER_CHECKBOX (allow-clip) detErr=$detErr noCand=$noCand tasks=$gotTasks finish=$gotFinish"
+  if ($detErr -gt 0 -or $noCand -gt 0 -or -not $gotTasks -or -not $gotFinish) { exit 1 }
+  exit 0
+}
+if ($ExpectClip) {
+  $tasksClip = @(Select-String -Path $log -Pattern 'OK tasks clipped as expected' -ErrorAction SilentlyContinue).Count
+  $finishClip = @(Select-String -Path $log -Pattern 'OK finish clipped as expected' -ErrorAction SilentlyContinue).Count
+  L "INSTALLER_CHECKBOX_FAILS=$fails tasks=$gotTasks finish=$gotFinish tasksClip=$tasksClip finishClip=$finishClip (expect 139 clip)"
+  if ($fails -gt 0 -or -not $gotTasks -or -not $gotFinish -or $tasksClip -lt 1 -or $finishClip -lt 1) { exit 1 }
+  exit 0
+}
 L "INSTALLER_CHECKBOX_FAILS=$fails tasks=$gotTasks finish=$gotFinish"
 if ($fails -gt 0 -or -not $gotTasks -or -not $gotFinish) { exit 1 }
 exit 0

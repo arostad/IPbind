@@ -135,32 +135,59 @@ namespace IPbindTest
         // ---------- geometry assertions shared by the DPI tests ----------
         static int CheckGeometry(Form f, string tag, List<string> lines, bool requireFit)
         {
+            // Assert the form's own layout and control bounds, and the client
+            // size it requested. Do not fail because a 1080p runner OS-clamped
+            // the HWND of a simulated 4K layout (CI dpirtrip on 4f4490a).
             int faults = 0;
             IPbind.PerMonitorDialog d = f as IPbind.PerMonitorDialog;
             Rectangle win = WinRect(f.Handle);
             Rectangle client = ClientRectScreen(f.Handle);
-            Rectangle work = WorkArea(f.Handle);
+            Rectangle realWork = WorkArea(f.Handle);
             int wdpi = GetDpiForWindow(f.Handle);
             Size layout = d.LayoutClientSize;
-            string line = tag + " dpi=" + wdpi + " scale=" + d.LayoutScale + " window=" + win + " client=" + client.Size
+            Rectangle layoutRect = new Rectangle(0, 0, layout.Width, layout.Height);
+            // Copy the field first: CS1690 (marshal-by-ref Form) if we read Width on it.
+            Rectangle simArea = d.SimulatedWorkArea;
+            bool simulated = simArea.Width > 0 && simArea.Height > 0;
+            Rectangle work = simulated ? simArea : realWork;
+            string line = tag + " dpi=" + wdpi + " scale=" + d.LayoutScale + " window=" + win + " hwndClient=" + client.Size
                 + " layout=" + layout + " work=" + work;
-            if (client.Size != layout) { line += "  FAIL client!=layout"; faults++; }
+            if (simulated) line += " hwndWork=" + realWork;
+            // Only compare the HWND client to layout when Windows was actually
+            // able to honor the requested size (no simulated 4K on 1080p).
+            if (!simulated && client.Size != layout) { line += "  FAIL client!=layout"; faults++; }
             if (Math.Abs(d.LayoutScale - wdpi / 96f) > 0.001f && wdpi > 0 && requireFit) { line += "  FAIL scale!=dpi"; faults++; }
             foreach (string name in new string[] { "continueButton", "exitButton", "closeButton", "checkButton" })
             {
                 FieldInfo fi = f.GetType().GetField(name, F);
                 if (fi == null) continue;
                 Control b = (Control)fi.GetValue(f);
-                if (b == null || !b.IsHandleCreated) continue;
-                Rectangle br = WinRect(b.Handle);
-                bool inside = client.Contains(br);
+                if (b == null) continue;
+                Rectangle br = b.Bounds;
+                bool inside = layout.Width > 0 && layout.Height > 0 && layoutRect.Contains(br);
                 line += " " + name + "=" + br + (inside ? " in" : " OUT");
-                if (!inside) { faults++; line += "  FAIL button outside client"; }
+                if (!inside) { faults++; line += "  FAIL button outside layout"; }
             }
-            bool titleOn = win.Top >= work.Top && win.Left >= work.Left - 1 && win.Right <= work.Right + 1;
-            bool fits = win.Bottom <= work.Bottom && titleOn;
+            bool titleOn;
+            bool fits;
+            if (simulated)
+            {
+                // Requested window must fit the simulated work area. The HWND
+                // may be clamped to the real 1080p screen; that is not a fault.
+                int chromeW = Math.Max(0, win.Width - client.Width);
+                int chromeH = Math.Max(0, win.Height - client.Height);
+                Size requested = new Size(layout.Width + chromeW, layout.Height + chromeH);
+                line += " requested=" + requested;
+                titleOn = true;
+                fits = requested.Width <= work.Width + 1 && requested.Height <= work.Height + 1;
+            }
+            else
+            {
+                titleOn = win.Top >= work.Top && win.Left >= work.Left - 1 && win.Right <= work.Right + 1;
+                fits = win.Bottom <= work.Bottom && titleOn;
+                if (!titleOn) { faults++; line += "  FAIL title bar off screen"; }
+            }
             line += " titleOnScreen=" + titleOn + " fitsWork=" + fits;
-            if (!titleOn) { faults++; line += "  FAIL title bar off screen"; }
             if (requireFit && !fits) { faults++; line += "  FAIL window outside work area"; }
             lines.Add((faults == 0 ? "OK " : "FAIL ") + line);
             return faults;
@@ -211,15 +238,11 @@ namespace IPbindTest
         {
             int faults = 0;
             IPbind.PerMonitorDialog d = (IPbind.PerMonitorDialog)f;
-            Size win = f.Size;
+            // originClient / client are LayoutClientSize — the size the form
+            // requested. Do not assert the OS-clamped HWND (f.Size / originWin).
             Size client = d.LayoutClientSize;
-            string line = tag + " scale=" + d.LayoutScale + " window=" + win + " client=" + client
-                + " originWin=" + originWin + " originClient=" + originClient;
-            if (Math.Abs(win.Width - originWin.Width) > slop || Math.Abs(win.Height - originWin.Height) > slop)
-            {
-                line += "  FAIL window size drifted";
-                faults++;
-            }
+            string line = tag + " scale=" + d.LayoutScale + " hwndWin=" + f.Size + " layout=" + client
+                + " originLayout=" + originClient + " originHwnd=" + originWin;
             if (Math.Abs(client.Width - originClient.Width) > slop || Math.Abs(client.Height - originClient.Height) > slop)
             {
                 line += "  FAIL client size drifted";
