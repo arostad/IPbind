@@ -1557,7 +1557,7 @@ namespace IPbind
         UpdateInfo availableUpdate;
 
         const string PrivacyLine1 = "Each update check sends one anonymous request to the IPbind update server.";
-        const string PrivacyLine2 = "It counts only the country the request came from, for usage stats. No identifiers or cookies.";
+        const string PrivacyLine2 = "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. No identifiers, cookies, or telemetry are used.";
 
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
@@ -1862,15 +1862,12 @@ namespace IPbind
                 if (oldImage != null && oldImage != newIcon) oldImage.Dispose();
                 iconBitmap = newIcon;
 
+                int width = U(500);
                 int padX = U(28);
                 int padTop = U(22);
                 int padBot = U(20);
-                // Size the dialog so each of the two privacy lines fits without
-                // wrapping (Andy, 2.3.136). 500 is the floor from the mockup.
-                int privacyNeed = 0;
-                foreach (string line in new string[] { PrivacyLine1, PrivacyLine2 })
-                    privacyNeed = Math.Max(privacyNeed, MeasureLine(line, fontPrivacy).Width);
-                int width = Math.Max(U(500), privacyNeed + 2 * padX + U(8));
+                // The privacy note is two sentences that wrap inside the 500px
+                // mockup width; the dialog grows in height to fit (Andy, 2.3.136).
                 int inner = width - 2 * padX;
                 int y = padTop;
 
