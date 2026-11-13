@@ -1,4 +1,4 @@
-// Throwaway 2.3.136 UI harness: reminder and About shots and layout checks, font
+// Throwaway 2.3.137 UI harness: reminder and About shots and layout checks, font
 // weights, simulated and real WM_DPICHANGED (live monitor-scale changes through
 // DisplayConfigSetDeviceInfo), checkbox close-ups after a high-to-low DPI move,
 // and icon checks. Not part of the app.
@@ -76,6 +76,7 @@ namespace IPbindTest
             if (kind == "tallwidth") return TallWidth(args[1]);
             if (kind == "tallshot") return TallShot(args[1], args[2]);
             if (kind == "aboutcheck") return AboutCheck(args[1], args[2]);
+            if (kind == "comboflicker") return ComboFlicker(args[1], args[2]);
             return 2;
         }
 
@@ -388,7 +389,7 @@ namespace IPbindTest
                 lines.Add("privacy lines=" + privLines.Length + " text=" + (priv.Text ?? "").Replace("\r\n", " | ") + " bounds=" + priv.Bounds);
                 if (privLines.Length != 2
                     || privLines[0] != "Each update check sends one anonymous request to the IPbind update server."
-                    || privLines[1] != "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. No identifiers, cookies, or telemetry are used.")
+                    || privLines[1] != "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. Your IP address is never stored, and no identifiers, cookies, or telemetry are used.")
                     lines.Add("PRIVACY WORDING");
                 Size privNeed = TextRenderer.MeasureText(priv.Text ?? "", priv.Font, new Size(priv.Width, int.MaxValue),
                     TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
@@ -507,6 +508,111 @@ namespace IPbindTest
             if (Math.Abs(delta) > 1) { lines.Add("ALIGN OFF"); bad++; }
             if (kpS.Top != gwS.Top || gwS.Bottom > rfS.Top) { lines.Add("ROW NOT ABOVE REFRESH"); bad++; }
             return bad;
+        }
+
+        // Select each main-window dropdown, then move the mouse over the combo,
+        // around it, and over the rest of the window for 10+ seconds. Fail if
+        // paints keep going after the cursor stops (a repaint loop) or if the
+        // 10-second pass paints an implausible number of times.
+        const int WM_MOUSEMOVE = 0x0200;
+
+        static int ComboFlicker(string outPrefix, string report)
+        {
+            List<string> lines = new List<string>();
+            IPbind.MainForm main = new IPbind.MainForm();
+            main.Show(); Pump(2500);
+            CheckBox gw = (CheckBox)typeof(IPbind.MainForm).GetField("chkGateway", F).GetValue(main);
+            gw.Checked = true; Pump(600);
+            IPbind.ThemedComboBox adapter = (IPbind.ThemedComboBox)typeof(IPbind.MainForm).GetField("combo", F).GetValue(main);
+            IPbind.ThemedComboBox gateway = (IPbind.ThemedComboBox)typeof(IPbind.MainForm).GetField("cboGwIp", F).GetValue(main);
+            int problems = 0;
+            problems += FlickerOne(main, adapter, "adapter", lines);
+            problems += FlickerOne(main, gateway, "gateway", lines);
+            Capture(main.Handle, outPrefix + "-after.png");
+            lines.Add("COMBOFLICKER_PROBLEMS=" + problems);
+            File.WriteAllLines(report, lines.ToArray());
+            main.Close();
+            return problems == 0 ? 0 : 1;
+        }
+
+        static int FlickerOne(IPbind.MainForm main, IPbind.ThemedComboBox box, string name, List<string> lines)
+        {
+            if (box == null) { lines.Add("COMBO FLICKER missing " + name); return 1; }
+            box.Enabled = true;
+            box.Focus();
+            Pump(400);
+            int start = box.DebugPaintCount;
+            DateTime until = DateTime.UtcNow.AddSeconds(10);
+            Rectangle formR = main.RectangleToScreen(main.ClientRectangle);
+            Rectangle boxR = box.RectangleToScreen(box.ClientRectangle);
+            int step = 0;
+            while (DateTime.UtcNow < until)
+            {
+                Point p = FlickerPoint(step++, formR, boxR);
+                try { Cursor.Position = p; } catch { }
+                Point client = main.PointToClient(p);
+                int lp = (client.Y << 16) | (client.X & 0xFFFF);
+                SendMessage(main.Handle, WM_MOUSEMOVE, IntPtr.Zero, new IntPtr(lp));
+                Point boxClient = box.PointToClient(p);
+                if (box.ClientRectangle.Contains(boxClient))
+                {
+                    int lpBox = (boxClient.Y << 16) | (boxClient.X & 0xFFFF);
+                    SendMessage(box.Handle, WM_MOUSEMOVE, IntPtr.Zero, new IntPtr(lpBox));
+                }
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(30);
+            }
+            int during = box.DebugPaintCount - start;
+            // Park the cursor still, keep the combo focused, and watch for a loop.
+            Point park = new Point(formR.X + formR.Width / 2, formR.Y + formR.Height / 2);
+            try { Cursor.Position = park; } catch { }
+            Pump(200);
+            int idleStart = box.DebugPaintCount;
+            DateTime idleUntil = DateTime.UtcNow.AddSeconds(2);
+            while (DateTime.UtcNow < idleUntil)
+            {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(50);
+            }
+            int idle = box.DebugPaintCount - idleStart;
+            lines.Add("combo flicker " + name + " focused=" + box.Focused + " dark=" + box.UseDarkChrome
+                + " during=" + during + " idle=" + idle);
+            int problems = 0;
+            if (idle > 8)
+            {
+                lines.Add("COMBO FLICKER LOOP " + name + " idlePaints=" + idle);
+                problems++;
+            }
+            if (during > 2000)
+            {
+                lines.Add("COMBO FLICKER HEAVY " + name + " paints=" + during);
+                problems++;
+            }
+            return problems;
+        }
+
+        static Point FlickerPoint(int step, Rectangle formR, Rectangle boxR)
+        {
+            int phase = step % 12;
+            if (phase < 4)
+            {
+                int t = phase;
+                return new Point(boxR.X + (t * Math.Max(1, boxR.Width - 1) / 3), boxR.Y + boxR.Height / 2);
+            }
+            if (phase < 8)
+            {
+                int t = phase - 4;
+                int pad = 16;
+                if (t == 0) return new Point(boxR.X - pad, boxR.Y - pad);
+                if (t == 1) return new Point(boxR.Right + pad, boxR.Y - pad);
+                if (t == 2) return new Point(boxR.Right + pad, boxR.Bottom + pad);
+                return new Point(boxR.X - pad, boxR.Bottom + pad);
+            }
+            int k = phase - 8;
+            if (k == 0) return new Point(formR.X + 8, formR.Y + 8);
+            if (k == 1) return new Point(formR.Right - 8, formR.Y + 8);
+            if (k == 2) return new Point(formR.Right - 8, formR.Bottom - 8);
+            return new Point(formR.X + formR.Width / 2, formR.Y + formR.Height / 2);
         }
 
         static int CheckAboutPlacement(IPbind.MainForm main, List<string> lines)
