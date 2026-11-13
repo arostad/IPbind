@@ -369,6 +369,19 @@ namespace IPbindTest
                 lines.Add("launchCheckBox visible=" + lc.Visible + " checked=" + lc.Checked + " bounds=" + lc.Bounds
                     + " label='" + cap.Text + "' " + cap.Bounds + " text=" + lt + " fits=" + lcFits);
                 if (!lcFits) lines.Add("LAUNCH CHECKBOX CLIPPED OR HIDDEN");
+                Label priv = (Label)typeof(IPbind.AboutForm).GetField("privacyLabel", F).GetValue(f);
+                string[] privLines = (priv.Text ?? "").Replace("\r\n", "\n").Split('\n');
+                lines.Add("privacy lines=" + privLines.Length + " text=" + (priv.Text ?? "").Replace("\r\n", " | ") + " bounds=" + priv.Bounds);
+                if (privLines.Length != 2
+                    || privLines[0] != "Each update check sends one anonymous request to the IPbind update server."
+                    || privLines[1] != "It counts only the country the request came from, for usage stats. No identifiers or cookies.")
+                    lines.Add("PRIVACY WORDING");
+                foreach (string line in privLines)
+                {
+                    Size lw = TextRenderer.MeasureText(line, priv.Font, new Size(int.MaxValue, int.MaxValue),
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                    if (lw.Width > priv.Width + 2) lines.Add("PRIVACY WRAPPED OR CLIPPED '" + line + "' need=" + lw.Width + " have=" + priv.Width);
+                }
                 CheckCheckBoxPaint(f, png, png.Replace(".png", "-check"), lines, scale);
                 Rectangle client = ClientRectScreen(f.Handle);
                 lines.Add("window " + WinRect(f.Handle).Size + " client " + client.Size + " layout " + f.LayoutClientSize);
@@ -377,7 +390,8 @@ namespace IPbindTest
                 foreach (string line in lines)
                     if ((line.StartsWith("PROBLEMS=") && line != "PROBLEMS=0") || line.IndexOf("HEADER NOT ONE LINE") >= 0
                         || line.IndexOf("CREDIT NOT STACKED") >= 0 || line.IndexOf("CLIENT MISMATCH") >= 0
-                        || line.IndexOf("LINK STYLE MISMATCH") >= 0 || line.IndexOf("LAUNCH CHECKBOX") >= 0) rc = 1;
+                        || line.IndexOf("LINK STYLE MISMATCH") >= 0 || line.IndexOf("LAUNCH CHECKBOX") >= 0
+                        || line.IndexOf("PRIVACY WORDING") >= 0 || line.IndexOf("PRIVACY WRAPPED OR CLIPPED") >= 0) rc = 1;
                 f.Close(); owner.Close();
             };
             f.Shown += delegate { f.Activate(); t.Start(); };
