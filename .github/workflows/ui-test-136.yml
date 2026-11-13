@@ -27,6 +27,9 @@ jobs:
           & $csc @cargs IPbind.cs Version.cs .github\test\UiShot.cs .github\test\ScaleControl.cs
           if ($LASTEXITCODE -ne 0) { throw 'uishot compile failed' }
           New-Item -ItemType Directory -Force shots | Out-Null
+      - name: Adapter display and Apply-safety unit tests
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\.github\test\run-apply-safety-tests.ps1
       - name: Static About and popup shots
         shell: pwsh
         run: |
