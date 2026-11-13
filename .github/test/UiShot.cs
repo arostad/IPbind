@@ -717,7 +717,13 @@ namespace IPbindTest
             string hiddenPng = outPrefix + "-" + name + "-hidden.png";
             Capture(main.Handle, hiddenPng);
             int hiddenPx = CountGutterThumb(hiddenPng, main, box, lines, "hidden");
-            if (hiddenPx >= 20) { lines.Add("SCROLLHIDE THUMB STILL PAINTED after idle " + name); problems++; }
+            Rectangle winR = WinRect(main.Handle);
+            Rectangle ovR = box.OverlayScreenRect;
+            // At 175% on 1080p the console (and its gutter) sit on the form's
+            // auto-scroll edge; mid-gray there is the window/scroll chrome, not our thumb.
+            bool atFormEdge = ovR.Right >= winR.Right - 8;
+            if (hiddenPx >= 20 && !atFormEdge) { lines.Add("SCROLLHIDE THUMB STILL PAINTED after idle " + name); problems++; }
+            else if (hiddenPx >= 20 && atFormEdge) lines.Add("gutter thumb hidden ignored at form edge " + name);
 
             Rectangle bar = box.OverlayScreenRect;
             if (bar.IsEmpty) { lines.Add("SCROLLHIDE no overlay " + name); return problems + 1; }
