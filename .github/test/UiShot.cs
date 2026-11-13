@@ -619,8 +619,10 @@ namespace IPbindTest
             return new Point(formR.X + formR.Width / 2, formR.Y + formR.Height / 2);
         }
 
-        static int CheckUncheckedBoxes(Form form, string png, List<string> lines, bool dark)
+        static int CheckUncheckedBoxes(Form form, string png, List<string> lines)
         {
+            System.Reflection.FieldInfo darkField = form.GetType().GetField("dark", F);
+            bool dark = darkField != null && (bool)darkField.GetValue(form);
             if (!dark) return 0;
             if (!File.Exists(png)) { lines.Add("UNCHECKED BOX missing shot " + png); return 1; }
             int bad = 0;
