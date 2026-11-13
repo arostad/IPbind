@@ -738,14 +738,20 @@ namespace IPbindTest
             {
                 try { Cursor.Position = away; } catch { }
                 Pump(400);
+                box.ScrollToFirst(Math.Max(1, box.MaxFirstLine() / 3));
+                Pump(200);
+                int keyBefore = box.FirstVisibleLine();
                 box.Focus(); Pump(200);
                 SendKeys.SendWait("{PGDN}");
                 Pump(400);
-                lines.Add(name + " after pgdn shown=" + box.BarShown + " first=" + box.FirstVisibleLine());
+                lines.Add(name + " after pgdn shown=" + box.BarShown + " first=" + box.FirstVisibleLine() + " (was " + keyBefore + ")");
                 if (!box.BarShown) { lines.Add("SCROLLHIDE KEYBOARD DID NOT SHOW " + name); problems++; }
+                if (box.FirstVisibleLine() == keyBefore) { lines.Add("SCROLLHIDE KEYBOARD DID NOT MOVE " + name); problems++; }
 
                 try { Cursor.Position = onBar; } catch { }
-                Pump(800);
+                Pump(400);
+                box.ScrollToFirst(Math.Max(1, box.MaxFirstLine() / 3));
+                Pump(400);
                 Rectangle thumb = box.ThumbScreenRect;
                 lines.Add(name + " thumb=" + thumb);
                 if (!thumb.IsEmpty)
