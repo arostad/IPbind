@@ -1,7 +1,7 @@
-name: ui test 137
+name: ui test 138
 on:
   push:
-    branches: [test-ui-137]
+    branches: [test-ui-138]
 permissions:
   contents: read
 jobs:
@@ -86,7 +86,7 @@ jobs:
             Start-Sleep -Seconds 2
             foreach ($theme in @('light','dark')) {
               Set-ItemProperty $pers AppsUseLightTheme $(if ($theme -eq 'light') { 1 } else { 0 }) -Type DWord
-              $t = "main-137-$pct-$theme"
+              $t = "main-138-$pct-$theme"
               $p = Start-Process .\uishot.exe -ArgumentList @('main',"$PWD\shots\$t.png","$PWD\shots\$t.txt") -PassThru -Wait
               if ($p.ExitCode -ne 0) { $fails++; Write-Host "::warning::$t exit $($p.ExitCode)" }
             }
@@ -97,7 +97,7 @@ jobs:
           $unexpected = 0
           foreach ($pct in @('100','150')) {
             foreach ($theme in @('light','dark')) {
-              $t = "shots/main-137-$pct-$theme.txt"
+              $t = "shots/main-138-$pct-$theme.txt"
               if (Test-Path $t) {
                 $m = Select-String -Path $t -Pattern 'MAIN_PROBLEMS=([1-9])'
                 if ($m) { $unexpected++ }
@@ -151,6 +151,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ui-shots-137
+          name: ui-shots-138
           path: shots/
           retention-days: 1

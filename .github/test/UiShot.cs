@@ -325,6 +325,7 @@ namespace IPbindTest
                 if (client.Size != layout) lines.Add("CLIENT MISMATCH");
                 // checked state shot
                 CheckCheckBoxPaint(f, png, png.Replace(".png", "-check"), lines, scale);
+                CheckUncheckedBoxes(f, png, lines);
                 CheckBox box = (CheckBox)typeof(IPbind.DhcpReminderForm).GetField("understandBox", F).GetValue(f);
                 box.Checked = true; Pump(300);
                 string ack = png.Replace(".png", "-ack.png");
@@ -431,6 +432,9 @@ namespace IPbindTest
                 problems += CheckAlign(main, png, lines);
                 problems += CheckAboutPlacement(main, lines);
                 problems += CheckComboChrome(main, png, lines);
+                problems += CheckUncheckedBoxes(main, png, lines);
+                bool darkMain = (bool)typeof(IPbind.MainForm).GetField("dark", F).GetValue(main);
+                problems += CheckUncheckedBoxes(main, png, lines);
                 // overlaps between visible siblings (ignore labels inside the update banner)
                 List<Control> vis = new List<Control>();
                 foreach (Control c in main.Controls) if (c.Visible) vis.Add(c);
@@ -613,6 +617,40 @@ namespace IPbindTest
             if (k == 1) return new Point(formR.Right - 8, formR.Y + 8);
             if (k == 2) return new Point(formR.Right - 8, formR.Bottom - 8);
             return new Point(formR.X + formR.Width / 2, formR.Y + formR.Height / 2);
+        }
+
+        static int CheckUncheckedBoxes(Form form, string png, List<string> lines, bool dark)
+        {
+            if (!dark) return 0;
+            if (!File.Exists(png)) { lines.Add("UNCHECKED BOX missing shot " + png); return 1; }
+            int bad = 0;
+            using (Bitmap b = new Bitmap(png))
+            {
+                Rectangle win = WinRect(form.Handle);
+                string[] fields = new string[] { "chkAll", "chkGateway", "understandBox", "dontShowBox", "launchCheckBox" };
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    System.Reflection.FieldInfo fi = form.GetType().GetField(fields[i], F);
+                    if (fi == null) continue;
+                    CheckBox box = fi.GetValue(form) as CheckBox;
+                    if (box == null || !box.Visible) continue;
+                    if (box.Checked) continue;
+                    Rectangle scr = box.RectangleToScreen(box.ClientRectangle);
+                    int glyph = Math.Min(scr.Height, Math.Max(12, scr.Height - 2));
+                    Rectangle area = new Rectangle(
+                        scr.X - win.X,
+                        scr.Y - win.Y + Math.Max(0, (scr.Height - glyph) / 2),
+                        glyph, glyph);
+                    int white = CountNearWhite(b, area);
+                    lines.Add("unchecked box " + fields[i] + " whitePct=" + white + " area=" + area);
+                    if (white >= 25)
+                    {
+                        lines.Add("UNCHECKED BOX BRIGHT WHITE " + fields[i] + " whitePct=" + white);
+                        bad++;
+                    }
+                }
+            }
+            return bad;
         }
 
         static int CheckAboutPlacement(IPbind.MainForm main, List<string> lines)
