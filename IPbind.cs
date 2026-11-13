@@ -1013,6 +1013,32 @@ namespace IPbind
             if (y < work.Top) y = work.Top;
             return new Rectangle(x, y, window.Width, window.Height);
         }
+
+        // Use around paint, layout, and WndProc so a PMv2 dialog inside a
+        // system-aware process is not coordinate-virtualized to the system DPI.
+        public static IntPtr EnterContext(IntPtr hwnd)
+        {
+            return hwnd == IntPtr.Zero ? IntPtr.Zero : Enter(hwnd);
+        }
+
+        public static void LeaveContext(IntPtr previous)
+        {
+            Leave(previous);
+        }
+
+        public static Size ClientPixelSize(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return Size.Empty;
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (GetClientRect(hwnd, out r)) return new Size(r.Right - r.Left, r.Bottom - r.Top);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Size.Empty;
+        }
     }
 
     // Base for the About and setup-reminder dialogs. The handle is created Per-Monitor
@@ -1195,6 +1221,16 @@ namespace IPbind
 
         protected override void WndProc(ref Message m)
         {
+            IntPtr prev = IsHandleCreated ? DpiWindow.EnterContext(Handle) : IntPtr.Zero;
+            try
+            {
+                WndProcCore(ref m);
+            }
+            finally { DpiWindow.LeaveContext(prev); }
+        }
+
+        void WndProcCore(ref Message m)
+        {
             if (m.Msg == WM_DPICHANGED)
             {
                 int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
@@ -1347,6 +1383,146 @@ namespace IPbind
         }
     }
 
+    // 20 CSS-px checkbox for Per-Monitor V2 dialogs (About and the DHCP reminder).
+    // The themed WinForms glyph is sized at the process (system) DPI, so on a PMv2
+    // dialog it looks right on the system-DPI monitor and blows out or shrinks after
+    // a drag to a monitor at a different scale (Andy, 2.3.135, About on a 100%
+    // secondary). This control paints the box and check from the HWND's current
+    // pixel size so a stale scale cannot overflow the square.
+    sealed class RoundCheckBox : CheckBox
+    {
+        public const int DesignBox = 20;
+        public const int DesignRing = 3;
+        public const int DesignSide = DesignBox + 2 * DesignRing;
+
+        public Color Surface = Color.Black, BoxFill = Color.White, BoxBorder = Color.Gray;
+        public Color CheckedFill = Color.DodgerBlue, CheckMark = Color.Black, FocusColor = Color.White;
+
+        public static int RingFor(float scale) { return Math.Max(2, (int)Math.Round(DesignRing * scale)); }
+
+        public static int SideFor(float scale)
+        {
+            return Math.Max(1, (int)Math.Round(DesignBox * scale)) + 2 * RingFor(scale);
+        }
+
+        public RoundCheckBox()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            AutoSize = false;
+            UseMnemonic = false;
+            UseCompatibleTextRendering = false;
+            Text = "";
+            Cursor = Cursors.Hand;
+        }
+
+        public void ApplyDialogColors(Color surface, Color fore, Color checkedFill, Color checkMark, bool dark)
+        {
+            Surface = surface;
+            BoxFill = Color.White;
+            BoxBorder = dark ? Color.FromArgb(0x76, 0x76, 0x76) : Color.FromArgb(0x5A, 0x5A, 0x5A);
+            CheckedFill = checkedFill;
+            CheckMark = checkMark;
+            FocusColor = fore;
+            Invalidate();
+        }
+
+        protected override void OnCheckedChanged(EventArgs e)
+        {
+            base.OnCheckedChanged(e);
+            Invalidate();
+        }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            int width = Width, height = Height;
+            IntPtr prev = IntPtr.Zero;
+            if (IsHandleCreated)
+            {
+                prev = DpiWindow.EnterContext(Handle);
+                Size px = DpiWindow.ClientPixelSize(Handle);
+                if (px.Width > 0) width = px.Width;
+                if (px.Height > 0) height = px.Height;
+            }
+            try
+            {
+                PaintBox(e.Graphics, width, height);
+            }
+            finally { DpiWindow.LeaveContext(prev); }
+        }
+
+        void PaintBox(Graphics g, int width, int height)
+        {
+            g.ResetTransform();
+            g.PageUnit = GraphicsUnit.Pixel;
+            g.Clear(Surface);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            int side = Math.Min(width, height);
+            if (side < 8) return;
+            // Geometry comes from the pixels we are painting into, not a remembered DPI.
+            float paintScale = side / (float)DesignSide;
+            int ring = Math.Max(2, (int)Math.Round(DesignRing * paintScale));
+            int boxSide = Math.Max(4, side - 2 * ring - 1);
+            Rectangle box = new Rectangle((width - boxSide) / 2, (height - boxSide) / 2, boxSide, boxSide);
+            int rad = Math.Max(2, (int)Math.Round(3 * paintScale));
+            using (GraphicsPath path = RoundedBox(box, rad))
+            {
+                if (Checked)
+                {
+                    using (SolidBrush fill = new SolidBrush(CheckedFill)) g.FillPath(fill, path);
+                    float w = box.Width, h = box.Height;
+                    PointF[] mark = new PointF[]
+                    {
+                        new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
+                        new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
+                        new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
+                    };
+                    using (Pen pen = new Pen(CheckMark, Math.Max(1.6f, boxSide * 2f / DesignBox)))
+                    {
+                        pen.StartCap = LineCap.Round;
+                        pen.EndCap = LineCap.Round;
+                        pen.LineJoin = LineJoin.Round;
+                        g.DrawLines(pen, mark);
+                    }
+                }
+                else
+                {
+                    using (SolidBrush fill = new SolidBrush(BoxFill)) g.FillPath(fill, path);
+                    using (Pen pen = new Pen(BoxBorder, Math.Max(1f, paintScale)))
+                        g.DrawPath(pen, path);
+                }
+            }
+            if (Focused && ShowFocusCues)
+            {
+                Rectangle outer = new Rectangle(0, 0, width - 1, height - 1);
+                using (GraphicsPath focus = RoundedBox(outer, rad + ring))
+                using (Pen pen = new Pen(FocusColor, Math.Max(1f, paintScale)))
+                    g.DrawPath(pen, focus);
+            }
+        }
+
+        static GraphicsPath RoundedBox(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
     sealed class AboutForm : PerMonitorDialog
     {
         readonly bool dark;
@@ -1365,7 +1541,8 @@ namespace IPbind
         readonly LinkLabel creditLink;
         readonly LinkLabel sourceLink;
         readonly LinkLabel licenseLink;
-        readonly CheckBox launchCheckBox;
+        readonly RoundCheckBox launchCheckBox;
+        readonly Label launchCheckLabel;
         readonly Label statusLabel;
         readonly Label privacyLabel;
         readonly Panel footer;
@@ -1454,14 +1631,19 @@ namespace IPbind
             licenseLink = MakeLink("Released under the MIT License", "MIT License",
                 "https://github.com/arostad/IPbind/blob/main/LICENSE");
 
-            launchCheckBox = new CheckBox();
-            launchCheckBox.Text = "Check for updates at launch (recommended)";
+            launchCheckBox = new RoundCheckBox();
             launchCheckBox.UseMnemonic = false;
             launchCheckBox.AutoSize = false;
             launchCheckBox.Checked = launchEnabled;
             // Shown in installed and portable copies alike, whatever was picked at install.
             launchCheckBox.Visible = true;
             launchCheckBox.CheckedChanged += LaunchCheckChanged;
+            launchCheckLabel = MakeLabel();
+            launchCheckLabel.Text = "Check for updates at launch (recommended)";
+            launchCheckLabel.UseMnemonic = false;
+            launchCheckLabel.Cursor = Cursors.Hand;
+            launchCheckLabel.Click += delegate { launchCheckBox.Checked = !launchCheckBox.Checked; };
+            launchCheckBox.AccessibleName = launchCheckLabel.Text;
 
             statusLabel = MakeLabel();
             statusLabel.Text = "";
@@ -1504,6 +1686,7 @@ namespace IPbind
             Controls.Add(creditLink);
             Controls.Add(licenseLink);
             Controls.Add(launchCheckBox);
+            Controls.Add(launchCheckLabel);
             Controls.Add(statusLabel);
             Controls.Add(privacyLabel);
             Controls.Add(footer);
@@ -1604,6 +1787,24 @@ namespace IPbind
             return MeasureLine(text, font).Width + U(16);
         }
 
+        // Glyph centered on the first line of the label, same pattern as the
+        // DHCP reminder. The caption lives on a Label so it uses the same GDI
+        // TextRenderer as the rest of About (and stays clickable).
+        int LayoutLaunchCheck(int x, int y, int textW, int chkBox, Size textNeed)
+        {
+            int firstH = MeasureLine(launchCheckLabel.Text ?? "Ag", launchCheckLabel.Font).Height;
+            int rowH = Math.Max(chkBox, textNeed.Height + U(6));
+            launchCheckLabel.Location = new Point(x + chkBox + U(12), y);
+            launchCheckLabel.Size = new Size(textW, rowH);
+            int boxY = y + (firstH - chkBox) / 2;
+            int ring = RoundCheckBox.RingFor(sc);
+            launchCheckBox.Size = new Size(chkBox + 2 * ring, chkBox + 2 * ring);
+            launchCheckBox.Location = new Point(x - ring, boxY - ring);
+            launchCheckBox.Visible = true;
+            launchCheckLabel.Visible = true;
+            return rowH;
+        }
+
         protected override void LayoutContent()
         {
             if (layingOut) return;
@@ -1635,6 +1836,12 @@ namespace IPbind
                 launchCheckBox.Font = fontBody;
                 launchCheckBox.ForeColor = fore;
                 launchCheckBox.BackColor = bodyBack;
+                launchCheckBox.Text = "";
+                launchCheckBox.ApplyDialogColors(bodyBack, fore, primaryBack, primaryFore, dark);
+                launchCheckLabel.Font = fontBody;
+                launchCheckLabel.ForeColor = fore;
+                launchCheckLabel.BackColor = Color.Transparent;
+                launchCheckBox.AccessibleName = launchCheckLabel.Text;
                 statusLabel.Font = fontStatus; statusLabel.ForeColor = quiet;
                 privacyLabel.Font = fontPrivacy; privacyLabel.ForeColor = quiet;
                 checkButton.Font = fontButton;
@@ -1738,14 +1945,9 @@ namespace IPbind
                 y = licenseLink.Bottom;
 
                 y += U(16);
-                Size boxNeed = MeasureWrap(launchCheckBox.Text, fontBody, inner - U(24));
-                int boxH = Math.Max(U(20), boxNeed.Height);
-                launchCheckBox.Location = new Point(padX, y);
-                launchCheckBox.Size = new Size(inner, boxH);
-                launchCheckBox.CheckAlign = ContentAlignment.MiddleLeft;
-                launchCheckBox.TextAlign = ContentAlignment.MiddleLeft;
-                launchCheckBox.Visible = true;
-                y = launchCheckBox.Bottom;
+                int chkBox = U(20);
+                Size boxNeed = MeasureWrap(launchCheckLabel.Text, fontBody, inner - chkBox - U(12));
+                y += LayoutLaunchCheck(padX, y, inner - chkBox - U(12), chkBox, boxNeed);
                 if (!string.IsNullOrEmpty(statusLabel.Text))
                 {
                     y += U(16);
@@ -2798,92 +3000,7 @@ namespace IPbind
         {
             RoundCheckBox round = box as RoundCheckBox;
             if (round == null) return;
-            round.Surface = footerBack;
-            round.BoxFill = Color.White;
-            round.BoxBorder = dark ? Color.FromArgb(0x76, 0x76, 0x76) : Color.FromArgb(0x5A, 0x5A, 0x5A);
-            round.CheckedFill = primaryBack;
-            round.CheckMark = primaryFore;
-            round.FocusColor = fore;
-            round.DrawScale = sc;
-            round.Invalidate();
-        }
-
-        // The mockup's checkbox: a 20px rounded white square (accent fill and a
-        // check mark when ticked), drawn at the dialog's own scale. The themed
-        // WinForms glyph stays 13px at the system DPI, so it looked tiny at 150%.
-        // Still a real CheckBox: keyboard, Space, focus and accessibility as usual.
-        sealed class RoundCheckBox : CheckBox
-        {
-            public Color Surface = Color.Black, BoxFill = Color.White, BoxBorder = Color.Gray;
-            public Color CheckedFill = Color.DodgerBlue, CheckMark = Color.Black, FocusColor = Color.White;
-            public float DrawScale = 1f;
-
-            public static int RingFor(float scale) { return Math.Max(2, (int)Math.Round(3 * scale)); }
-
-            public RoundCheckBox()
-            {
-                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
-                    ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-                AutoSize = false;
-                UseMnemonic = false;
-                Text = "";
-                Cursor = Cursors.Hand;
-            }
-
-            protected override void OnCheckedChanged(EventArgs e)
-            {
-                base.OnCheckedChanged(e);
-                Invalidate();
-            }
-
-            protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
-            protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                Graphics g = e.Graphics;
-                g.Clear(Surface);
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                int ring = RingFor(DrawScale);
-                Rectangle box = new Rectangle(ring, ring, Width - 2 * ring - 1, Height - 2 * ring - 1);
-                if (box.Width < 4 || box.Height < 4) return;
-                int rad = Math.Max(2, (int)Math.Round(3 * DrawScale));
-                using (GraphicsPath path = RoundedRect(box, rad))
-                {
-                    if (Checked)
-                    {
-                        using (SolidBrush fill = new SolidBrush(CheckedFill)) g.FillPath(fill, path);
-                        float w = box.Width, h = box.Height;
-                        PointF[] mark = new PointF[]
-                        {
-                            new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
-                            new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
-                            new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
-                        };
-                        using (Pen pen = new Pen(CheckMark, Math.Max(1.6f, 2f * DrawScale)))
-                        {
-                            pen.StartCap = LineCap.Round;
-                            pen.EndCap = LineCap.Round;
-                            pen.LineJoin = LineJoin.Round;
-                            g.DrawLines(pen, mark);
-                        }
-                    }
-                    else
-                    {
-                        using (SolidBrush fill = new SolidBrush(BoxFill)) g.FillPath(fill, path);
-                        using (Pen pen = new Pen(BoxBorder, Math.Max(1f, (float)Math.Round(DrawScale))))
-                            g.DrawPath(pen, path);
-                    }
-                }
-                if (Focused && ShowFocusCues)
-                {
-                    Rectangle outer = new Rectangle(0, 0, Width - 1, Height - 1);
-                    using (GraphicsPath focus = RoundedRect(outer, rad + ring))
-                    using (Pen pen = new Pen(FocusColor, Math.Max(1f, (float)Math.Round(DrawScale))))
-                        g.DrawPath(pen, focus);
-                }
-            }
+            round.ApplyDialogColors(footerBack, fore, primaryBack, primaryFore, dark);
         }
 
         // Non-interactive picture of the real Return to DHCP button: same caption,
