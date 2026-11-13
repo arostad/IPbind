@@ -65,12 +65,20 @@ function All($win) { $win.FindAll($TS::Descendants, [System.Windows.Automation.C
 function OfKind($win, [string]$kind) {
   @(All $win | Where-Object { $_.Current.ControlType.ProgrammaticName -eq "ControlType.$kind" -or $_.Current.ClassName -eq "TNew$kind" })
 }
+function Named($win, [string]$name) {
+  foreach ($el in (All $win)) {
+    $n = ([string]$el.Current.Name).Replace('&', '').Trim()
+    if ($n -eq $name -or $n -eq ($name -replace ' >$', '') -or $n -like $name) { return $el }
+  }
+  return $null
+}
 function Btn($win, [string]$name) {
+  $el = $null
   foreach ($b in (OfKind $win 'Button')) {
     $n = ([string]$b.Current.Name).Replace('&', '').Trim()
     if ($n -eq $name -or $n -eq ($name -replace ' >$', '')) { return $b }
   }
-  return $null
+  return Named $win $name
 }
 function Click($el) {
   if (-not $el) { L 'click: no element'; return $false }
@@ -110,22 +118,40 @@ function Scale([int]$pct) {
   Start-Sleep 2
 }
 function ClearReminder { if (Test-Path $Data) { Remove-Item -Force -ea SilentlyContinue (Join-Path $Data 'dhcp-reminder-dismissed.txt') } }
+function FindReminder([int]$sec = 15) {
+  $end = (Get-Date).AddSeconds($sec)
+  while ((Get-Date) -lt $end) {
+    foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+      $n = [string]$w.Current.Name
+      # The reminder's title is "IPbind Beta" (no version). Prefer a window
+      # that has Continue; fall back to the exact title.
+      if ($n -eq 'IPbind Beta' -or $n -eq 'IPbind Beta ') {
+        $cont = Named $w 'Continue'
+        $txt = Texts $w
+        if ($cont -or $txt -like '*Return to DHCP before*' -or $txt -like '*I understand*' -or $txt -like "*I'll click Return*") {
+          return $w
+        }
+      }
+    }
+    Start-Sleep -Milliseconds 300
+  }
+  return $null
+}
 function DismissReminder([string]$shotName) {
-  Start-Sleep 2
-  $rem = $null
-  foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
-    if ($w.Current.Name -eq 'IPbind Beta' -and (Checks $w).Count -ge 2 -and (Btn $w 'Continue')) { $rem = $w }
+  $rem = FindReminder 20
+  if (-not $rem) { L 'WARN reminder not found'; return $false }
+  if ($shotName) { Shot $rem $shotName; L "popup texts: $(Texts $rem)" }
+  $ack = Named $rem "I'll click Return to DHCP before I plug into a live network"
+  if (-not $ack) { $ack = Named $rem 'I understand*'; if (-not $ack) { $checks = Checks $rem; if ($checks.Count -ge 1) { $ack = $checks[0] } } }
+  if ($ack) { Click $ack | Out-Null; Start-Sleep -Milliseconds 400 }
+  $cont = Named $rem 'Continue'
+  if ($cont) { Click $cont | Out-Null } else { Fail 'Continue not found on reminder'; return $false }
+  $gone = (Get-Date).AddSeconds(8)
+  while ((Get-Date) -lt $gone) {
+    if (-not (FindReminder 1)) { Start-Sleep -Milliseconds 400; return $true }
+    Start-Sleep -Milliseconds 200
   }
-  if (-not $rem) { $rem = FindWin 'IPbind Beta' 8 }
-  if ($rem -and (Btn $rem 'Continue')) {
-    if ($shotName) { Shot $rem $shotName; L "popup texts: $(Texts $rem)" }
-    $c = Checks $rem
-    if ($c.Count -ge 1) { Click $c[0] | Out-Null; Start-Sleep -Milliseconds 400 }
-    Click (Btn $rem 'Continue') | Out-Null
-    Start-Sleep 1
-    return $true
-  }
-  L 'WARN reminder not found'
+  L 'WARN reminder still open after Continue'
   return $false
 }
 function LaunchAndGetMain([string]$popupShot) {
@@ -278,14 +304,20 @@ if ((DisplayVer) -ne '2.3.135') { Fail "pre-update DisplayVersion was $(DisplayV
 ClearReminder
 $main = LaunchAndGetMain 'popup-135-for-update'
 if ($main) {
+  # Re-acquire main after the modal reminder has closed so the update
+  # banner (which is posted once the UI thread is free) can appear.
+  $main = FindWin 'IPbind Beta v*' 10 -Like
   Shot $main 'main-135-waiting-for-banner'
-  $deadline = (Get-Date).AddSeconds(45)
+  $deadline = (Get-Date).AddSeconds(60)
   $updateBtn = $null
   while ((Get-Date) -lt $deadline -and -not $updateBtn) {
     Start-Sleep 2
+    $main = FindWin 'IPbind Beta v*' 3 -Like
+    if (-not $main) { continue }
     $updateBtn = Btn $main 'Update'
     $txt = Texts $main
     if ($txt -like '*available*') { L "banner texts: $txt" }
+    else { L "update wait: no banner yet" }
   }
   if (-not $updateBtn) { Fail 'update banner/Update button did not appear on 2.3.135'; Shot $main 'main-135-no-banner' }
   else {
