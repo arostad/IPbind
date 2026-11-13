@@ -276,7 +276,7 @@ function FlickerMove($main, $boxes, [string]$tag) {
       $step++
       Start-Sleep -Milliseconds 30
     }
-    L "flicker $tag $name: 10s mouse move done"
+    L "flicker $tag ${name}: 10s mouse move done"
     Shot $main "$tag-flicker-$name-after"
   }
 }
