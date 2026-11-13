@@ -2567,7 +2567,7 @@ namespace IPbind
 
             string[] heads = new string[]
             {
-                "Your laptop will likely not have internet",
+                "Your laptop may not have internet",
                 "You could knock an existing device offline",
                 "You could set off security alerts"
             };
