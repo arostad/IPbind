@@ -8,6 +8,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -77,6 +78,7 @@ namespace IPbindTest
             if (kind == "tallshot") return TallShot(args[1], args[2]);
             if (kind == "aboutcheck") return AboutCheck(args[1], args[2]);
             if (kind == "comboflicker") return ComboFlicker(args[1], args[2]);
+            if (kind == "scrollhide") return ScrollHide(args[1], args[2]);
             return 2;
         }
 
@@ -616,6 +618,172 @@ namespace IPbindTest
             if (k == 2) return new Point(formR.Right - 8, formR.Bottom - 8);
             return new Point(formR.X + formR.Width / 2, formR.Y + formR.Height / 2);
         }
+
+
+        static int ScrollHide(string outPrefix, string report)
+        {
+            List<string> lines = new List<string>();
+            int problems = 0;
+            IPbind.MainForm main = new IPbind.MainForm();
+            main.Show(); Pump(2000);
+            IPbind.AutoHideScrollBox console = typeof(IPbind.MainForm).GetField("console", F).GetValue(main) as IPbind.AutoHideScrollBox;
+            IPbind.AutoHideScrollBox ips = typeof(IPbind.MainForm).GetField("txtIPs", F).GetValue(main) as IPbind.AutoHideScrollBox;
+            if (console == null || ips == null)
+            {
+                lines.Add("SCROLLHIDE missing AutoHideScrollBox fields");
+                File.WriteAllLines(report, lines.ToArray());
+                main.Close();
+                return 1;
+            }
+            MethodInfo log = typeof(IPbind.MainForm).GetMethod("Log", F, null, new Type[] { typeof(string), typeof(string) }, null);
+            if (log == null) log = typeof(IPbind.MainForm).GetMethod("Log", F);
+            for (int i = 0; i < 80; i++)
+            {
+                if (log != null) log.Invoke(main, new object[] { "scroll test line " + i + " " + new string('x', 40), "INFO" });
+            }
+            StringBuilder ipText = new StringBuilder();
+            for (int i = 0; i < 40; i++) ipText.AppendLine("10.10." + (i % 250) + ".98/24");
+            ips.Text = ipText.ToString();
+            Pump(500);
+            lines.Add("console lines=" + console.LineCount() + " vis=" + console.VisibleLineCount() + " maxFirst=" + console.MaxFirstLine() + " gutter=" + console.GutterWidth);
+            lines.Add("ips lines=" + ips.LineCount() + " vis=" + ips.VisibleLineCount() + " maxFirst=" + ips.MaxFirstLine() + " gutter=" + ips.GutterWidth);
+            if (console.MaxFirstLine() <= 0) { lines.Add("SCROLLHIDE console does not overflow"); problems++; }
+            if (ips.MaxFirstLine() <= 0) { lines.Add("SCROLLHIDE ips does not overflow"); problems++; }
+            problems += CheckGutter(console, "console", lines);
+            problems += CheckGutter(ips, "ips", lines);
+
+            Rectangle formR = main.RectangleToScreen(main.ClientRectangle);
+            Point away = new Point(formR.X + 8, formR.Y + 8);
+            problems += ScrollHideOne(main, console, "console", away, outPrefix, lines, log, true);
+            problems += ScrollHideOne(main, ips, "ips", away, outPrefix, lines, null, false);
+
+            lines.Add("SCROLLHIDE_PROBLEMS=" + problems);
+            File.WriteAllLines(report, lines.ToArray());
+            main.Close();
+            return problems == 0 ? 0 : 1;
+        }
+
+        static int CheckGutter(IPbind.AutoHideScrollBox box, string name, List<string> lines)
+        {
+            RECT r = new RECT();
+            SendMessageRect(box.Handle, 0x00B2, IntPtr.Zero, ref r);
+            int right = r.Right;
+            int client = box.ClientSize.Width;
+            int gutter = box.GutterWidth;
+            lines.Add("gutter " + name + " formatRight=" + right + " clientW=" + client + " gutter=" + gutter);
+            if (right > client - gutter + 2)
+            {
+                lines.Add("SCROLLHIDE GUTTER TOO SMALL " + name);
+                return 1;
+            }
+            return 0;
+        }
+
+        static int ScrollHideOne(IPbind.MainForm main, IPbind.AutoHideScrollBox box, string name,
+            Point away, string outPrefix, List<string> lines, MethodInfo log, bool full)
+        {
+            int problems = 0;
+            if (box.MaxFirstLine() <= 0) return 0;
+            try { Cursor.Position = away; } catch { }
+            Pump(5800);
+            lines.Add(name + " after 5.8s away shown=" + box.BarShown + " pointer=" + box.State.PointerOver);
+            if (box.BarShown) { lines.Add("SCROLLHIDE STILL SHOWN after idle " + name); problems++; }
+            Capture(main.Handle, outPrefix + "-" + name + "-hidden.png");
+
+            Rectangle bar = box.OverlayScreenRect;
+            if (bar.IsEmpty) { lines.Add("SCROLLHIDE no overlay " + name); return problems + 1; }
+            Point onBar = new Point(bar.X + Math.Max(1, bar.Width / 2), bar.Y + bar.Height / 2);
+            try { Cursor.Position = onBar; } catch { }
+            Pump(800);
+            lines.Add(name + " on bar shown=" + box.BarShown + " rect=" + bar);
+            if (!box.BarShown) { lines.Add("SCROLLHIDE NOT SHOWN on hover " + name); problems++; }
+            Capture(main.Handle, outPrefix + "-" + name + "-hover.png");
+
+            // Cursor parked on the bar: must stay visible past 5s.
+            Pump(6000);
+            lines.Add(name + " parked 6s shown=" + box.BarShown);
+            if (!box.BarShown) { lines.Add("SCROLLHIDE HID UNDER CURSOR " + name); problems++; }
+
+            if (log != null)
+            {
+                for (int i = 0; i < 8; i++) log.Invoke(main, new object[] { "append while hovered " + i, "INFO" });
+                Pump(400);
+                lines.Add(name + " append hovered shown=" + box.BarShown);
+                if (!box.BarShown) { lines.Add("SCROLLHIDE HID ON HOVERED APPEND " + name); problems++; }
+            }
+
+            try { Cursor.Position = away; } catch { }
+            Pump(400);
+            if (log != null)
+            {
+                for (int i = 0; i < 8; i++) log.Invoke(main, new object[] { "append while away " + i, "INFO" });
+            }
+            Pump(5800);
+            lines.Add(name + " after append-away shown=" + box.BarShown);
+            if (box.BarShown) { lines.Add("SCROLLHIDE APPEND RESET TIMER " + name); problems++; }
+            Capture(main.Handle, outPrefix + "-" + name + "-after-append-away.png");
+
+            // Wheel over the area should show the bar.
+            Rectangle area = box.RectangleToScreen(box.ClientRectangle);
+            Point mid = new Point(area.X + area.Width / 2, area.Y + area.Height / 2);
+            try { Cursor.Position = mid; } catch { }
+            Pump(400);
+            box.HandleWheel(-120 << 16);
+            Pump(300);
+            lines.Add(name + " after wheel shown=" + box.BarShown + " first=" + box.FirstVisibleLine());
+            if (!box.BarShown) { lines.Add("SCROLLHIDE WHEEL DID NOT SHOW " + name); problems++; }
+
+            if (full)
+            {
+                try { Cursor.Position = away; } catch { }
+                Pump(400);
+                box.Focus(); Pump(200);
+                SendKeys.SendWait("{PGDN}");
+                Pump(400);
+                lines.Add(name + " after pgdn shown=" + box.BarShown + " first=" + box.FirstVisibleLine());
+                if (!box.BarShown) { lines.Add("SCROLLHIDE KEYBOARD DID NOT SHOW " + name); problems++; }
+
+                try { Cursor.Position = onBar; } catch { }
+                Pump(800);
+                Rectangle thumb = box.ThumbScreenRect;
+                lines.Add(name + " thumb=" + thumb);
+                if (!thumb.IsEmpty)
+                {
+                    int before = box.FirstVisibleLine();
+                    Point dragFrom = new Point(thumb.X + thumb.Width / 2, thumb.Y + thumb.Height / 2);
+                    Point dragTo = new Point(dragFrom.X, Math.Min(area.Bottom - 4, dragFrom.Y + Math.Max(30, area.Height / 3)));
+                    try { Cursor.Position = dragFrom; } catch { }
+                    Pump(200);
+                    MouseEvent(2); // left down
+                    Pump(80);
+                    try { Cursor.Position = dragTo; } catch { }
+                    Pump(200);
+                    MouseEvent(4); // left up
+                    Pump(300);
+                    int after = box.FirstVisibleLine();
+                    lines.Add(name + " drag first " + before + " -> " + after + " shown=" + box.BarShown);
+                    if (after == before) { lines.Add("SCROLLHIDE DRAG DID NOT MOVE " + name); problems++; }
+                    if (!box.BarShown) { lines.Add("SCROLLHIDE DRAG HID BAR " + name); problems++; }
+                }
+                else lines.Add("SCROLLHIDE no thumb to drag " + name);
+            }
+
+            try { Cursor.Position = away; } catch { }
+            Pump(5800);
+            int paints0 = box.DebugPaintCount;
+            Pump(2000);
+            int paints = box.DebugPaintCount - paints0;
+            lines.Add(name + " idle paints=" + paints + " shown=" + box.BarShown);
+            if (box.BarShown) { lines.Add("SCROLLHIDE STILL SHOWN after final idle " + name); problems++; }
+            if (paints > 8) { lines.Add("SCROLLHIDE FLICKER " + name + " idlePaints=" + paints); problems++; }
+            return problems;
+        }
+
+        [DllImport("user32.dll", EntryPoint = "SendMessage", CharSet = CharSet.Auto)]
+        static extern IntPtr SendMessageRect(IntPtr hWnd, int msg, IntPtr wParam, ref RECT lParam);
+        [DllImport("user32.dll")]
+        static extern void mouse_event(int flags, int dx, int dy, int data, IntPtr extra);
+        static void MouseEvent(int flags) { mouse_event(flags, 0, 0, 0, IntPtr.Zero); }
 
         static int CheckUncheckedBoxes(Form form, string png, List<string> lines)
         {

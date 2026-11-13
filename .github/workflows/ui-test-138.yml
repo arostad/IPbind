@@ -105,6 +105,29 @@ jobs:
             }
           }
           if ($unexpected -gt 0) { throw "main shots failed unexpectedly $unexpected (100/150)" }
+      - name: Auto-hide scrollbars (100/150/175 dark, 100 light, after 175→100)
+        shell: pwsh
+        run: |
+          $fails = 0
+          $pers = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          $runs = @(
+            @{pct='100'; theme='dark'; tag='scrollhide-100-dark'},
+            @{pct='150'; theme='dark'; tag='scrollhide-150-dark'},
+            @{pct='175'; theme='dark'; tag='scrollhide-175-dark'},
+            @{pct='100'; theme='light'; tag='scrollhide-100-light'},
+            @{pct='100'; theme='dark'; tag='scrollhide-100-dark-after-175'}
+          )
+          foreach ($item in $runs) {
+            Start-Process .\uishot.exe -ArgumentList @('setscale',$item.pct,"$PWD\shots\setscale-$($item.tag).txt") -Wait
+            Start-Sleep -Seconds 2
+            Set-ItemProperty $pers AppsUseLightTheme $(if ($item.theme -eq 'light') { 1 } else { 0 }) -Type DWord
+            $t = $item.tag
+            $p = Start-Process .\uishot.exe -ArgumentList @('scrollhide',"$PWD\shots\$t","$PWD\shots\$t.txt") -PassThru -Wait
+            if (Test-Path "shots\$t.txt") { Get-Content "shots\$t.txt" }
+            if ($p.ExitCode -ne 0) { $fails++; Write-Host "::error::$t exit $($p.ExitCode)" }
+          }
+          Set-Content shots\fails-scrollhide.txt "FAILS=$fails"
+          if ($fails -gt 0) { throw "scrollhide failed $fails" }
       - name: Dark combo flicker (10s mouse move at 100% and 150%)
         shell: pwsh
         run: |
