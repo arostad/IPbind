@@ -35,14 +35,14 @@ $prodVer = @'
 using System.Reflection;
 [assembly: AssemblyTitle("IPbind")]
 [assembly: AssemblyProduct("IPbind")]
-[assembly: AssemblyVersion("2.3.138")]
-[assembly: AssemblyFileVersion("2.3.138")]
-[assembly: AssemblyInformationalVersion("2.3.138")]
+[assembly: AssemblyVersion("2.3.139")]
+[assembly: AssemblyFileVersion("2.3.139")]
+[assembly: AssemblyInformationalVersion("2.3.139")]
 namespace IPbind
 {
     internal static class BuildInfo
     {
-        public const string Version = "2.3.138";
+        public const string Version = "2.3.139";
         public const string Channel = "prod";
         public static readonly bool IsBeta = Channel == "beta";
         public static readonly string DisplayVersion = IsBeta ? Version + "b" : Version;

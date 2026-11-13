@@ -5072,7 +5072,15 @@ namespace IPbind
         public void SyncThumbOnly()
         {
             lastFirstLine = FirstVisibleLine();
-            if (overlay != null && State.Visible) overlay.Invalidate();
+            // Content may flip CanScroll (so the thumb should appear or
+            // disappear) without counting as input. ApplyVisibility paints
+            // that change; it must not be skipped or the bar can get stuck.
+            ApplyVisibility();
+            if (overlay != null)
+            {
+                overlay.BringToFront();
+                if (State.Visible) overlay.Invalidate();
+            }
         }
 
         public void HandleWheel(int wParam)
@@ -5099,7 +5107,11 @@ namespace IPbind
                 lastPaintedVisible = flag;
                 if (areaName.Length > 0)
                     DebugLog.Debug("scrollbar " + areaName + (shown ? " shown" : " hidden"));
-                if (overlay != null) overlay.Invalidate();
+                if (overlay != null)
+                {
+                    overlay.BringToFront();
+                    overlay.Invalidate();
+                }
             }
         }
 
