@@ -211,7 +211,10 @@ namespace IPbindTest
                     Capture(f.Handle, png);
                     if (err != null) { lines.Add("FAIL " + name + " " + err); faults++; }
                     faults += CheckGeometry(f, name, lines, false);
-                    faults += CheckCheckBoxPaint(f, png, Path.Combine(outDir, name + "-check"), lines, ((IPbind.PerMonitorDialog)f).LayoutScale);
+                    float scNow = ((IPbind.PerMonitorDialog)f).LayoutScale;
+                    faults += CheckCheckBoxPaint(f, png, Path.Combine(outDir, name + "-check"), lines, scNow);
+                    IPbind.AboutForm about = f as IPbind.AboutForm;
+                    if (about != null) faults += CheckAboutGaps(about, lines, scNow);
                     prevDpi = steps[i];
                 }
                 foreach (string l in ((IPbind.PerMonitorDialog)f).DpiLog) lines.Add("  log " + l);
@@ -253,7 +256,10 @@ namespace IPbindTest
                 string startPng = Path.Combine(outDir, which + "-real-start-" + GetDpiForWindow(f.Handle) + ".png");
                 Capture(f.Handle, startPng);
                 faults += CheckGeometry(f, which + "-real-start", lines, true);
-                faults += CheckCheckBoxPaint(f, startPng, Path.Combine(outDir, which + "-real-start-check"), lines, ((IPbind.PerMonitorDialog)f).LayoutScale);
+                float startSc = ((IPbind.PerMonitorDialog)f).LayoutScale;
+                faults += CheckCheckBoxPaint(f, startPng, Path.Combine(outDir, which + "-real-start-check"), lines, startSc);
+                IPbind.AboutForm startAbout = f as IPbind.AboutForm;
+                if (startAbout != null) faults += CheckAboutGaps(startAbout, lines, startSc);
                 int[] pcts = new int[] { 100, 150, 100, 200, 100, 150, 200 };
                 int prevPct = sys * 100 / 96;
                 for (int i = 0; i < pcts.Length; i++)
@@ -271,7 +277,10 @@ namespace IPbindTest
                     string png = Path.Combine(outDir, name + ".png");
                     Capture(f.Handle, png);
                     faults += CheckGeometry(f, name, lines, pcts[i] <= 150);
-                    faults += CheckCheckBoxPaint(f, png, Path.Combine(outDir, name + "-check"), lines, ((IPbind.PerMonitorDialog)f).LayoutScale);
+                    float scNow = ((IPbind.PerMonitorDialog)f).LayoutScale;
+                    faults += CheckCheckBoxPaint(f, png, Path.Combine(outDir, name + "-check"), lines, scNow);
+                    IPbind.AboutForm about = f as IPbind.AboutForm;
+                    if (about != null) faults += CheckAboutGaps(about, lines, scNow);
                     prevPct = pcts[i];
                 }
                 foreach (string l in ((IPbind.PerMonitorDialog)f).DpiLog) lines.Add("  log " + l);
@@ -380,6 +389,7 @@ namespace IPbindTest
                     TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
                 lines.Add("privacy need=" + privNeed + " labelH=" + priv.Height);
                 if (privNeed.Height > priv.Height + 2) lines.Add("PRIVACY CLIPPED");
+                CheckAboutGaps(f, lines, scale);
                 CheckCheckBoxPaint(f, png, png.Replace(".png", "-check"), lines, scale);
                 Rectangle client = ClientRectScreen(f.Handle);
                 lines.Add("window " + WinRect(f.Handle).Size + " client " + client.Size + " layout " + f.LayoutClientSize);
@@ -389,7 +399,8 @@ namespace IPbindTest
                     if ((line.StartsWith("PROBLEMS=") && line != "PROBLEMS=0") || line.IndexOf("HEADER NOT ONE LINE") >= 0
                         || line.IndexOf("CREDIT NOT STACKED") >= 0 || line.IndexOf("CLIENT MISMATCH") >= 0
                         || line.IndexOf("LINK STYLE MISMATCH") >= 0 || line.IndexOf("LAUNCH CHECKBOX") >= 0
-                        || line.IndexOf("PRIVACY WORDING") >= 0 || line.IndexOf("PRIVACY CLIPPED") >= 0) rc = 1;
+                        || line.IndexOf("PRIVACY WORDING") >= 0 || line.IndexOf("PRIVACY CLIPPED") >= 0 || line.IndexOf("GAP CHANGED") >= 0
+                        || line.IndexOf("ABOUT DOES NOT FIT WORK AREA") >= 0) rc = 1;
                 f.Close(); owner.Close();
             };
             f.Shown += delegate { f.Activate(); t.Start(); };
@@ -772,6 +783,50 @@ namespace IPbindTest
                 finally { silent.SetValue(about, false); }
             }
             Pump(300);
+        }
+
+
+        static int CheckAboutGaps(IPbind.AboutForm f, List<string> lines, float scale)
+        {
+            int U(int v) { return (int)Math.Round(v * scale); }
+            int slop = 1;
+            int faults = 0;
+            Label tagline = (Label)typeof(IPbind.AboutForm).GetField("tagline", F).GetValue(f);
+            Label credit = (Label)typeof(IPbind.AboutForm).GetField("creditLink", F).GetValue(f);
+            Label lic = (Label)typeof(IPbind.AboutForm).GetField("licenseLink", F).GetValue(f);
+            Label cap = (Label)typeof(IPbind.AboutForm).GetField("launchCheckLabel", F).GetValue(f);
+            Label status = (Label)typeof(IPbind.AboutForm).GetField("statusLabel", F).GetValue(f);
+            Label priv = (Label)typeof(IPbind.AboutForm).GetField("privacyLabel", F).GetValue(f);
+            Panel footer = (Panel)typeof(IPbind.AboutForm).GetField("footer", F).GetValue(f);
+            int[] got = new int[] {
+                credit.Top - tagline.Bottom,
+                lic.Top - credit.Bottom,
+                cap.Top - lic.Bottom,
+                priv.Top - (status.Visible ? status.Bottom : cap.Bottom),
+                footer.Top - priv.Bottom
+            };
+            int[] want = new int[] { U(18), U(8), U(16), U(18), U(20) };
+            string[] names = new string[] { "tagline-credit", "credit-license", "license-checkbox", "checkbox-privacy", "privacy-footer" };
+            for (int i = 0; i < got.Length; i++)
+            {
+                string row = "gap " + names[i] + " got=" + got[i] + " want=" + want[i];
+                if (Math.Abs(got[i] - want[i]) > slop)
+                {
+                    row += " GAP CHANGED";
+                    faults++;
+                }
+                lines.Add(row);
+            }
+            Rectangle win = WinRect(f.Handle);
+            Rectangle work = WorkArea(f.Handle);
+            bool fits = work.IsEmpty || work.Contains(win);
+            lines.Add("fitsWork=" + fits + " window=" + win + " work=" + work);
+            if (!fits)
+            {
+                lines.Add("ABOUT DOES NOT FIT WORK AREA");
+                faults++;
+            }
+            return faults;
         }
 
         // Crop each RoundCheckBox from the window shot and fail if the check or
