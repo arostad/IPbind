@@ -150,9 +150,41 @@ namespace IPbind
 
     class Adapter
     {
-        public string Name;
-        public string Description;
+        public string Name;         // Windows connection name (real ID); never tidied
+        public string Description;  // hardware description as Windows reports it
         public string Status;
+    }
+
+    // Display-only tidy for the interface dropdown. Matching, the remembered
+    // adapter, and every netsh/WMI call keep using Adapter.Name and the raw
+    // description; this string is never fed back into those paths.
+    public static class AdapterDisplay
+    {
+        public static string CleanDescription(string description)
+        {
+            if (string.IsNullOrEmpty(description)) return "";
+            string s = description;
+            // (R) / (TM), with or without spaces, any case; also the symbol forms.
+            s = Regex.Replace(s, @"\(\s*R\s*\)", " ", RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, @"\(\s*TM\s*\)", " ", RegexOptions.IgnoreCase);
+            s = s.Replace("®", " ").Replace("™", " ");
+            // Intel-style generation tags: "(16)", "(7)", "( 16 )". Parentheses
+            // that are part of a real model name (letters or punctuation) stay.
+            s = Regex.Replace(s, @"\(\s*\d+\s*\)", " ");
+            s = Regex.Replace(s, @"\s+", " ").Trim();
+            return s;
+        }
+
+        public static string Format(string name, string description, string status)
+        {
+            string n = name ?? "";
+            string d = CleanDescription(description);
+            string st = status ?? "";
+            string text = d.Length > 0
+                ? n + " | " + d + " [" + st + "]"
+                : n + " [" + st + "]";
+            return Regex.Replace(text, @"\s+", " ").Trim();
+        }
     }
 
     sealed class UpdateInfo
@@ -4171,7 +4203,7 @@ namespace IPbind
                 return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
             });
             foreach (Adapter a in adapters)
-                combo.Items.Add(a.Name + "   |   " + a.Description + "   [" + a.Status + "]");
+                combo.Items.Add(AdapterDisplay.Format(a.Name, a.Description, a.Status));
 
             // Keep long "Name | Description [Status]" entries readable when the list
             // opens. TextRenderer measures in device pixels; design padding and the
@@ -4203,6 +4235,8 @@ namespace IPbind
             Log("Listed " + adapters.Count + " interface(s)" + (chkAll.Checked ? " (all)" : " (wired only)") + ".");
         }
 
+        // The real Windows connection name. Never parse the dropdown's display
+        // string (that is tidied for reading only and is not an interface ID).
         string GetSelectedAlias()
         {
             if (combo.SelectedIndex < 0 || combo.SelectedIndex >= adapters.Count) return null;

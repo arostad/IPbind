@@ -17,3 +17,15 @@ $cargs = @(
 if ($LASTEXITCODE -ne 0) { throw 'Apply safety test compile failed' }
 & .\apply-safety-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Apply safety tests failed' }
+
+$displayArgs = @(
+  '/nologo', '/target:exe', '/out:adapter-display-tests.exe',
+  '/main:IPbindTest.AdapterDisplayTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\AdapterDisplayTest.cs'
+)
+& $csc @displayArgs
+if ($LASTEXITCODE -ne 0) { throw 'Adapter display test compile failed' }
+& .\adapter-display-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Adapter display tests failed' }
