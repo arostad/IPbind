@@ -118,19 +118,23 @@ function Scale([int]$pct) {
   Start-Sleep 2
 }
 function ClearReminder { if (Test-Path $Data) { Remove-Item -Force -ea SilentlyContinue (Join-Path $Data 'dhcp-reminder-dismissed.txt') } }
+function SuppressReminder {
+  New-Item -ItemType Directory -Force $Data | Out-Null
+  Set-Content (Join-Path $Data 'dhcp-reminder-dismissed.txt') 'walk'
+}
 function FindReminder([int]$sec = 15) {
   $end = (Get-Date).AddSeconds($sec)
+  $logged = $false
   while ((Get-Date) -lt $end) {
-    foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
-      $n = [string]$w.Current.Name
-      # The reminder's title is "IPbind Beta" (no version). Prefer a window
-      # that has Continue; fall back to the exact title.
-      if ($n -eq 'IPbind Beta' -or $n -eq 'IPbind Beta ') {
-        $cont = Named $w 'Continue'
-        $txt = Texts $w
-        if ($cont -or $txt -like '*Return to DHCP before*' -or $txt -like '*I understand*' -or $txt -like "*I'll click Return*") {
-          return $w
-        }
+    $roots = @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))
+    if (-not $logged) {
+      L ("root windows: " + (($roots | ForEach-Object { "'" + $_.Current.Name + "'" }) -join ", "))
+      $logged = $true
+    }
+    foreach ($w in $roots) {
+      $txt = Texts $w
+      if ($txt -like '*Return to DHCP before*' -or $txt -like "*I'll click Return to DHCP*" -or $txt -like '*BEFORE YOU START*') {
+        return $w
       }
     }
     Start-Sleep -Milliseconds 300
@@ -258,12 +262,22 @@ if ($v136 -ne '2.3.136') { Fail "Installed apps did not show 2.3.136 (got $v136)
 if ($launched -and $launched.Current.Name -notlike '*v2.3.136b*') { Fail "title bar was '$($launched.Current.Name)', expected 2.3.136b" }
 KillApp
 
-# ---- 2. About, popup, dropdowns at 100 / 150 / 175 ----
+# ---- 2. Popup shots at 100 / 150 / 175 (reminder must appear) ----
 foreach ($pct in 100, 150, 175) {
   Scale $pct
+  KillApp
   ClearReminder
-  $popupName = "popup-$pct"
-  $main = LaunchAndGetMain $popupName
+  if (-not (Test-Path $Exe)) { Fail "exe missing"; break }
+  Start-Process $Exe
+  if (DismissReminder "popup-$pct") { L "popup $pct dismissed after shot" } else { ShotScreen "popup-$pct-screen" }
+  KillApp
+}
+
+# ---- 3. About, dropdowns, gateway at 100 / 150 / 175 (reminder suppressed) ----
+foreach ($pct in 100, 150, 175) {
+  Scale $pct
+  SuppressReminder
+  $main = LaunchAndGetMain $null
   if ($main) {
     Shot $main "main-$pct"
     if ($main.Current.Name -notlike '*v2.3.136b*') { Fail "title at $pct% was '$($main.Current.Name)'" }
@@ -275,10 +289,10 @@ foreach ($pct in 100, 150, 175) {
   KillApp
 }
 
-# ---- 3. About at 100% after a live move from high scale ----
+# ---- 4. About at 100% after a live move from high scale ----
 Scale 175
-ClearReminder
-$main = LaunchAndGetMain 'popup-before-dpi-move'
+SuppressReminder
+$main = LaunchAndGetMain $null
 if ($main) {
   $ab = OpenAbout $main 'about-175-before-move'
   if ($ab) {
@@ -287,11 +301,12 @@ if ($main) {
     Shot $ab 'about-100-after-175-move'
     L "about after move texts: $(Texts $ab)"
     CloseAbout $ab
-  }
-}
+  } else { Scale 100 }
+} else { Scale 100 }
 KillApp
 
-# ---- 4. In-app update: published 135 -> 136 ----
+# ---- 5. In-app update: published 135 -> 136 ----
+Scale 100
 L 'in-app update path: uninstall 136, install 135, launch, click Update'
 $unins = $null
 if (Test-Path $Key) { $us = (Get-ItemProperty $Key).UninstallString; if ($us -match '"([^"]+)"') { $unins = $Matches[1] } }
@@ -301,8 +316,10 @@ if (Test-Path $Data) { Remove-Item -Recurse -Force $Data }
 SilentInstall $Installer135 '2.3.135-for-update'
 if ((DisplayVer) -ne '2.3.135') { Fail "pre-update DisplayVersion was $(DisplayVer)" }
 # Auto update checks on (installer default). Don't pre-create update-check.txt as manual.
-ClearReminder
-$main = LaunchAndGetMain 'popup-135-for-update'
+# Suppress the reminder so the UI thread can show and we can click the banner.
+SuppressReminder
+# Keep launch-check enabled (suppress only writes the reminder flag).
+$main = LaunchAndGetMain $null
 if ($main) {
   # Re-acquire main after the modal reminder has closed so the update
   # banner (which is posted once the UI thread is free) can appear.
@@ -339,7 +356,7 @@ if ($main) {
 }
 KillApp
 
-# ---- 5. Uninstall with the remove-data step (interactive) ----
+# ---- 6. Uninstall with the remove-data step (interactive) ----
 if (-not (Test-Path $Key)) { SilentInstall $Installer136 '2.3.136-for-uninstall' }
 # Leave a data file so we can see it go away.
 New-Item -ItemType Directory -Force $Data | Out-Null
