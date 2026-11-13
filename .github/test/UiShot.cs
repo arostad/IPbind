@@ -440,7 +440,8 @@ namespace IPbindTest
                 foreach (Control c in main.Controls) if (c.Visible) vis.Add(c);
                 for (int i = 0; i < vis.Count; i++)
                     for (int j = i + 1; j < vis.Count; j++)
-                        if (vis[i].Bounds.IntersectsWith(vis[j].Bounds))
+                        if (vis[i].Bounds.IntersectsWith(vis[j].Bounds)
+                            && !GutterOverlayPair(vis[i], vis[j]))
                         {
                             lines.Add("OVERLAP " + vis[i].GetType().Name + " '" + Short(vis[i].Text) + "' " + vis[i].Bounds
                                 + " x " + vis[j].GetType().Name + " '" + Short(vis[j].Text) + "' " + vis[j].Bounds);
@@ -784,6 +785,15 @@ namespace IPbindTest
         [DllImport("user32.dll")]
         static extern void mouse_event(int flags, int dx, int dy, int data, IntPtr extra);
         static void MouseEvent(int flags) { mouse_event(flags, 0, 0, 0, IntPtr.Zero); }
+
+
+        // The auto-hide overlay is meant to sit in the text box's reserved right margin.
+        static bool GutterOverlayPair(Control a, Control b)
+        {
+            string an = a.GetType().Name, bn = b.GetType().Name;
+            return (an == "OverlayBar" && bn == "AutoHideScrollBox")
+                || (bn == "OverlayBar" && an == "AutoHideScrollBox");
+        }
 
         static int CheckUncheckedBoxes(Form form, string png, List<string> lines)
         {
