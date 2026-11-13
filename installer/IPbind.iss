@@ -188,6 +188,31 @@ end;
   %LOCALAPPDATA%\<AppTitle>, leftover update helpers, and temp netsh
   scripts. The other channel's folders and the Inno uninstall key are
   left alone. }
+
+#if Channel == "beta"
+procedure WriteBetaUninstallChoice(Proceeded: Boolean; RemoveData: Boolean);
+var
+  Dir, Path, Line: String;
+begin
+  try
+    Dir := ExpandConstant('{localappdata}\{#AppTitle}\logs');
+    if not DirExists(Dir) then
+      ForceDirectories(Dir);
+    Path := Dir + '\ipbind-beta-' + GetDateTimeString('yyyy-mm-dd', '-', '-') + '.log';
+    Line := GetDateTimeString('yyyy-mm-dd hh:nn:ss.zzz', '-', ':') +
+      ' INFO Uninstall prompt: proceed=' + IntToStr(Ord(Proceeded)) +
+      ' remove-data=' + IntToStr(Ord(RemoveData)) + #13#10;
+    SaveStringToFile(Path, Line, True);
+  except
+  end;
+end;
+#else
+procedure WriteBetaUninstallChoice(Proceeded: Boolean; RemoveData: Boolean);
+begin
+  { Prod never writes a log file. }
+end;
+#endif
+
 procedure DeleteAppData;
 var
   AppDir, TempDir: String;
@@ -410,6 +435,7 @@ begin
     if Result then
       RemoveDataRequested := RemoveDataCheckBox.Checked;
     Log('Uninstall prompt: ' + IntToStr(Ord(Result)) + ', remove data: ' + IntToStr(Ord(RemoveDataRequested)));
+    WriteBetaUninstallChoice(Result, RemoveDataRequested);
   finally
     RemoveDataCheckBox := nil;
     Form.Free;

@@ -29,3 +29,37 @@ $displayArgs = @(
 if ($LASTEXITCODE -ne 0) { throw 'Adapter display test compile failed' }
 & .\adapter-display-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Adapter display tests failed' }
+
+# Prod-channel compile of the same sources: DebugLog must create no files or folders.
+$prodVer = @'
+using System.Reflection;
+[assembly: AssemblyTitle("IPbind")]
+[assembly: AssemblyProduct("IPbind")]
+[assembly: AssemblyVersion("2.3.137")]
+[assembly: AssemblyFileVersion("2.3.137")]
+[assembly: AssemblyInformationalVersion("2.3.137")]
+namespace IPbind
+{
+    internal static class BuildInfo
+    {
+        public const string Version = "2.3.137";
+        public const string Channel = "prod";
+        public static readonly bool IsBeta = Channel == "beta";
+        public static readonly string DisplayVersion = IsBeta ? Version + "b" : Version;
+        public const string AppName = "IPbind";
+        public const string ReleaseTag = "latest";
+    }
+}
+'@
+Set-Content -Path .\Version-prod-test.cs -Value $prodVer -Encoding UTF8
+$logArgs = @(
+  '/nologo', '/target:exe', '/out:debug-log-prod-tests.exe',
+  '/main:IPbindTest.DebugLogTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version-prod-test.cs', '.github\test\DebugLogTest.cs'
+)
+& $csc @logArgs
+if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test compile failed' }
+& .\debug-log-prod-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test failed' }
