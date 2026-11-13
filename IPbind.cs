@@ -4749,6 +4749,651 @@ namespace IPbind
         }
     }
 
+    // Per-area auto-hide for the console and IP-list vertical bars (2.3.138).
+    // Pattern from IXSmon ScrollBarIdleState, implemented as a reserved-gutter
+    // overlay so WinForms never toggles ScrollBars / ShowScrollBar (that would
+    // change the client width and wrap-shift the text).
+    sealed class ScrollBarIdleState
+    {
+        public static readonly TimeSpan HideAfter = TimeSpan.FromSeconds(5);
+        readonly TimeSpan hideAfter;
+
+        public ScrollBarIdleState() : this(DateTime.Now, null) { }
+
+        public ScrollBarIdleState(DateTime now, TimeSpan? hideAfter)
+        {
+            this.hideAfter = hideAfter.HasValue ? hideAfter.Value : HideAfter;
+            Visible = true;
+            HideDueAt = now + this.hideAfter;
+        }
+
+        public bool Visible { get; private set; }
+        public bool PointerOver { get; private set; }
+        // Null-equivalent: DateTime.MinValue means no deadline (hovered or already hidden).
+        public DateTime HideDueAt { get; private set; }
+
+        public void PointerEntered()
+        {
+            PointerOver = true;
+            Visible = true;
+            HideDueAt = DateTime.MinValue;
+        }
+
+        public void PointerMoved()
+        {
+            PointerEntered();
+        }
+
+        public void PointerExited(DateTime now)
+        {
+            PointerOver = false;
+            Visible = true;
+            HideDueAt = now + hideAfter;
+        }
+
+        // Wheel, thumb drag, or keyboard scroll. Does not run for AppendText / auto-scroll.
+        public void Scrolled(DateTime now)
+        {
+            Visible = true;
+            HideDueAt = PointerOver ? DateTime.MinValue : now + hideAfter;
+        }
+
+        public void Deactivated()
+        {
+            PointerOver = false;
+            Visible = false;
+            HideDueAt = DateTime.MinValue;
+        }
+
+        // True when Visible flipped. Callers apply only then, never on every tick.
+        public bool Tick(DateTime now)
+        {
+            if (Visible && !PointerOver && HideDueAt != DateTime.MinValue && now >= HideDueAt)
+            {
+                Visible = false;
+                HideDueAt = DateTime.MinValue;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    static class AutoHideScrollBars
+    {
+        public static readonly TimeSpan CheckEvery = TimeSpan.FromMilliseconds(250);
+        static readonly List<AutoHideScrollBox> areas = new List<AutoHideScrollBox>();
+        static Timer timer;
+        static bool filterAdded;
+
+        public static void Register(AutoHideScrollBox box)
+        {
+            if (box == null || areas.Contains(box)) return;
+            areas.Add(box);
+            if (timer == null)
+            {
+                timer = new Timer();
+                timer.Interval = (int)CheckEvery.TotalMilliseconds;
+                timer.Tick += OnTick;
+                timer.Start();
+            }
+            if (!filterAdded)
+            {
+                Application.AddMessageFilter(new WheelFilter());
+                filterAdded = true;
+            }
+            Form form = box.FindForm();
+            if (form != null)
+            {
+                form.Deactivate -= OnDeactivate;
+                form.Deactivate += OnDeactivate;
+                form.FormClosed -= OnFormClosed;
+                form.FormClosed += OnFormClosed;
+            }
+        }
+
+        public static void Unregister(AutoHideScrollBox box)
+        {
+            areas.Remove(box);
+        }
+
+        static void OnTick(object sender, EventArgs e)
+        {
+            DateTime now = DateTime.Now;
+            Point cursor;
+            try { cursor = Cursor.Position; }
+            catch { return; }
+            for (int i = 0; i < areas.Count; i++)
+            {
+                AutoHideScrollBox box = areas[i];
+                if (box.IsDisposed || !box.IsHandleCreated) continue;
+                bool over = box.IsDragging || box.AreaContains(cursor);
+                bool changed = false;
+                if (over && !box.State.PointerOver)
+                {
+                    box.State.PointerEntered();
+                    changed = true;
+                }
+                else if (!over && box.State.PointerOver)
+                {
+                    box.State.PointerExited(now);
+                    changed = true;
+                }
+                if (box.State.Tick(now)) changed = true;
+                if (changed) box.ApplyVisibility();
+            }
+        }
+
+        static void OnDeactivate(object sender, EventArgs e)
+        {
+            for (int i = 0; i < areas.Count; i++)
+            {
+                AutoHideScrollBox box = areas[i];
+                if (box.IsDisposed) continue;
+                box.State.Deactivated();
+                box.ApplyVisibility();
+            }
+        }
+
+        static void OnFormClosed(object sender, EventArgs e)
+        {
+            Form form = sender as Form;
+            if (form == null) return;
+            form.Deactivate -= OnDeactivate;
+            form.FormClosed -= OnFormClosed;
+            for (int i = areas.Count - 1; i >= 0; i--)
+            {
+                if (areas[i].FindForm() == form) areas.RemoveAt(i);
+            }
+        }
+
+        sealed class WheelFilter : IMessageFilter
+        {
+            const int WM_MOUSEWHEEL = 0x020A;
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                if (m.Msg != WM_MOUSEWHEEL) return false;
+                Point cursor;
+                try { cursor = Cursor.Position; }
+                catch { return false; }
+                for (int i = 0; i < areas.Count; i++)
+                {
+                    AutoHideScrollBox box = areas[i];
+                    if (box.IsDisposed || !box.IsHandleCreated) continue;
+                    if (!box.AreaContains(cursor)) continue;
+                    box.HandleWheel(unchecked((int)(m.WParam.ToInt64() & 0xFFFFFFFF)));
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    // Multiline text box with the native vertical bar off and a thin overlay in a
+    // permanently reserved right margin. Hover / wheel / keyboard / thumb-drag are
+    // the only inputs that reset the hide deadline.
+    sealed class AutoHideScrollBox : TextBox
+    {
+        const int WM_KEYDOWN = 0x0100;
+        const int WM_SETREDRAW = 0x000B;
+        const int EM_SETMARGINS = 0x00D3;
+        const int EM_GETRECT = 0x00B2;
+        const int EM_LINESCROLL = 0x00B6;
+        const int EM_GETLINECOUNT = 0x00BA;
+        const int EM_GETFIRSTVISIBLELINE = 0x00CE;
+        const int EC_RIGHTMARGIN = 0x0002;
+        const int GWL_STYLE = -16;
+        const int ES_AUTOVSCROLL = 0x0040;
+        const int WS_VSCROLL = 0x00200000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", EntryPoint = "SendMessage", CharSet = CharSet.Auto)]
+        static extern IntPtr SendMessageRect(IntPtr hWnd, int msg, IntPtr wParam, ref RECT lParam);
+        [DllImport("user32.dll")]
+        static extern int GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+        static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+        static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+        static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+        static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        public readonly ScrollBarIdleState State = new ScrollBarIdleState();
+        readonly OverlayBar overlay;
+        int gutter = 10;
+        int lastPaintedVisible = -1;
+        int lastFirstLine = -1;
+        string areaName = "";
+        public int DebugPaintCount;
+        public bool IsDragging;
+
+        public AutoHideScrollBox()
+        {
+            Multiline = true;
+            ScrollBars = ScrollBars.None;
+            overlay = new OverlayBar(this);
+        }
+
+        public void SetAreaName(string name) { areaName = name ?? ""; }
+
+        public bool BarShown
+        {
+            get { return State.Visible && CanScroll(); }
+        }
+
+        public int GutterWidth { get { return gutter; } }
+
+        public Rectangle OverlayScreenRect
+        {
+            get
+            {
+                if (overlay == null || !overlay.IsHandleCreated)
+                    return Rectangle.Empty;
+                return overlay.RectangleToScreen(overlay.ClientRectangle);
+            }
+        }
+
+        public Rectangle ThumbScreenRect
+        {
+            get
+            {
+                Rectangle local = overlay.ThumbRect();
+                if (local.IsEmpty || !overlay.IsHandleCreated) return Rectangle.Empty;
+                return overlay.RectangleToScreen(local);
+            }
+        }
+
+        public bool AreaContains(Point screen)
+        {
+            if (!IsHandleCreated) return false;
+            if (RectangleToScreen(ClientRectangle).Contains(screen)) return true;
+            if (overlay != null && overlay.IsHandleCreated
+                && overlay.RectangleToScreen(overlay.ClientRectangle).Contains(screen))
+                return true;
+            return false;
+        }
+
+        public bool CanScroll()
+        {
+            return MaxFirstLine() > 0;
+        }
+
+        public int FirstVisibleLine()
+        {
+            if (!IsHandleCreated) return 0;
+            return (int)SendMessage(Handle, EM_GETFIRSTVISIBLELINE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public int LineCount()
+        {
+            if (!IsHandleCreated) return 0;
+            return (int)SendMessage(Handle, EM_GETLINECOUNT, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public int VisibleLineCount()
+        {
+            if (!IsHandleCreated) return 1;
+            RECT r = new RECT();
+            SendMessageRect(Handle, EM_GETRECT, IntPtr.Zero, ref r);
+            int h = r.Bottom - r.Top;
+            int lh = Font != null ? Font.Height : 16;
+            if (lh < 1) lh = 16;
+            return Math.Max(1, h / lh);
+        }
+
+        public int MaxFirstLine()
+        {
+            return Math.Max(0, LineCount() - VisibleLineCount());
+        }
+
+        public void LineScroll(int lines)
+        {
+            if (!IsHandleCreated || lines == 0) return;
+            SendMessage(Handle, EM_LINESCROLL, IntPtr.Zero, (IntPtr)lines);
+            lastFirstLine = FirstVisibleLine();
+        }
+
+        public void ScrollToFirst(int first)
+        {
+            int max = MaxFirstLine();
+            if (first < 0) first = 0;
+            if (first > max) first = max;
+            LineScroll(first - FirstVisibleLine());
+        }
+
+        // Update the thumb after AppendText / auto-scroll / a layout change.
+        // Must not reset the hide deadline.
+        public void SyncThumbOnly()
+        {
+            lastFirstLine = FirstVisibleLine();
+            if (overlay != null && State.Visible) overlay.Invalidate();
+        }
+
+        public void HandleWheel(int wParam)
+        {
+            int delta = (short)((wParam >> 16) & 0xFFFF);
+            int notches = delta / 120;
+            if (notches == 0) return;
+            int per = SystemInformation.MouseWheelScrollLines;
+            int lines;
+            if (per <= 0) lines = -notches * VisibleLineCount();
+            else lines = -notches * per;
+            LineScroll(lines);
+            State.Scrolled(DateTime.Now);
+            ApplyVisibility();
+            SyncThumbOnly();
+        }
+
+        public void ApplyVisibility()
+        {
+            bool shown = BarShown;
+            int flag = shown ? 1 : 0;
+            if (flag != lastPaintedVisible)
+            {
+                lastPaintedVisible = flag;
+                if (areaName.Length > 0)
+                    DebugLog.Debug("scrollbar " + areaName + (shown ? " shown" : " hidden"));
+                if (overlay != null) overlay.Invalidate();
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ScrollBars = ScrollBars.None;
+            EnsureAutoVScroll();
+            ApplyMargin();
+            AutoHideScrollBars.Register(this);
+            AttachOverlay();
+            ApplyVisibility();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            AutoHideScrollBars.Unregister(this);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void OnParentChanged(EventArgs e)
+        {
+            base.OnParentChanged(e);
+            AttachOverlay();
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            PositionOverlay();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            ApplyMargin();
+            PositionOverlay();
+            SyncThumbOnly();
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            ApplyMargin();
+            PositionOverlay();
+            SyncThumbOnly();
+        }
+
+        protected override void OnBackColorChanged(EventArgs e)
+        {
+            base.OnBackColorChanged(e);
+            if (overlay != null) overlay.Invalidate();
+        }
+
+        void AttachOverlay()
+        {
+            if (overlay == null || Parent == null) return;
+            if (overlay.Parent != Parent) Parent.Controls.Add(overlay);
+            PositionOverlay();
+            overlay.BringToFront();
+            if (IsHandleCreated) AutoHideScrollBars.Register(this);
+        }
+
+        void PositionOverlay()
+        {
+            if (overlay == null || Parent == null) return;
+            int frameX = Math.Max(0, (Width - ClientSize.Width) / 2);
+            int frameY = Math.Max(0, (Height - ClientSize.Height) / 2);
+            int w = Math.Max(1, gutter);
+            overlay.SetBounds(
+                Left + frameX + Math.Max(0, ClientSize.Width - w),
+                Top + frameY,
+                w,
+                Math.Max(1, ClientSize.Height));
+            overlay.BringToFront();
+        }
+
+        void ApplyMargin()
+        {
+            int dpi = 96;
+            try
+            {
+                if (IsHandleCreated) dpi = GetDpiForWindow(Handle);
+            }
+            catch
+            {
+                try { using (Graphics g = CreateGraphics()) dpi = (int)Math.Round(g.DpiX); }
+                catch { dpi = 96; }
+            }
+            if (dpi < 96) dpi = 96;
+            int want = Math.Max(8, (int)Math.Round(10.0 * dpi / 96.0));
+            gutter = want;
+            if (!IsHandleCreated) return;
+            int first = FirstVisibleLine();
+            int sel = SelectionStart;
+            int len = SelectionLength;
+            SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+            SendMessage(Handle, EM_SETMARGINS, (IntPtr)EC_RIGHTMARGIN, (IntPtr)(gutter << 16));
+            int now = FirstVisibleLine();
+            if (now != first) LineScroll(first - now);
+            SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
+            try
+            {
+                SelectionStart = sel;
+                SelectionLength = len;
+            }
+            catch { }
+            Invalidate();
+        }
+
+        void EnsureAutoVScroll()
+        {
+            if (!IsHandleCreated) return;
+            try
+            {
+                long style = GetStyle(Handle);
+                long next = (style | ES_AUTOVSCROLL) & ~WS_VSCROLL;
+                if (next != style) SetStyle(Handle, next);
+            }
+            catch { }
+        }
+
+        static long GetStyle(IntPtr hwnd)
+        {
+            if (IntPtr.Size == 8) return GetWindowLongPtr64(hwnd, GWL_STYLE).ToInt64();
+            return GetWindowLong32(hwnd, GWL_STYLE);
+        }
+
+        static void SetStyle(IntPtr hwnd, long style)
+        {
+            if (IntPtr.Size == 8) SetWindowLongPtr64(hwnd, GWL_STYLE, new IntPtr(style));
+            else SetWindowLong32(hwnd, GWL_STYLE, (int)style);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_KEYDOWN)
+            {
+                int before = FirstVisibleLine();
+                base.WndProc(ref m);
+                int after = FirstVisibleLine();
+                if (after != before)
+                {
+                    lastFirstLine = after;
+                    State.Scrolled(DateTime.Now);
+                    ApplyVisibility();
+                    SyncThumbOnly();
+                }
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        sealed class OverlayBar : Control
+        {
+            readonly AutoHideScrollBox box;
+            bool dragging;
+            int dragStartY;
+            int dragStartFirst;
+
+            public OverlayBar(AutoHideScrollBox box)
+            {
+                this.box = box;
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
+                TabStop = false;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                box.DebugPaintCount++;
+                Graphics g = e.Graphics;
+                g.Clear(box.BackColor);
+                if (!box.State.Visible || !box.CanScroll()) return;
+                Rectangle thumb = ThumbRect();
+                if (thumb.IsEmpty) return;
+                Color fill = ThumbColor(false);
+                if (dragging || (box.State.PointerOver && thumb.Contains(PointToClient(Cursor.Position))))
+                    fill = ThumbColor(true);
+                using (SolidBrush br = new SolidBrush(fill))
+                using (GraphicsPath path = Rounded(thumb, Math.Max(2, thumb.Width / 2)))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.FillPath(br, path);
+                }
+            }
+
+            public Rectangle ThumbRect()
+            {
+                int max = box.MaxFirstLine();
+                if (max <= 0 || Height <= 0) return Rectangle.Empty;
+                int pad = Math.Max(2, box.GutterWidth / 5);
+                int track = Height - 2 * pad;
+                if (track <= 0) return Rectangle.Empty;
+                int total = box.LineCount();
+                int vis = box.VisibleLineCount();
+                int thumbH = Math.Max(Math.Max(12, box.GutterWidth), (int)((long)track * vis / Math.Max(1, total)));
+                if (thumbH > track) thumbH = track;
+                int first = box.FirstVisibleLine();
+                int y = pad + (int)((long)(track - thumbH) * first / max);
+                int x = Math.Max(1, (Width - Math.Max(4, Width - 2 * pad)) / 2);
+                int w = Math.Max(4, Width - 2 * pad);
+                return new Rectangle(x, y, w, thumbH);
+            }
+
+            Color ThumbColor(bool hot)
+            {
+                bool dark = box.BackColor.R < 80 && box.BackColor.G < 80 && box.BackColor.B < 80;
+                if (dark) return hot ? Color.FromArgb(0x8E, 0x8E, 0x93) : Color.FromArgb(0x6E, 0x6E, 0x73);
+                return hot ? Color.FromArgb(0x8E, 0x8E, 0x93) : Color.FromArgb(0xC6, 0xC6, 0xC8);
+            }
+
+            static GraphicsPath Rounded(Rectangle r, int radius)
+            {
+                GraphicsPath path = new GraphicsPath();
+                int d = radius * 2;
+                if (d <= 0 || d > r.Width || d > r.Height)
+                {
+                    path.AddRectangle(r);
+                    return path;
+                }
+                path.AddArc(r.X, r.Y, d, d, 180, 90);
+                path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+                path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+                path.CloseFigure();
+                return path;
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                base.OnMouseDown(e);
+                if (e.Button != MouseButtons.Left) return;
+                if (!box.CanScroll()) return;
+                box.State.PointerEntered();
+                box.ApplyVisibility();
+                Rectangle thumb = ThumbRect();
+                if (thumb.Contains(e.Location))
+                {
+                    dragging = true;
+                    box.IsDragging = true;
+                    dragStartY = e.Y;
+                    dragStartFirst = box.FirstVisibleLine();
+                    Capture = true;
+                }
+                else
+                {
+                    // Click in the track pages by one viewport.
+                    int page = box.VisibleLineCount();
+                    if (e.Y < thumb.Top) box.ScrollToFirst(box.FirstVisibleLine() - page);
+                    else box.ScrollToFirst(box.FirstVisibleLine() + page);
+                    box.State.Scrolled(DateTime.Now);
+                    box.ApplyVisibility();
+                    box.SyncThumbOnly();
+                }
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                if (!dragging) { Invalidate(); return; }
+                int max = box.MaxFirstLine();
+                if (max <= 0) return;
+                int pad = Math.Max(2, box.GutterWidth / 5);
+                int track = Height - 2 * pad - ThumbRect().Height;
+                if (track < 1) track = 1;
+                int delta = e.Y - dragStartY;
+                int first = dragStartFirst + (int)Math.Round((double)delta * max / track);
+                box.ScrollToFirst(first);
+                box.State.Scrolled(DateTime.Now);
+                box.ApplyVisibility();
+                Invalidate();
+            }
+
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                base.OnMouseUp(e);
+                if (!dragging) return;
+                dragging = false;
+                box.IsDragging = false;
+                Capture = false;
+                box.State.Scrolled(DateTime.Now);
+                box.ApplyVisibility();
+                Invalidate();
+            }
+
+            protected override void OnMouseWheel(MouseEventArgs e)
+            {
+                box.HandleWheel(e.Delta << 16);
+            }
+        }
+    }
+
+
     class MainForm : Form
     {
         static readonly string AppVersion = BuildInfo.Version;
@@ -4891,6 +5536,8 @@ namespace IPbind
             console.AppendText(line);
             console.SelectionStart = console.TextLength;
             console.ScrollToCaret();
+            AutoHideScrollBox box = console as AutoHideScrollBox;
+            if (box != null) box.SyncThumbOnly();
         }
 
         bool TryCidr(string s, out string ip, out int prefix)
@@ -7009,13 +7656,19 @@ namespace IPbind
             lblIPs.TextAlign = ContentAlignment.MiddleLeft;
             Controls.Add(lblIPs);
 
-            txtIPs = new TextBox();
+            txtIPs = new AutoHideScrollBox();
             txtIPs.Multiline = true;
-            txtIPs.ScrollBars = ScrollBars.Vertical;
+            txtIPs.ScrollBars = ScrollBars.None;
             txtIPs.Location = P(20, 170);
             txtIPs.Size = Z(520, 196);
             txtIPs.Font = new Font("Consolas", 10F);
-            txtIPs.TextChanged += delegate { RefreshGatewayChoices(); };
+            ((AutoHideScrollBox)txtIPs).SetAreaName("ips");
+            txtIPs.TextChanged += delegate
+            {
+                RefreshGatewayChoices();
+                AutoHideScrollBox ips = txtIPs as AutoHideScrollBox;
+                if (ips != null) ips.SyncThumbOnly();
+            };
             Controls.Add(txtIPs);
 
             // Gateway rows (hidden until Gateway support is on). They sit in the bottom
@@ -7121,18 +7774,24 @@ namespace IPbind
             Controls.Add(lblConsole);
 
             btnClear = MakeButton("Clear", 1000, 14, 80, 24);
-            btnClear.Click += delegate { console.Clear(); };
+            btnClear.Click += delegate
+            {
+                console.Clear();
+                AutoHideScrollBox box = console as AutoHideScrollBox;
+                if (box != null) box.SyncThumbOnly();
+            };
             Controls.Add(btnClear);
 
-            console = new TextBox();
+            console = new AutoHideScrollBox();
             console.Multiline = true;
-            console.ScrollBars = ScrollBars.Vertical;
+            console.ScrollBars = ScrollBars.None;
             console.ReadOnly = true;
             console.Location = P(560, 44);
             console.Size = Z(520, 466);
             console.Font = new Font("Consolas", 9F);
             console.BackColor = Color.FromArgb(18, 18, 18);
             console.ForeColor = Color.FromArgb(210, 210, 210);
+            ((AutoHideScrollBox)console).SetAreaName("console");
             Controls.Add(console);
 
             updateBanner = new Panel();

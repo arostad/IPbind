@@ -34,7 +34,7 @@ param(
 )
 
 # ==============================================================
-$Version = '2.3.137'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.138'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
