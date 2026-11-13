@@ -1,10 +1,11 @@
-# Real-user walkthrough of the PUBLISHED Beta 2.3.136 installer:
-# install 2.3.135, install 136 over it, check Installed apps, launch, About and
+# Real-user walkthrough of the PUBLISHED Beta 2.3.137 installer:
+# install 2.3.136, install 137 over it, check Installed apps, launch, About and
 # the DHCP popup at 100/150/175 and after a live scale change, open both
-# dropdowns, in-app update from 135, uninstall with the remove-data step.
+# dropdowns, 10s mouse-move flicker test at 100/150, in-app update from 136,
+# uninstall with the remove-data step.
 param(
-  [Parameter(Mandatory=$true)][string]$Installer135,
   [Parameter(Mandatory=$true)][string]$Installer136,
+  [Parameter(Mandatory=$true)][string]$Installer137,
   [Parameter(Mandatory=$true)][string]$Out,
   [Parameter(Mandatory=$true)][string]$SetScale
 )
@@ -22,7 +23,7 @@ public static class W {
 '@
 [W]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
 New-Item -ItemType Directory -Force $Out | Out-Null
-$log = Join-Path $Out 'walk-release-136.txt'
+$log = Join-Path $Out 'walk-release-137.txt'
 $fails = 0
 function L([string]$s) { $line = "[$((Get-Date).ToString('HH:mm:ss.fff'))] $s"; Add-Content $log $line; Write-Host $line }
 function Fail([string]$s) { $script:fails++; L "FAIL $s" }
@@ -31,12 +32,25 @@ $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 $CT = [System.Windows.Automation.ControlType]
 function Cond($prop, $val) { New-Object System.Windows.Automation.PropertyCondition($prop, $val) }
+function WinNameMatch([string]$n, [string]$name, [switch]$Like) {
+  if ($Like) { return $n -like $name }
+  return $n -eq $name
+}
 function FindWin([string]$name, [int]$sec = 15, [switch]$Like) {
   $end = (Get-Date).AddSeconds($sec)
   while ((Get-Date) -lt $end) {
-    foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
-      $n = $w.Current.Name
-      if (($Like -and $n -like $name) -or (-not $Like -and $n -eq $name)) { return $w }
+    $roots = @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))
+    foreach ($w in $roots) {
+      if (WinNameMatch $w.Current.Name $name -Like:$Like) { return $w }
+    }
+    # Owned dialogs (About) are sometimes nested under the owner in the UIA tree
+    # instead of appearing as a root child. Search descendants too.
+    foreach ($w in $roots) {
+      try {
+        foreach ($c in $w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+          if (WinNameMatch $c.Current.Name $name -Like:$Like) { return $c }
+        }
+      } catch {}
     }
     Start-Sleep -Milliseconds 250
   }
@@ -171,10 +185,18 @@ function OpenAbout($main, [string]$shotName) {
   $aboutBtn = Btn $main 'About'
   if (-not $aboutBtn) { Fail 'About button missing'; return $null }
   Click $aboutBtn | Out-Null
-  $ab = FindWin 'About IPbind Beta' 10
-  if (-not $ab) { Fail 'About dialog missing'; return $null }
+  $ab = FindWin 'About IPbind Beta*' 10 -Like
+  if (-not $ab) {
+    $names = @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { "'" + $_.Current.Name + "'" })
+    L ("About missing; root windows: " + ($names -join ', '))
+    Fail 'About dialog missing'
+    ShotScreen ($shotName + '-no-about')
+    return $null
+  }
   Start-Sleep 1
   if ($shotName) { Shot $ab $shotName; L "about texts: $(Texts $ab)" }
+  $txt = Texts $ab
+  if ($txt -notlike '*Your IP address is never stored*') { Fail "About privacy note missing IP-not-stored line at $shotName" }
   return $ab
 }
 function CloseAbout($ab) {
@@ -212,6 +234,51 @@ function OpenDropdowns($main, [string]$tag) {
     [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
     Start-Sleep -Milliseconds 300
   } else { L "WARN gateway combo not found (count=$($boxes.Count))" }
+  return ,$boxes
+}
+function FlickerMove($main, $boxes, [string]$tag) {
+  if (-not $main) { return }
+  $h = [IntPtr]$main.Current.NativeWindowHandle
+  $fr = New-Object W+RECT; [W]::GetWindowRect($h, [ref]$fr) | Out-Null
+  $targets = @()
+  if ($boxes -and $boxes.Count -ge 1) { $targets += ,@('adapter', $boxes[0]) }
+  if ($boxes -and $boxes.Count -ge 2) { $targets += ,@('gateway', $boxes[1]) }
+  if ($targets.Count -eq 0) { L "WARN flicker: no combos at $tag"; return }
+  foreach ($pair in $targets) {
+    $name = $pair[0]; $box = $pair[1]
+    try { $box.SetFocus() } catch { L "flicker focus $name failed: $_" }
+    Start-Sleep -Milliseconds 200
+    $end = (Get-Date).AddSeconds(10)
+    $step = 0
+    while ((Get-Date) -lt $end) {
+      $phase = $step % 12
+      $x = [int](($fr.L + $fr.R) / 2); $y = [int](($fr.T + $fr.B) / 2)
+      try {
+        $bh = [IntPtr]$box.Current.NativeWindowHandle
+        $br = New-Object W+RECT; [W]::GetWindowRect($bh, [ref]$br) | Out-Null
+        if ($phase -lt 4) {
+          $x = $br.L + [int](($br.R - $br.L) * $phase / 3)
+          $y = [int](($br.T + $br.B) / 2)
+        } elseif ($phase -lt 8) {
+          $pad = 16
+          if ($phase -eq 4) { $x = $br.L - $pad; $y = $br.T - $pad }
+          elseif ($phase -eq 5) { $x = $br.R + $pad; $y = $br.T - $pad }
+          elseif ($phase -eq 6) { $x = $br.R + $pad; $y = $br.B + $pad }
+          else { $x = $br.L - $pad; $y = $br.B + $pad }
+        } else {
+          if ($phase -eq 8) { $x = $fr.L + 8; $y = $fr.T + 8 }
+          elseif ($phase -eq 9) { $x = $fr.R - 8; $y = $fr.T + 8 }
+          elseif ($phase -eq 10) { $x = $fr.R - 8; $y = $fr.B - 8 }
+          else { $x = [int](($fr.L + $fr.R) / 2); $y = [int](($fr.T + $fr.B) / 2) }
+        }
+      } catch {}
+      try { [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point $x, $y } catch {}
+      $step++
+      Start-Sleep -Milliseconds 30
+    }
+    L "flicker $tag $name: 10s mouse move done"
+    Shot $main "$tag-flicker-$name-after"
+  }
 }
 
 KillApp
@@ -226,21 +293,21 @@ KillApp
 if (Test-Path $Data) { Remove-Item -Recurse -Force $Data }
 if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir -ea SilentlyContinue }
 
-# ---- 1. Install published 2.3.135, then 2.3.136 over it ----
+# ---- 1. Install published 2.3.136, then 2.3.137 over it ----
 Scale 100
-SilentInstall $Installer135 '2.3.135'
-$v135 = DisplayVer
-L "Installed apps after 135: $v135"
-if ($v135 -ne '2.3.135') { Fail "expected DisplayVersion 2.3.135, got $v135" }
+SilentInstall $Installer136 '2.3.136'
+$v136 = DisplayVer
+L "Installed apps after 136: $v136"
+if ($v136 -ne '2.3.136') { Fail "expected DisplayVersion 2.3.136, got $v136" }
 
-L 'wizard install 2.3.136 over 2.3.135'
-Start-Process $Installer136
+L 'wizard install 2.3.137 over 2.3.136'
+Start-Process $Installer137
 $wiz = FindWin 'Setup - IPbind Beta*' 30 -Like
-if (-not $wiz) { Fail '136 wizard not found'; ShotScreen 'no-wizard-136' }
+if (-not $wiz) { Fail '137 wizard not found'; ShotScreen 'no-wizard-137' }
 else {
   for ($i = 1; $i -le 12; $i++) {
     Start-Sleep -Milliseconds 1500
-    Shot $wiz ("install-over-136-{0:D2}" -f $i)
+    Shot $wiz ("install-over-137-{0:D2}" -f $i)
     L "page $i texts: $(Texts $wiz)"
     $accept = OfKind $wiz 'RadioButton' | Where-Object { $_.Current.Name -like 'I accept*' } | Select-Object -First 1
     if ($accept) { L 'accept licence'; Click $accept | Out-Null; Start-Sleep -Milliseconds 400 }
@@ -256,10 +323,10 @@ $launched = FindWin 'IPbind Beta v*' 8 -Like
 if (-not $launched) { DismissReminder 'first-launch-popup' | Out-Null; $launched = FindWin 'IPbind Beta v*' 8 -Like }
 if ($launched) { L "launched after finish: $($launched.Current.Name)"; Shot $launched 'after-install-over-main' }
 Start-Sleep 2
-$v136 = DisplayVer
-L "Installed apps after 136 over 135 (and launch): $v136  file=$($FileVer)"
-if ($v136 -ne '2.3.136') { Fail "Installed apps did not show 2.3.136 (got $v136)" }
-if ($launched -and $launched.Current.Name -notlike '*v2.3.136b*') { Fail "title bar was '$($launched.Current.Name)', expected 2.3.136b" }
+$v137 = DisplayVer
+L "Installed apps after 137 over 136 (and launch): $v137  file=$($FileVer)"
+if ($v137 -ne '2.3.137') { Fail "Installed apps did not show 2.3.137 (got $v137)" }
+if ($launched -and $launched.Current.Name -notlike '*v2.3.137b*') { Fail "title bar was '$($launched.Current.Name)', expected 2.3.137b" }
 KillApp
 
 # ---- 2. Popup shots at 100 / 150 / 175 (reminder must appear) ----
@@ -280,10 +347,11 @@ foreach ($pct in 100, 150, 175) {
   $main = LaunchAndGetMain $null
   if ($main) {
     Shot $main "main-$pct"
-    if ($main.Current.Name -notlike '*v2.3.136b*') { Fail "title at $pct% was '$($main.Current.Name)'" }
+    if ($main.Current.Name -notlike '*v2.3.137b*') { Fail "title at $pct% was '$($main.Current.Name)'" }
     $ab = OpenAbout $main "about-$pct"
     CloseAbout $ab
-    OpenDropdowns $main "main-$pct"
+    $boxes = OpenDropdowns $main "main-$pct"
+    if ($pct -eq 100 -or $pct -eq 150) { FlickerMove $main $boxes "main-$pct" }
     if ($pct -eq 150) { Shot $main 'final-main-150-gateway' }
   }
   KillApp
@@ -305,16 +373,16 @@ if ($main) {
 } else { Scale 100 }
 KillApp
 
-# ---- 5. In-app update: published 135 -> 136 ----
+# ---- 5. In-app update: published 136 -> 137 ----
 Scale 100
-L 'in-app update path: uninstall 136, install 135, launch, click Update'
+L 'in-app update path: uninstall 137, install 136, launch, click Update'
 $unins = $null
 if (Test-Path $Key) { $us = (Get-ItemProperty $Key).UninstallString; if ($us -match '"([^"]+)"') { $unins = $Matches[1] } }
 if ($unins) { Start-Process $unins -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/REMOVEDATA=1' -Wait; Start-Sleep 2 }
 KillApp
 if (Test-Path $Data) { Remove-Item -Recurse -Force $Data }
-SilentInstall $Installer135 '2.3.135-for-update'
-if ((DisplayVer) -ne '2.3.135') { Fail "pre-update DisplayVersion was $(DisplayVer)" }
+SilentInstall $Installer136 '2.3.136-for-update'
+if ((DisplayVer) -ne '2.3.136') { Fail "pre-update DisplayVersion was $(DisplayVer)" }
 # Auto update checks on (installer default). Don't pre-create update-check.txt as manual.
 # Suppress the reminder so the UI thread can show and we can click the banner.
 SuppressReminder
@@ -324,7 +392,7 @@ if ($main) {
   # Re-acquire main after the modal reminder has closed so the update
   # banner (which is posted once the UI thread is free) can appear.
   $main = FindWin 'IPbind Beta v*' 10 -Like
-  Shot $main 'main-135-waiting-for-banner'
+  Shot $main 'main-136-waiting-for-banner'
   $deadline = (Get-Date).AddSeconds(60)
   $updateBtn = $null
   while ((Get-Date) -lt $deadline -and -not $updateBtn) {
@@ -336,28 +404,28 @@ if ($main) {
     if ($txt -like '*available*') { L "banner texts: $txt" }
     else { L "update wait: no banner yet" }
   }
-  if (-not $updateBtn) { Fail 'update banner/Update button did not appear on 2.3.135'; Shot $main 'main-135-no-banner' }
+  if (-not $updateBtn) { Fail 'update banner/Update button did not appear on 2.3.136'; Shot $main 'main-136-no-banner' }
   else {
     L 'clicking Update'
-    Shot $main 'main-135-update-banner'
+    Shot $main 'main-136-update-banner'
     Click $updateBtn | Out-Null
-    $newMain = FindWin 'IPbind Beta v2.3.136b*' 60 -Like
+    $newMain = FindWin 'IPbind Beta v2.3.137b*' 60 -Like
     if (-not $newMain) {
       # update restarts; the reminder may appear first
       DismissReminder 'popup-after-update' | Out-Null
-      $newMain = FindWin 'IPbind Beta v2.3.136b*' 20 -Like
+      $newMain = FindWin 'IPbind Beta v2.3.137b*' 20 -Like
     }
     if ($newMain) {
       L "after in-app update: $($newMain.Current.Name)  installed=$(DisplayVer) file=$($FileVer)"
       Shot $newMain 'main-after-in-app-update'
-      if ((DisplayVer) -ne '2.3.136') { Fail "after in-app update Installed apps shows $(DisplayVer)" }
-    } else { Fail 'app did not restart as 2.3.136b after in-app update'; ShotScreen 'no-main-after-update' }
+      if ((DisplayVer) -ne '2.3.137') { Fail "after in-app update Installed apps shows $(DisplayVer)" }
+    } else { Fail 'app did not restart as 2.3.137b after in-app update'; ShotScreen 'no-main-after-update' }
   }
 }
 KillApp
 
 # ---- 6. Uninstall with the remove-data step (interactive) ----
-if (-not (Test-Path $Key)) { SilentInstall $Installer136 '2.3.136-for-uninstall' }
+if (-not (Test-Path $Key)) { SilentInstall $Installer137 '2.3.137-for-uninstall' }
 # Leave a data file so we can see it go away.
 New-Item -ItemType Directory -Force $Data | Out-Null
 Set-Content (Join-Path $Data 'walk-marker.txt') 'should-be-removed'
