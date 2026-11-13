@@ -87,7 +87,7 @@ try {
       for ($yy = $y; $yy -le $y2; $yy++) { [void]$visited.Add("$x,$yy") }
       if ($x -le 2 -or $x -ge $w - 4) { continue }
 
-      # Width and label gap on the upper quarter, not mid — mid often cuts
+      # Width and label gap on the upper quarter, not mid -- mid often cuts
       # through the check glyph and the hole looks like a 1px "gap".
       $uy = $y + [Math]::Max(2, [int]($coreH / 5))
       if ($uy -gt $y2) { $uy = [int](($y + $y2) / 2) }
