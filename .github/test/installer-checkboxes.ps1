@@ -50,7 +50,7 @@ function Shot($win, [string]$name) {
   }
   if ($clipExit -gt 1) { L "FAIL $name clip-detector error (exit $clipExit)" }
   elseif ($AllowClip) {
-    if ($clipExit -ge 1) { L "NOTE $name clipped at this scale (exit $clipExit candidates=$cands) — recorded, not a job fail" }
+    if ($clipExit -ge 1) { L "NOTE $name clipped at this scale (exit $clipExit candidates=$cands) -- recorded, not a job fail" }
     elseif (($name -eq 'tasks' -or $name -eq 'finish') -and $cands -eq 0) { L "FAIL $name clip check found no checkbox candidates" }
     else { L "NOTE $name unclipped at this scale (candidates=$cands)" }
   }
@@ -147,7 +147,7 @@ else {
   else {
     Start-Sleep 1
     Shot $dlg 'uninstall-prompt'
-    # Cancel — leave the install? Cleanup silent uninstall.
+    # Cancel -- leave the install? Cleanup silent uninstall.
     $cancel = Btn $dlg 'Cancel'
     if ($cancel) { Click $cancel | Out-Null; Start-Sleep 2 }
   }

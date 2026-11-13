@@ -93,7 +93,7 @@ jobs:
         run: |
           if (Test-Path .\dist) { } else { New-Item -ItemType Directory dist | Out-Null }
           # Copy the just-built installer into dist. Never copy the frozen
-          # 2.3.139 fixture from .github/test/fixtures — that used to leave
+          # 2.3.139 fixture from .github/test/fixtures -- that used to leave
           # two exes in dist, so Get-ChildItem ...FullName became an Object[]
           # and installer-clip / walk could start the wrong installer or fail
           # Start-Process -ArgumentList.
