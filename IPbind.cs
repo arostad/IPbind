@@ -39,7 +39,7 @@ using System.Windows.Forms;
 // AppName, ReleaseTag) are generated fresh on every compile into Version.cs by
 // Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
 // DisplayVersion is Version plus a trailing "b" in Beta (title bar, About,
-// footer, log). Parsed versions, version.txt, and installer DisplayVersion
+// and the startup log). Parsed versions, version.txt, and installer DisplayVersion
 // stay the numeric Version. Prod display is unchanged.
 
 namespace IPbind
@@ -55,6 +55,7 @@ namespace IPbind
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            WindowTheme.ApplyPreferredAppMode();
             Application.Run(new MainForm());
         }
     }
@@ -842,6 +843,62 @@ namespace IPbind
         [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
 
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        public static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subId);
+
+        // uxtheme ordinal 135 (Win10 1903+): 0=Default, 1=AllowDark, 2=ForceDark.
+        [DllImport("uxtheme.dll", EntryPoint = "#135")]
+        static extern int SetPreferredAppMode(int mode);
+
+        // uxtheme ordinal 133 (Win10 1809+).
+        [DllImport("uxtheme.dll", EntryPoint = "#133")]
+        static extern int AllowDarkModeForWindow(IntPtr hWnd, int allow);
+
+        [DllImport("user32.dll")]
+        static extern bool GetComboBoxInfo(IntPtr hwndCombo, ref ComboBoxInfo info);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT
+        {
+            public int Left, Top, Right, Bottom;
+            public Rectangle ToRectangle()
+            {
+                return Rectangle.FromLTRB(Left, Top, Right, Bottom);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ComboBoxInfo
+        {
+            public int cbSize;
+            public RECT rcItem;
+            public RECT rcButton;
+            public int stateButton;
+            public IntPtr hwndCombo;
+            public IntPtr hwndItem;
+            public IntPtr hwndList;
+        }
+
+        public static bool IsAppDark()
+        {
+            try
+            {
+                object v = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "AppsUseLightTheme", 1);
+                if (v is int) return ((int)v) == 0;   // 0 = dark, 1 = light
+            }
+            catch { }
+            return false;
+        }
+
+        // Call once before any window is created so combo lists and other
+        // common-controls popups can use DarkMode_CFD / DarkMode_Explorer.
+        public static void ApplyPreferredAppMode()
+        {
+            try { SetPreferredAppMode(IsAppDark() ? 2 : 0); } catch { }   // ForceDark or Default
+        }
+
         // Tint a form's non-client title bar after its handle has been created.
         public static void ApplyTitleBar(Form form, bool dark)
         {
@@ -854,6 +911,169 @@ namespace IPbind
                     DwmSetWindowAttribute(form.Handle, 19, ref on, 4);
             }
             catch { }
+        }
+
+        public static bool TryGetComboBoxInfo(IntPtr hwnd, out ComboBoxInfo info)
+        {
+            info = new ComboBoxInfo();
+            info.cbSize = Marshal.SizeOf(typeof(ComboBoxInfo));
+            try { return hwnd != IntPtr.Zero && GetComboBoxInfo(hwnd, ref info); }
+            catch { return false; }
+        }
+
+        // DarkMode_Explorer does not style combo chrome (field, drop arrow, list).
+        // DarkMode_CFD does, on the combo HWND and on its dropdown list HWND.
+        public static void ApplyCombo(ComboBox box, bool dark)
+        {
+            if (box == null || !box.IsHandleCreated) return;
+            try { AllowDarkModeForWindow(box.Handle, dark ? 1 : 0); } catch { }
+            try { SetWindowTheme(box.Handle, dark ? "DarkMode_CFD" : null, null); } catch { }
+            ComboBoxInfo info;
+            if (!TryGetComboBoxInfo(box.Handle, out info)) return;
+            if (info.hwndItem != IntPtr.Zero)
+            {
+                try { AllowDarkModeForWindow(info.hwndItem, dark ? 1 : 0); } catch { }
+                try { SetWindowTheme(info.hwndItem, dark ? "DarkMode_CFD" : null, null); } catch { }
+            }
+            if (info.hwndList != IntPtr.Zero)
+            {
+                try { AllowDarkModeForWindow(info.hwndList, dark ? 1 : 0); } catch { }
+                try { SetWindowTheme(info.hwndList, dark ? "DarkMode_CFD" : null, null); } catch { }
+            }
+        }
+    }
+
+    // Main-window dropdown (LAN interface and "Use gateway on"). Owner-draw
+    // keeps the closed field free of the system-blue focus highlight. In dark
+    // mode the OS still paints a white field and arrow (especially when the
+    // box is empty and DrawItem never runs), so we theme with DarkMode_CFD and
+    // overpaint the closed chrome ourselves. Layout is unchanged.
+    sealed class ThemedComboBox : ComboBox
+    {
+        const int WM_PAINT = 0x000F;
+        const int WM_PRINTCLIENT = 0x0318;
+
+        public bool UseDarkChrome;
+
+        public ThemedComboBox()
+        {
+            DrawMode = DrawMode.OwnerDrawFixed;
+            DropDownStyle = ComboBoxStyle.DropDownList;
+        }
+
+        public void ApplyDark(bool dark)
+        {
+            UseDarkChrome = dark;
+            if (dark) FlatStyle = FlatStyle.Standard;
+            if (IsHandleCreated) WindowTheme.ApplyCombo(this, dark);
+            Invalidate();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+        }
+
+        protected override void OnDropDown(EventArgs e)
+        {
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+            base.OnDropDown(e);
+        }
+
+        protected override void OnDropDownClosed(EventArgs e)
+        {
+            base.OnDropDownClosed(e);
+            Invalidate();
+        }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            base.OnEnabledChanged(e);
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+            Invalidate();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (UseDarkChrome && (m.Msg == WM_PAINT || m.Msg == WM_PRINTCLIENT))
+                PaintDarkChrome();
+        }
+
+        void PaintDarkChrome()
+        {
+            if (!IsHandleCreated) return;
+            WindowTheme.ComboBoxInfo info;
+            bool have = WindowTheme.TryGetComboBoxInfo(Handle, out info);
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(Handle))
+                {
+                    Rectangle client = ClientRectangle;
+                    if (client.Width <= 0 || client.Height <= 0) return;
+                    Color field = BackColor;
+                    Color border = Color.FromArgb(80, 80, 80);
+                    Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
+
+                    using (SolidBrush brush = new SolidBrush(field))
+                    {
+                        g.FillRectangle(brush, client);
+                        if (have)
+                        {
+                            Rectangle button = info.rcButton.ToRectangle();
+                            if (button.Width <= 0)
+                                button = new Rectangle(
+                                    client.Right - Math.Max(16, client.Height),
+                                    client.Top, Math.Max(16, client.Height), client.Height);
+                            // Keep the arrow well dark even if the theme paints it light.
+                            g.FillRectangle(brush, button);
+                            DrawChevron(g, button, fore);
+                        }
+                    }
+
+                    using (Pen pen = new Pen(border))
+                        g.DrawRectangle(pen, client.X, client.Y, client.Width - 1, client.Height - 1);
+
+                    string text = Text;
+                    if (string.IsNullOrEmpty(text) && SelectedIndex >= 0 && SelectedIndex < Items.Count)
+                        text = Items[SelectedIndex].ToString();
+                    Rectangle item = have ? info.rcItem.ToRectangle() : client;
+                    int pad = Math.Max(3, (int)Math.Round(3 * g.DpiX / 96f));
+                    Rectangle textBounds = new Rectangle(
+                        item.X + pad, item.Y,
+                        Math.Max(0, item.Width - pad * 2), item.Height);
+                    if (!string.IsNullOrEmpty(text) && textBounds.Width > 0)
+                    {
+                        TextRenderer.DrawText(
+                            g, text, Font, textBounds, fore,
+                            TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                            TextFormatFlags.NoPadding);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        static void DrawChevron(Graphics g, Rectangle button, Color color)
+        {
+            if (button.Width <= 0 || button.Height <= 0) return;
+            int cx = button.X + button.Width / 2;
+            int cy = button.Y + button.Height / 2;
+            int w = Math.Max(3, button.Height / 5);
+            int h = Math.Max(2, button.Height / 7);
+            Point[] pts = new Point[]
+            {
+                new Point(cx - w, cy - h / 2),
+                new Point(cx + w, cy - h / 2),
+                new Point(cx, cy + h + h / 2)
+            };
+            SmoothingMode old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (SolidBrush brush = new SolidBrush(color))
+                g.FillPolygon(brush, pts);
+            g.SmoothingMode = old;
         }
     }
 
@@ -3451,7 +3671,6 @@ namespace IPbind
         Button btnUpdateNow, btnUpdateLater;
         Button btnClear;
         Button btnAbout;
-        Label lblVersion;
         CheckBox chkKeepDhcp;
         ToolTip keepDhcpTip;
         bool keepDhcpPref = true;     // what the user chose; the box is forced off where unsupported
@@ -5073,25 +5292,9 @@ namespace IPbind
         }
 
         // ---------------- dark mode ----------------
-        // Themes a control's scrollbars/borders. "DarkMode_Explorer" gives dark scrollbars.
-        [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-        static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subId);
-
-        // uxtheme ordinal 135 (Win10 1903+): 0=Default,1=AllowDark,2=ForceDark. Best-effort.
-        [System.Runtime.InteropServices.DllImport("uxtheme.dll", EntryPoint = "#135")]
-        static extern int SetPreferredAppMode(int mode);
-
         static bool IsDarkMode()
         {
-            try
-            {
-                object v = Microsoft.Win32.Registry.GetValue(
-                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                    "AppsUseLightTheme", 1);
-                if (v is int) return ((int)v) == 0;   // 0 = dark, 1 = light
-            }
-            catch { }
-            return false;
+            return WindowTheme.IsAppDark();
         }
 
         const int WM_DPICHANGED = 0x02E0;
@@ -5141,7 +5344,7 @@ namespace IPbind
             FitToWorkingArea(true);
             if (dark)
             {
-                try { SetPreferredAppMode(1); } catch { }   // AllowDark (best-effort, Win10 1903+)
+                WindowTheme.ApplyPreferredAppMode();
                 DarkenScrollbars(this.Controls);
             }
             CheckForUpdatesOnLaunch();
@@ -5207,9 +5410,7 @@ namespace IPbind
             int consoleHeight = Math.Min(U(466), Math.Max(U(140), availableHeight - U(94)));
             console.Size = new Size(consoleWidth, consoleHeight);
             btnClear.Location = new Point(console.Right - U(80), U(14));
-            btnAbout.Location = new Point(console.Left, console.Bottom + U(10));
-            lblVersion.Location =
-                new Point(console.Right - U(160), console.Bottom + U(14));
+            btnAbout.Location = new Point(console.Right - btnAbout.Width, console.Bottom + U(10));
         }
 
         void FitToWorkingArea(bool center)
@@ -5268,13 +5469,21 @@ namespace IPbind
 
         // Give scrollable controls dark scrollbars. WinForms paints scrollbars with the OS
         // theme and ignores BackColor, so this is the only way to darken them.
+        // ComboBoxes use DarkMode_CFD (and ThemedComboBox chrome); Explorer does not
+        // style combo fields, arrows, or the open list.
         void DarkenScrollbars(Control.ControlCollection cc)
         {
             foreach (Control c in cc)
             {
-                if (c is TextBox || c is ComboBox || c is ListBox)
+                if (c is ComboBox)
                 {
-                    try { SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
+                    ThemedComboBox themed = c as ThemedComboBox;
+                    if (themed != null) themed.ApplyDark(true);
+                    else WindowTheme.ApplyCombo((ComboBox)c, true);
+                }
+                else if (c is TextBox || c is ListBox)
+                {
+                    try { WindowTheme.SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
                 }
                 if (c.Controls.Count > 0) DarkenScrollbars(c.Controls);
             }
@@ -5300,7 +5509,7 @@ namespace IPbind
                 back = dark ? Color.FromArgb(70, 70, 70) : SystemColors.Highlight;
                 fore = dark ? FgCol : SystemColors.HighlightText;
             }
-            else if ((e.State & DrawItemState.Disabled) != 0)
+            else if (!combo.Enabled || (e.State & DrawItemState.Disabled) != 0)
             {
                 fore = dark ? SubCol : SystemColors.GrayText;
             }
@@ -5368,9 +5577,11 @@ namespace IPbind
                 }
                 else if (c is ComboBox)
                 {
-                    c.BackColor = PanelCol;
+                    c.BackColor = InputCol;
                     c.ForeColor = FgCol;
-                    ((ComboBox)c).FlatStyle = FlatStyle.Flat;
+                    ThemedComboBox themed = c as ThemedComboBox;
+                    if (themed != null) themed.ApplyDark(true);
+                    else ((ComboBox)c).FlatStyle = FlatStyle.Standard;
                 }
                 else if (c is LinkLabel)
                 {
@@ -5440,7 +5651,7 @@ namespace IPbind
             lblAdapter.AutoSize = true;
             Controls.Add(lblAdapter);
 
-            combo = new ComboBox();
+            combo = new ThemedComboBox();
             combo.Location = P(20, 94);
             combo.Size = Z(420, 24);
             combo.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -5544,7 +5755,7 @@ namespace IPbind
             // Gateway rows (hidden until Gateway support is on). They sit in the bottom
             // 62px of the IP list's normal area, which the list gives up when shown.
             lblGwOn = MakeRowLabel("Use gateway on:", 20, 310);
-            cboGwIp = new ComboBox();
+            cboGwIp = new ThemedComboBox();
             cboGwIp.Location = P(122, 310);
             cboGwIp.Size = Z(150, 24);
             cboGwIp.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -5666,7 +5877,9 @@ namespace IPbind
             updateBanner.Controls.Add(btnUpdateLater);
             Controls.Add(updateBanner);
 
-            btnAbout = MakeButton("About", 560, 520, 96, 26);
+            // 984 = console left (560) + console width (520) - About width (96),
+            // so the button is right-aligned with the console from the first paint.
+            btnAbout = MakeButton("About", 984, 520, 96, 26);
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
@@ -5674,16 +5887,6 @@ namespace IPbind
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);
-
-            lblVersion = new Label();
-            lblVersion.Text = "v" + BuildInfo.DisplayVersion;
-            lblVersion.Font = UiFont(8F, FontStyle.Regular);
-            lblVersion.AutoSize = false;
-            lblVersion.TextAlign = ContentAlignment.MiddleRight;
-            lblVersion.Location = P(920, 524);
-            lblVersion.Size = Z(160, 20);
-            lblVersion.ForeColor = Color.FromArgb(120, 120, 120);
-            Controls.Add(lblVersion);
 
             ApplyTheme();
             this.ResumeLayout(true);
