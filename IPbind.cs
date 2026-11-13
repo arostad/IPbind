@@ -80,6 +80,8 @@ namespace IPbind
 
         const int KeepDays = 14;
         const long MaxTotalBytes = 10L * 1024L * 1024L;
+        const int FlushEveryMs = 5000;
+        const int FlushAtCount = 500;
         const int UiStallMs = 250;
         const int PaintWarnPerMinute = 300;
         const int FirstChanceMaxPerWindow = 20;
@@ -88,10 +90,16 @@ namespace IPbind
         static readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
         static readonly AutoResetEvent pulse = new AutoResetEvent(false);
         static readonly object startGate = new object();
+        static readonly object diskGate = new object();
         static Thread writer;
         static volatile bool started;
         static volatile bool stopping;
         static string logDir;
+        static string logDirOverride;
+        static int queuedCount;
+        static int diskWrites;
+        static readonly System.Collections.Generic.List<int> diskWriteSizes = new System.Collections.Generic.List<int>();
+        static System.Threading.Timer rotateTimer;
         static SynchronizationContext uiContext;
         static int lastUiTick;
         static int lastStallLogTick;
@@ -129,10 +137,22 @@ namespace IPbind
             }
             try
             {
-                logDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    BuildInfo.AppName, "logs");
+                if (!string.IsNullOrEmpty(logDirOverride))
+                    logDir = logDirOverride;
+                else
+                    logDir = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        BuildInfo.AppName, "logs");
                 Directory.CreateDirectory(logDir);
+                Rotate(CurrentLogPath());
+                rotateTimer = new System.Threading.Timer(delegate
+                {
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(logDir)) Rotate(CurrentLogPath());
+                    }
+                    catch { }
+                }, null, 60 * 60 * 1000, 60 * 60 * 1000);
             }
             catch (Exception ex)
             {
@@ -177,6 +197,7 @@ namespace IPbind
             Write("INFO", "Debug log started (local only, never sent). fileDir=" + logDir);
             LogStartup();
             LogElevation();
+            Flush();
         }
 
         public static void Stop()
@@ -197,9 +218,37 @@ namespace IPbind
             catch { }
             try { if (metricsTimer != null) metricsTimer.Dispose(); } catch { }
             try { if (paintTimer != null) paintTimer.Dispose(); } catch { }
+            try { if (rotateTimer != null) rotateTimer.Dispose(); } catch { }
             pulse.Set();
             try { if (writer != null) writer.Join(2000); } catch { }
             FlushToDisk();
+        }
+
+        // Test hook: redirect logs away from the real Beta logs folder.
+        public static void SetLogDirectoryForTest(string dir)
+        {
+            logDirOverride = dir;
+        }
+
+        public static int DiskWriteCount
+        {
+            get { return diskWrites; }
+        }
+
+        public static void ResetDiskWriteCount()
+        {
+            Interlocked.Exchange(ref diskWrites, 0);
+            lock (diskWriteSizes) { diskWriteSizes.Clear(); }
+        }
+
+        public static int[] DiskWriteSizes
+        {
+            get { lock (diskWriteSizes) { return diskWriteSizes.ToArray(); } }
+        }
+
+        public static int QueuedCount
+        {
+            get { return queuedCount; }
         }
 
         public static void Write(string level, string message)
@@ -209,7 +258,13 @@ namespace IPbind
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)
                 + " " + level + " " + message;
             queue.Enqueue(line);
-            pulse.Set();
+            int n = Interlocked.Increment(ref queuedCount);
+            // Do not pulse the writer for every line (SSD wear). ERROR flushes
+            // immediately; other levels wait for the 5 s loop or a 500-line batch.
+            if (level != null && string.Equals(level, "ERROR", StringComparison.OrdinalIgnoreCase))
+                FlushToDisk();
+            else if (n == FlushAtCount)
+                pulse.Set();
         }
 
         public static void Debug(string message) { Write("DEBUG", message); }
@@ -227,13 +282,7 @@ namespace IPbind
         public static void Flush()
         {
             if (!Enabled || !started) return;
-            pulse.Set();
-            int spins = 0;
-            while (!queue.IsEmpty && spins < 200)
-            {
-                Thread.Sleep(10);
-                spins++;
-            }
+            FlushToDisk();
         }
 
         public static IDisposable Time(string name)
@@ -407,12 +456,20 @@ namespace IPbind
             }
         }
 
+        static string CurrentLogPath()
+        {
+            string name = "ipbind-beta-" + DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".log";
+            return Path.Combine(logDir, name);
+        }
+
         static void WriterLoop()
         {
             while (true)
             {
-                pulse.WaitOne(1000);
+                pulse.WaitOne(FlushEveryMs);
                 FlushToDisk();
+                while (queuedCount >= FlushAtCount)
+                    FlushToDisk();
                 if (stopping && queue.IsEmpty) break;
             }
         }
@@ -420,19 +477,32 @@ namespace IPbind
         static void FlushToDisk()
         {
             if (string.IsNullOrEmpty(logDir)) return;
-            string name = "ipbind-beta-" + DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".log";
-            string path = Path.Combine(logDir, name);
-            StringBuilder batch = new StringBuilder();
-            string line;
-            while (queue.TryDequeue(out line))
-                batch.Append(line).Append("\r\n");
-            if (batch.Length == 0) return;
-            try
+            lock (diskGate)
             {
-                File.AppendAllText(path, batch.ToString());
-                Rotate(path);
+                string path = CurrentLogPath();
+                StringBuilder batch = new StringBuilder();
+                string line;
+                int taken = 0;
+                while (queue.TryDequeue(out line))
+                {
+                    batch.Append(line).Append("\r\n");
+                    taken++;
+                }
+                if (taken > 0) Interlocked.Add(ref queuedCount, -taken);
+                if (batch.Length == 0) return;
+                try
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(batch.ToString());
+                    using (FileStream fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read))
+                    {
+                        fs.Write(bytes, 0, bytes.Length);
+                        fs.Flush();
+                    }
+                    Interlocked.Increment(ref diskWrites);
+                    lock (diskWriteSizes) { diskWriteSizes.Add(taken); }
+                }
+                catch { }
             }
-            catch { }
         }
 
         static void Rotate(string currentPath)

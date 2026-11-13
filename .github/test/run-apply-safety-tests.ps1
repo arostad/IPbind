@@ -53,7 +53,7 @@ namespace IPbind
 '@
 Set-Content -Path .\Version-prod-test.cs -Value $prodVer -Encoding UTF8
 $logArgs = @(
-  '/nologo', '/target:exe', '/out:debug-log-prod-tests.exe',
+  '/nologo', '/warnaserror+', '/target:exe', '/out:debug-log-prod-tests.exe',
   '/main:IPbindTest.DebugLogTest',
   '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
   '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
@@ -63,3 +63,16 @@ $logArgs = @(
 if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test compile failed' }
 & .\debug-log-prod-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Prod debug-log test failed' }
+
+# Beta-channel compile: coalesced INFO writes, immediate ERROR/Stop flush.
+$logBetaArgs = @(
+  '/nologo', '/warnaserror+', '/target:exe', '/out:debug-log-batch-tests.exe',
+  '/main:IPbindTest.DebugLogBatchTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\DebugLogBatchTest.cs'
+)
+& $csc @logBetaArgs
+if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test compile failed' }
+& .\debug-log-batch-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test failed' }
