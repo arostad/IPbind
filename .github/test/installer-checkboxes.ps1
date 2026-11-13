@@ -78,7 +78,10 @@ for ($i = 1; $i -le 14; $i++) {
   Start-Sleep -Milliseconds 1500
   $t = Texts $wiz
   L "page $i texts: $t"
-  if ($t -match 'Check for updates at launch') {
+  # Match the Tasks page by its title. The Ready-to-Install summary also
+  # contains "Check for updates at launch", which is how 73a4e91 shot the
+  # wrong page (no checkbox) and the clip check passed with candidates=0.
+  if ($t -match 'Select Additional Tasks') {
     Shot $wiz 'tasks'
     $gotTasks = $true
   } elseif ($t -match 'Launch IPbind') {
