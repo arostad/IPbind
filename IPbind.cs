@@ -1559,6 +1559,16 @@ namespace IPbind
         const string PrivacyLine1 = "Each update check sends one anonymous request to the IPbind update server.";
         const string PrivacyLine2 = "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. No identifiers, cookies, or telemetry are used.";
 
+        // Fixed design-pixel gaps (Andy, 2.3.136). If the privacy note needs
+        // more room, only the window height grows. These are never reduced.
+        const int GapAfterTagline = 18;
+        const int GapCreditToLicense = 8;
+        const int GapLicenseToCheckbox = 16;
+        const int GapCheckboxToStatus = 16;
+        const int GapAbovePrivacy = 18;
+        const int GapPrivacyToFooter = 20;
+        const int FooterPadX = 28, FooterPadTop = 16, FooterPadBot = 18, FooterBtnH = 32;
+
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
             this.updateCheckFile = updateCheckFile;
@@ -1865,9 +1875,8 @@ namespace IPbind
                 int width = U(500);
                 int padX = U(28);
                 int padTop = U(22);
-                int padBot = U(20);
-                // The privacy note is two sentences that wrap inside the 500px
-                // mockup width; the dialog grows in height to fit (Andy, 2.3.136).
+                // The privacy note wraps inside the 500px mockup width. Extra
+                // lines make the dialog taller; gaps below stay as named above.
                 int inner = width - 2 * padX;
                 int y = padTop;
 
@@ -1936,25 +1945,25 @@ namespace IPbind
                 Size tagSize = MeasureWrap(tagline.Text, fontBody, inner);
                 tagline.Location = new Point(padX, y);
                 tagline.Size = new Size(inner, tagSize.Height);
-                y = tagline.Bottom + U(18);
+                y = tagline.Bottom + U(GapAfterTagline);
 
                 // Credit and license stacked, left-aligned, nothing to their right.
                 Size creditNeed = MeasureLine(creditLink.Text, fontBody);
                 creditLink.Location = new Point(padX, y);
                 creditLink.Size = new Size(Math.Min(inner, LinkWidth(creditLink.Text, fontBody)), creditNeed.Height);
-                y = creditLink.Bottom + U(8);
+                y = creditLink.Bottom + U(GapCreditToLicense);
                 Size licNeed = MeasureLine(licenseLink.Text, fontBody);
                 licenseLink.Location = new Point(padX, y);
                 licenseLink.Size = new Size(Math.Min(inner, LinkWidth(licenseLink.Text, fontBody)), licNeed.Height);
                 y = licenseLink.Bottom;
 
-                y += U(16);
+                y += U(GapLicenseToCheckbox);
                 int chkBox = U(20);
                 Size boxNeed = MeasureWrap(launchCheckLabel.Text, fontBody, inner - chkBox - U(12));
                 y += LayoutLaunchCheck(padX, y, inner - chkBox - U(12), chkBox, boxNeed);
                 if (!string.IsNullOrEmpty(statusLabel.Text))
                 {
-                    y += U(16);
+                    y += U(GapCheckboxToStatus);
                     Size st = MeasureWrap(statusLabel.Text, fontStatus, inner);
                     statusLabel.Location = new Point(padX, y);
                     statusLabel.Size = new Size(inner, st.Height);
@@ -1967,16 +1976,16 @@ namespace IPbind
                     statusLabel.Size = new Size(inner, 0);
                 }
 
-                y += U(18);
+                y += U(GapAbovePrivacy);
                 Size priv = MeasureWrap(privacyLabel.Text, fontPrivacy, inner);
                 privacyLabel.Location = new Point(padX, y);
                 privacyLabel.Size = new Size(inner, priv.Height);
-                y = privacyLabel.Bottom + padBot;
+                y = privacyLabel.Bottom + U(GapPrivacyToFooter);
 
-                int footerPadX = U(28);
-                int footerPadTop = U(16);
-                int footerPadBot = U(18);
-                int btnH = U(32);
+                int footerPadX = U(FooterPadX);
+                int footerPadTop = U(FooterPadTop);
+                int footerPadBot = U(FooterPadBot);
+                int btnH = U(FooterBtnH);
                 Size checkNeed = MeasureLine(checkButton.Text, fontButton);
                 Size closeNeed = MeasureLine(closeButton.Text, fontButtonBold);
                 int checkW = Math.Max(U(96), checkNeed.Width + U(32));
