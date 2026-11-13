@@ -664,6 +664,31 @@ namespace IPbindTest
             return problems == 0 ? 0 : 1;
         }
 
+
+        static int CountGutterThumb(string png, IPbind.MainForm main, IPbind.AutoHideScrollBox box, List<string> lines, string tag)
+        {
+            if (!File.Exists(png) || !box.IsHandleCreated) { lines.Add("gutter thumb " + tag + " missing shot"); return 0; }
+            Rectangle win = WinRect(main.Handle);
+            Rectangle ov = box.OverlayScreenRect;
+            Rectangle area = new Rectangle(ov.X - win.X, ov.Y - win.Y, ov.Width, ov.Height);
+            int mid = 0, total = 0;
+            using (Bitmap b = new Bitmap(png))
+            {
+                area.Intersect(new Rectangle(0, 0, b.Width, b.Height));
+                for (int y = area.Top; y < area.Bottom; y++)
+                    for (int x = area.Left; x < area.Right; x++)
+                    {
+                        Color c = b.GetPixel(x, y);
+                        total++;
+                        int avg = (c.R + c.G + c.B) / 3;
+                        if (avg >= 80 && avg <= 200 && Math.Abs(c.R - c.G) < 25 && Math.Abs(c.G - c.B) < 25)
+                            mid++;
+                    }
+            }
+            lines.Add("gutter thumb " + tag + " midPx=" + mid + " area=" + area + " of " + total);
+            return mid;
+        }
+
         static int CheckGutter(IPbind.AutoHideScrollBox box, string name, List<string> lines)
         {
             RECT r = new RECT();
@@ -689,7 +714,10 @@ namespace IPbindTest
             Pump(5800);
             lines.Add(name + " after 5.8s away shown=" + box.BarShown + " pointer=" + box.State.PointerOver);
             if (box.BarShown) { lines.Add("SCROLLHIDE STILL SHOWN after idle " + name); problems++; }
-            Capture(main.Handle, outPrefix + "-" + name + "-hidden.png");
+            string hiddenPng = outPrefix + "-" + name + "-hidden.png";
+            Capture(main.Handle, hiddenPng);
+            int hiddenPx = CountGutterThumb(hiddenPng, main, box, lines, "hidden");
+            if (hiddenPx >= 20) { lines.Add("SCROLLHIDE THUMB STILL PAINTED after idle " + name); problems++; }
 
             Rectangle bar = box.OverlayScreenRect;
             if (bar.IsEmpty) { lines.Add("SCROLLHIDE no overlay " + name); return problems + 1; }
@@ -698,7 +726,10 @@ namespace IPbindTest
             Pump(800);
             lines.Add(name + " on bar shown=" + box.BarShown + " rect=" + bar);
             if (!box.BarShown) { lines.Add("SCROLLHIDE NOT SHOWN on hover " + name); problems++; }
-            Capture(main.Handle, outPrefix + "-" + name + "-hover.png");
+            string hoverPng = outPrefix + "-" + name + "-hover.png";
+            Capture(main.Handle, hoverPng);
+            int hoverPx = CountGutterThumb(hoverPng, main, box, lines, "hover");
+            if (hoverPx < 10) { lines.Add("SCROLLHIDE THUMB NOT PAINTED on hover " + name); problems++; }
 
             // Cursor parked on the bar: must stay visible past 5s.
             Pump(6000);
