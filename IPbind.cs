@@ -1037,6 +1037,7 @@ namespace IPbind
         bool dpiChanging;
         bool inSizeMove;
         Rectangle layoutWork = Rectangle.Empty;
+        Rectangle layoutWorkUsed = Rectangle.Empty;
         int pendingDpi;
         Rectangle pendingRect;
 
@@ -1120,6 +1121,7 @@ namespace IPbind
         protected void SetLayoutClientSize(Size client)
         {
             layoutClient = client;
+            layoutWorkUsed = CurrentWorkArea();
             if (!IsHandleCreated) { ClientSize = client; return; }
             if (deferResize) return;
             Size win = DpiWindow.WindowSizeFor(Handle, client, CurrentDpi());
@@ -1172,6 +1174,19 @@ namespace IPbind
                     Rectangle b = DpiWindow.Bounds(Handle);
                     Log("shown: window dpi " + dpi + " differs from scale " + sc);
                     ApplyDpi(dpi, b, false);
+                }
+            }
+            if (IsHandleCreated && !dpiChanging)
+            {
+                // The first layout ran before the window existed, against the
+                // primary screen's work area. If the dialog opened on a monitor
+                // with a different work area, lay it out again for that one.
+                Rectangle b = DpiWindow.Bounds(Handle);
+                Rectangle work = DpiWindow.WorkAreaFor(Handle, b);
+                if (!work.IsEmpty && work != layoutWorkUsed)
+                {
+                    Log("shown: work area " + work + " differs from layout work area " + layoutWorkUsed);
+                    ApplyDpi((int)Math.Round(sc * 96f), b, true, true);
                 }
             }
             base.OnShown(e);
@@ -1259,6 +1274,11 @@ namespace IPbind
 
         void ApplyDpi(int dpi, Rectangle suggested, bool clamp)
         {
+            ApplyDpi(dpi, suggested, clamp, false);
+        }
+
+        void ApplyDpi(int dpi, Rectangle suggested, bool clamp, bool relayout)
+        {
             dpiChanging = true;
             try
             {
@@ -1273,11 +1293,12 @@ namespace IPbind
                     layoutWork = work;
                     try
                     {
-                        if (Math.Abs(newSc - sc) > 0.001f)
+                        if (relayout || Math.Abs(newSc - sc) > 0.001f)
                         {
                             sc = newSc;
                             LayoutContent();
                         }
+                        relayout = false;
                     }
                     finally
                     {
@@ -1330,8 +1351,6 @@ namespace IPbind
     {
         readonly bool dark;
         readonly string updateCheckFile;
-        readonly bool portableCopy;
-        bool showEnableLaunchLink;
         readonly bool checkMatchOnShow;
         readonly Color bodyBack, footerBack, footerRule, fore, muted, quiet, linkColor, linkActive;
         readonly Color secondaryBack, secondaryBorder, secondaryFore, primaryBack, primaryFore;
@@ -1347,7 +1366,6 @@ namespace IPbind
         readonly LinkLabel sourceLink;
         readonly LinkLabel licenseLink;
         readonly CheckBox launchCheckBox;
-        readonly LinkLabel enableLaunchLink;
         readonly Label statusLabel;
         readonly Label privacyLabel;
         readonly Panel footer;
@@ -1375,7 +1393,6 @@ namespace IPbind
             StartPosition = FormStartPosition.CenterParent;
             try { Icon = owner.Icon; } catch { }
 
-            portableCopy = !IsInstalledCopy();
             bool launchEnabled = ReadLaunchCheckEnabled();
             checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
 
@@ -1438,20 +1455,13 @@ namespace IPbind
                 "https://github.com/arostad/IPbind/blob/main/LICENSE");
 
             launchCheckBox = new CheckBox();
-            launchCheckBox.Text = "Check for updates at launch";
+            launchCheckBox.Text = "Check for updates at launch (recommended)";
             launchCheckBox.UseMnemonic = false;
             launchCheckBox.AutoSize = false;
             launchCheckBox.Checked = launchEnabled;
-            launchCheckBox.Visible = portableCopy;
+            // Shown in installed and portable copies alike, whatever was picked at install.
+            launchCheckBox.Visible = true;
             launchCheckBox.CheckedChanged += LaunchCheckChanged;
-
-            enableLaunchLink = MakeLink("Turn on automatic update checks\u2026",
-                "Turn on automatic update checks\u2026", null);
-            // The installed "turn on" link runs the privacy-consent flow, not a URL.
-            enableLaunchLink.Links[0].LinkData = "launch-checks";
-            showEnableLaunchLink = !portableCopy && !launchEnabled;
-            enableLaunchLink.Visible = showEnableLaunchLink;
-            enableLaunchLink.LinkClicked += EnableLaunchChecks;
 
             statusLabel = MakeLabel();
             statusLabel.Text = "";
@@ -1494,7 +1504,6 @@ namespace IPbind
             Controls.Add(creditLink);
             Controls.Add(licenseLink);
             Controls.Add(launchCheckBox);
-            Controls.Add(enableLaunchLink);
             Controls.Add(statusLabel);
             Controls.Add(privacyLabel);
             Controls.Add(footer);
@@ -1626,7 +1635,6 @@ namespace IPbind
                 launchCheckBox.Font = fontBody;
                 launchCheckBox.ForeColor = fore;
                 launchCheckBox.BackColor = bodyBack;
-                StyleLink(enableLaunchLink); enableLaunchLink.Font = fontBody;
                 statusLabel.Font = fontStatus; statusLabel.ForeColor = quiet;
                 privacyLabel.Font = fontPrivacy; privacyLabel.ForeColor = quiet;
                 checkButton.Font = fontButton;
@@ -1729,33 +1737,15 @@ namespace IPbind
                 licenseLink.Size = new Size(Math.Min(inner, LinkWidth(licenseLink.Text, fontBody)), licNeed.Height);
                 y = licenseLink.Bottom;
 
-                // Control.Visible is false while the form itself is hidden, so layout
-                // from our own flags rather than the getter.
-                if (portableCopy)
-                {
-                    y += U(16);
-                    Size boxNeed = MeasureWrap(launchCheckBox.Text, fontBody, inner - U(24));
-                    int boxH = Math.Max(U(20), boxNeed.Height);
-                    launchCheckBox.Location = new Point(padX, y);
-                    launchCheckBox.Size = new Size(inner, boxH);
-                    launchCheckBox.CheckAlign = ContentAlignment.MiddleLeft;
-                    launchCheckBox.TextAlign = ContentAlignment.MiddleLeft;
-                    launchCheckBox.Visible = true;
-                    y = launchCheckBox.Bottom;
-                }
-                else
-                    launchCheckBox.Visible = false;
-                if (showEnableLaunchLink)
-                {
-                    y += U(16);
-                    Size linkNeed = MeasureLine(enableLaunchLink.Text, fontBody);
-                    enableLaunchLink.Location = new Point(padX, y);
-                    enableLaunchLink.Size = new Size(Math.Min(inner, LinkWidth(enableLaunchLink.Text, fontBody)), linkNeed.Height);
-                    enableLaunchLink.Visible = true;
-                    y = enableLaunchLink.Bottom;
-                }
-                else
-                    enableLaunchLink.Visible = false;
+                y += U(16);
+                Size boxNeed = MeasureWrap(launchCheckBox.Text, fontBody, inner - U(24));
+                int boxH = Math.Max(U(20), boxNeed.Height);
+                launchCheckBox.Location = new Point(padX, y);
+                launchCheckBox.Size = new Size(inner, boxH);
+                launchCheckBox.CheckAlign = ContentAlignment.MiddleLeft;
+                launchCheckBox.TextAlign = ContentAlignment.MiddleLeft;
+                launchCheckBox.Visible = true;
+                y = launchCheckBox.Bottom;
                 if (!string.IsNullOrEmpty(statusLabel.Text))
                 {
                     y += U(16);
@@ -1989,22 +1979,6 @@ namespace IPbind
             }
         }
 
-        // Installed = Inno Setup's uninstaller (unins*.exe + unins*.dat) sits next to
-        // the running exe. Every installed copy (prod or beta, any version) has it,
-        // the in-app updater never touches it, and portable copies never do.
-        static bool IsInstalledCopy()
-        {
-            try
-            {
-                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
-                if (string.IsNullOrEmpty(dir)) return false;
-                foreach (string dat in Directory.GetFiles(dir, "unins*.dat"))
-                    if (File.Exists(Path.ChangeExtension(dat, ".exe"))) return true;
-            }
-            catch { }
-            return false;
-        }
-
         void SetLaunchCheckSilently(bool value)
         {
             settingLaunchCheck = true;
@@ -2012,7 +1986,7 @@ namespace IPbind
             finally { settingLaunchCheck = false; }
         }
 
-        // Portable checkbox: turning checks ON needs consent to the installer's
+        // Update checkbox (installed and portable): turning checks ON needs consent to the installer's
         // privacy text (Cancel reverts); turning them OFF saves "manual" at once.
         void LaunchCheckChanged(object sender, EventArgs e)
         {
@@ -2038,20 +2012,6 @@ namespace IPbind
                 }
                 SetStatus("Automatic update checks are off. Use Check for updates any time.");
             }
-        }
-
-        // Installed link. Consent first: the same privacy text the installer shows. "I Agree" saves
-        // "auto" and removes the link immediately; Cancel changes nothing.
-        void EnableLaunchChecks(object sender, LinkLabelLinkClickedEventArgs e)
-        {
-            bool agreed;
-            using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
-                agreed = consent.ShowDialog(this) == DialogResult.OK;
-            if (!agreed || !WriteLaunchCheckMode("auto")) return;
-
-            showEnableLaunchLink = false;
-            enableLaunchLink.Visible = false;
-            SetStatus("Updates will now be checked at launch.");
         }
 
         static bool TryGetHttpsUrl(string value, out Uri uri)
@@ -2537,12 +2497,12 @@ namespace IPbind
 
         int MaxClientHeight()
         {
+            // The real work area of the dialog's monitor, in device pixels. No fixed
+            // pixel cap: a 1040 px cap here made a 4K screen at 175% or 200% look
+            // like a full 1080p one, so the dialog widened when it already fit.
             Rectangle work = CurrentWorkArea();
             int chromeH = ChromeSize().Height;
-            // Also cap to a 1080p working area (1920x1040) so 200% still fits
-            // when the current screen is taller (CI runners often have no taskbar).
-            int workH = Math.Min(work.Height, 1040);
-            return Math.Max(U(360), workH - chromeH - 16);
+            return Math.Max(U(360), work.Height - chromeH - 16);
         }
 
 
@@ -2641,7 +2601,7 @@ namespace IPbind
                     {
                         Rectangle work = CurrentWorkArea();
                         int chromeW = ChromeSize().Width;
-                        maxW = Math.Max(U(420), Math.Min(work.Width, 1920) - chromeW - 4);
+                        maxW = Math.Max(U(420), work.Width - chromeW - 4);
                     }
                     if (width > maxW) width = maxW;
                     int inner = width - 2 * padX;

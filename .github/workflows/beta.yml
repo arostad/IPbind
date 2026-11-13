@@ -111,7 +111,7 @@ jobs:
 
           IPbind Beta is a separate app: its own name, dark-gray and amber icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
 
-          The setup reminder now resizes to fit when you drag it to a monitor with a different scale, so its checkboxes and buttons are no longer cut off. The reminder and About use the lighter type weights from the design, and the reminder has larger checkboxes. In About, the GitHub project page link sits next to ipbind.com. In the main window, Keep DHCP and Gateway support share one row above Apply Static IPs.
+          The setup reminder opens at its normal width on high-resolution main screens, instead of stretching wide with long lines. About now always has a "Check for updates at launch (recommended)" box, in installed and portable copies, so you can turn automatic checks on or off any time. Turning them on still asks you to agree to the privacy notice.
 
           **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
 

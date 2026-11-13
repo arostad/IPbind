@@ -77,7 +77,7 @@ InfoBeforeLabel=Please read how {#AppTitle} uses the network before continuing.
 [Tasks]
 ; Checked by default (also for silent installs). On upgrade, Inno restores the
 ; previous choice (UsePreviousTasks=yes is the default). Saved to update-check.txt.
-Name: "autoupdatecheck"; Description: "Check for updates at launch"; GroupDescription: "Updates (when off, check manually from About):"
+Name: "autoupdatecheck"; Description: "Check for updates at launch (recommended)"; GroupDescription: "Updates (you can change this later in About):"
 
 [Files]
 Source: "{#ExePath}"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignoreversion
