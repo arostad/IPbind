@@ -41,9 +41,12 @@ using System.Windows.Forms;
 // AssemblyInformationalVersion and BuildInfo (Version, Channel, DisplayVersion,
 // AppName, ReleaseTag) are generated fresh on every compile into Version.cs by
 // Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
-// DisplayVersion is Version plus a trailing "b" in Beta (title bar, About,
-// and the startup log). Parsed versions, version.txt, and installer DisplayVersion
-// stay the numeric Version. Prod display is unchanged.
+// DisplayVersion is Version plus a trailing "b" in Beta, and every on-screen
+// version in Beta must use it (title bar, About, main-window update text,
+// console, prompts, installer wizard, and Apps & Features). Parsed versions,
+// version.txt, file versions, tags, and updater comparisons stay the numeric
+// Version (strip a trailing b if a display string is parsed). Prod display
+// is unchanged.
 
 namespace IPbind
 {
@@ -724,10 +727,44 @@ namespace IPbind
         }
     }
 
+    // Display-only Beta suffix. File versions, version.txt, tags, and compares
+    // stay numeric; strip a trailing "b" before parsing.
+    internal static class VersionText
+    {
+        public static string Numeric(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return version;
+            char last = version[version.Length - 1];
+            if (last == 'b' || last == 'B')
+            {
+                string trimmed = version.Substring(0, version.Length - 1);
+                System.Version parsed;
+                if (System.Version.TryParse(trimmed, out parsed))
+                    return trimmed;
+            }
+            return version;
+        }
+
+        public static string ForDisplay(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return version;
+            string numeric = Numeric(version);
+            if (BuildInfo.IsBeta) return numeric + "b";
+            return numeric;
+        }
+
+        public static bool TryParse(string version, out System.Version result)
+        {
+            return System.Version.TryParse(Numeric(version), out result);
+        }
+    }
+
     // The in-app updater swaps only the exe, so the installer's Apps & Features entry
     // (which winget reads) would keep the old version. On launch, an installed copy
-    // raises DisplayVersion to the running version. Portable copies, other users'
-    // installs and any error are skipped silently.
+    // raises DisplayVersion to the running display version (Beta includes the trailing
+    // "b"). Portable copies, other users' installs and any error are skipped silently.
+    // Never lowers the numeric version. A numeric 2.3.139 entry is rewritten as
+    // 2.3.139b on Beta so Settings > Installed apps matches the title bar.
     static class InstalledVersionSync
     {
         const string UninstallKeyFormat =
@@ -754,17 +791,32 @@ namespace IPbind
                             Path.GetFullPath(location).TrimEnd('\\'), dir.TrimEnd('\\'),
                             StringComparison.OrdinalIgnoreCase))
                         return;
-                    System.Version running, listed;
-                    if (!System.Version.TryParse(BuildInfo.Version, out running)) return;
                     string current = key.GetValue("DisplayVersion") as string;
-                    if (current != null && System.Version.TryParse(current, out listed)
-                        && listed >= running)
+                    string writeValue;
+                    if (!ShouldWrite(current, BuildInfo.Version, BuildInfo.DisplayVersion, out writeValue))
                         return;
-                    key.SetValue("DisplayVersion", BuildInfo.Version,
+                    key.SetValue("DisplayVersion", writeValue,
                         Microsoft.Win32.RegistryValueKind.String);
                 }
             }
             catch { }
+        }
+
+        // currentDisplay is the Apps & Features value (may be numeric or end in b).
+        // runningNumeric is BuildInfo.Version; runningDisplay is BuildInfo.DisplayVersion.
+        public static bool ShouldWrite(string currentDisplay, string runningNumeric, string runningDisplay, out string writeValue)
+        {
+            writeValue = runningDisplay;
+            if (string.Equals(currentDisplay, runningDisplay, StringComparison.Ordinal))
+                return false;
+            System.Version running, listed;
+            if (!VersionText.TryParse(runningNumeric, out running))
+                return false;
+            if (!string.IsNullOrEmpty(currentDisplay)
+                && VersionText.TryParse(currentDisplay, out listed)
+                && listed > running)
+                return false;
+            return true;
         }
     }
 
@@ -2058,6 +2110,15 @@ namespace IPbind
         public Size LayoutClientSize { get { return layoutClient; } }
         public float LayoutScale { get { return sc; } }
         public readonly List<string> DpiLog = new List<string>();
+        // When set (Width and Height > 0), CurrentWorkArea uses this instead of
+        // the real monitor, so a test can simulate a 4K screen vs a 1080p one.
+        public Rectangle SimulatedWorkArea;
+
+        public void RelayoutForTest()
+        {
+            LayoutContent();
+            if (IsHandleCreated) EnsureClientMatchesLayout("test-relayout");
+        }
 
         protected abstract void LayoutContent();
 
@@ -2115,6 +2176,8 @@ namespace IPbind
         protected Rectangle CurrentWorkArea()
         {
             if (!layoutWork.IsEmpty) return layoutWork;
+            if (SimulatedWorkArea.Width > 0 && SimulatedWorkArea.Height > 0)
+                return SimulatedWorkArea;
             if (IsHandleCreated) return DpiWindow.WorkAreaFor(Handle, DpiWindow.Bounds(Handle));
             return Screen.PrimaryScreen.WorkingArea;
         }
@@ -2248,16 +2311,19 @@ namespace IPbind
                 {
                     SuspendLayout();
                     deferResize = true;
+                    // This message arrives before the window moves, so the
+                    // current work area is still the old monitor. Do not widen
+                    // or tighten against that; ApplyDpi re-lays out against the
+                    // destination work area once WM_DPICHANGED supplies it.
+                    layoutWork = new Rectangle(0, 0, 16384, 16384);
                     try
                     {
-                        if (Math.Abs(dpi / 96f - sc) > 0.001f)
-                        {
-                            sc = dpi / 96f;
-                            LayoutContent();
-                        }
+                        sc = dpi / 96f;
+                        LayoutContent();
                     }
                     finally
                     {
+                        layoutWork = Rectangle.Empty;
                         deferResize = false;
                         ResumeLayout(false);
                     }
@@ -2321,11 +2387,12 @@ namespace IPbind
                     layoutWork = work;
                     try
                     {
-                        if (relayout || Math.Abs(newSc - sc) > 0.001f)
-                        {
-                            sc = newSc;
-                            LayoutContent();
-                        }
+                        // Always re-lay out. WM_GETDPISCALEDSIZE may already have
+                        // set sc and laid out against the old monitor's work area;
+                        // skipping here left the popup far too wide after a
+                        // 100% -> high-scale return trip (Andy's 2.3.139 catch).
+                        sc = newSc;
+                        LayoutContent();
                         relayout = false;
                     }
                     finally
@@ -3642,7 +3709,7 @@ namespace IPbind
                         }
 
                         availableUpdate = info;
-                        SetStatus("Version " + info.RemoteVersion + " is available.");
+                        SetStatus("Version " + VersionText.ForDisplay(info.RemoteVersion) + " is available.");
                         checkButton.Text = "Update now";
                         checkButton.Click -= CheckUpdates;
                         checkButton.Click += UpdateNow;
@@ -5427,8 +5494,6 @@ namespace IPbind
 
     class MainForm : Form
     {
-        static readonly string AppVersion = BuildInfo.Version;
-
         static readonly string[] DefaultIPs = new string[] {
             "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
             "192.168.0.98/24",  "192.168.1.98/24",  "192.168.2.98/24",
@@ -7088,7 +7153,7 @@ namespace IPbind
                     {
                         if (IsDisposed || updateDismissed) return;
                         lblUpdateBanner.Text =
-                            "Version " + info.RemoteVersion + " is available.";
+                            "Version " + VersionText.ForDisplay(info.RemoteVersion) + " is available.";
                         updateBanner.Visible = true;
                         ApplyLeftColumnStatusLayout();
                         updateBanner.BringToFront();
@@ -7315,7 +7380,7 @@ namespace IPbind
             try
             {
                 EnsureAppDir();
-                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + AppVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
+                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + BuildInfo.DisplayVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
             }
             catch (Exception ex)
             {

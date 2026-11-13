@@ -1,6 +1,9 @@
 #ifndef AppVersion
   #error AppVersion must be supplied by Build-Installer.ps1
 #endif
+#ifndef AppDisplayVersion
+  #define AppDisplayVersion AppVersion
+#endif
 #ifndef ExePath
   #error ExePath must be supplied by Build-Installer.ps1
 #endif
@@ -36,7 +39,7 @@
 AppId={#AppIdValue}
 AppName={#AppTitle}
 AppVersion={#AppVersion}
-AppVerName={#AppTitle} {#AppVersion}
+AppVerName={#AppTitle} {#AppDisplayVersion}
 AppPublisher=Andy Rostad
 AppPublisherURL=https://github.com/arostad
 AppSupportURL=https://github.com/arostad/IPbind/issues
@@ -96,6 +99,54 @@ Filename: "{app}\{#ExeName}"; Description: "Launch {#AppTitle}"; Flags: nowait p
 var
   RemoveDataRequested: Boolean;
   RemoveDataCheckBox: TNewCheckBox;
+
+{ Inno's modern-style TNewCheckListBox draws the glyph at Offset (default 4,
+  not DPI-scaled). At high scale the left edge of every checkbox square is
+  clipped. TNewCheckBox sized exactly to the box also clips the themed glyph.
+  Fix once for Setup and Uninstall: scale the list offset, and give standalone
+  checkboxes a few pixels of padding around the square. }
+procedure UnclipInnoChecks(Root: TWinControl);
+var
+  I, Pad, Need: Integer;
+  C: TControl;
+  Box: TNewCheckBox;
+  List: TNewCheckListBox;
+begin
+  if Root = nil then
+    Exit;
+  Need := ScaleX(8);
+  Pad := ScaleX(4);
+  if Root is TNewCheckListBox then
+  begin
+    List := TNewCheckListBox(Root);
+    if List.Offset < Need then
+      List.Offset := Need;
+  end
+  else if Root is TNewCheckBox then
+  begin
+    Box := TNewCheckBox(Root);
+    { Only expand once (Tag marks a box we already padded). }
+    if Box.Tag <> 1391 then
+    begin
+      Box.Left := Box.Left - Pad;
+      Box.Top := Box.Top - Pad;
+      Box.Width := Box.Width + (2 * Pad);
+      Box.Height := Box.Height + (2 * Pad);
+      Box.Tag := 1391;
+    end;
+  end;
+  for I := 0 to Root.ControlCount - 1 do
+  begin
+    C := Root.Controls[I];
+    if C is TWinControl then
+      UnclipInnoChecks(TWinControl(C));
+  end;
+end;
+
+procedure InitializeWizard;
+begin
+  UnclipInnoChecks(WizardForm);
+end;
 
 function CmdLineParamExists(const Value: String): Boolean;
 var
@@ -349,6 +400,7 @@ begin
   RemoveDataCheckBox.Height := BoxSize;
   RemoveDataCheckBox.Checked := RemoveDataRequested;
   RemoveDataCheckBox.TabOrder := 0;
+  UnclipInnoChecks(Form);
 
   DataLabel := TNewStaticText.Create(Form);
   DataLabel.Parent := Form;
@@ -502,6 +554,14 @@ begin
   Result := RelaunchWithPrompt;
 end;
 
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  { RunList is filled when the Finished page is shown; re-apply in case a
+    later Inno version resets Offset. }
+  if (CurPageID = wpSelectTasks) or (CurPageID = wpFinished) then
+    UnclipInnoChecks(WizardForm);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   SettingsDir: String;
@@ -518,6 +578,8 @@ begin
        not SaveStringToFile(SettingsDir + '\update-check.txt', Mode, False) then
       Log('Could not save update-check.txt in ' + SettingsDir);
     PatchUninstallString;
+    if not RegWriteStringValue(HKCU, UninstallRegKey, 'DisplayVersion', '{#AppDisplayVersion}') then
+      Log('Could not set DisplayVersion to {#AppDisplayVersion}');
   end;
 end;
 

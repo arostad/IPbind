@@ -42,9 +42,13 @@ if ([string]::IsNullOrWhiteSpace($version)) {
     $version = $fileInfo.FileVersion
 }
 $version = ($version -split '\+')[0].Trim()
+# ProductVersion / filenames / VersionInfo stay numeric. A trailing b is display-only.
+$version = $version.TrimEnd('b', 'B')
 if ($version -notmatch '^\d+(?:\.\d+){2,3}$') {
     throw "The executable reports an unsupported product version: '$version'."
 }
+$displayVersion = $version
+if ($Channel -eq 'beta') { $displayVersion = $version + 'b' }
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $root 'dist'
@@ -59,7 +63,8 @@ if ([string]::IsNullOrWhiteSpace($IsccPath)) {
     } else {
         $candidates = @(
             (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
         )
         $IsccPath = $candidates |
             Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
@@ -74,9 +79,10 @@ if ([string]::IsNullOrWhiteSpace($IsccPath) -or
 $resolvedIscc = (Resolve-Path -LiteralPath $IsccPath).Path
 $installerScript = Join-Path $root 'installer\IPbind.iss'
 
-Write-Host "Packaging IPbind $version with $resolvedIscc ..." -ForegroundColor Cyan
+Write-Host "Packaging IPbind $displayVersion with $resolvedIscc ..." -ForegroundColor Cyan
 & $resolvedIscc `
     "/DAppVersion=$version" `
+    "/DAppDisplayVersion=$displayVersion" `
     "/DExePath=$resolvedExe" `
     "/DOutputDir=$resolvedOutput" `
     "/DChannel=$Channel" `
