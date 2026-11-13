@@ -2172,13 +2172,26 @@ namespace IPbind
         }
 
         // Work area the layout must fit: the target monitor during a DPI change,
-        // otherwise the monitor the window is on.
+        // otherwise the monitor the window is on. A test can override the real
+        // monitor with SimulatedWorkArea (for example a 4K screen on a 1080p runner).
         protected Rectangle CurrentWorkArea()
         {
             if (!layoutWork.IsEmpty) return layoutWork;
+            return DestinationWorkArea(Rectangle.Empty);
+        }
+
+        // Prefer the test hook when it is set, so ApplyDpi / clamp / OnShown do
+        // not fall back to the runner's real 1080p work area and wrongly widen
+        // or clip a simulated 4K layout (CI dpirtrip on 2.3.140, SHA 73a4e91).
+        Rectangle DestinationWorkArea(Rectangle suggested)
+        {
             if (SimulatedWorkArea.Width > 0 && SimulatedWorkArea.Height > 0)
                 return SimulatedWorkArea;
-            if (IsHandleCreated) return DpiWindow.WorkAreaFor(Handle, DpiWindow.Bounds(Handle));
+            if (IsHandleCreated)
+            {
+                Rectangle hint = suggested.IsEmpty ? DpiWindow.Bounds(Handle) : suggested;
+                return DpiWindow.WorkAreaFor(Handle, hint);
+            }
             return Screen.PrimaryScreen.WorkingArea;
         }
 
@@ -2209,7 +2222,7 @@ namespace IPbind
         {
             if (!IsHandleCreated) return;
             Rectangle b = DpiWindow.Bounds(Handle);
-            Rectangle work = DpiWindow.WorkAreaFor(Handle, b);
+            Rectangle work = DestinationWorkArea(b);
             Rectangle fit = DpiWindow.Clamp(b, work);
             if (fit != b) DpiWindow.SetBounds(Handle, fit);
         }
@@ -2258,7 +2271,7 @@ namespace IPbind
                 // primary screen's work area. If the dialog opened on a monitor
                 // with a different work area, lay it out again for that one.
                 Rectangle b = DpiWindow.Bounds(Handle);
-                Rectangle work = DpiWindow.WorkAreaFor(Handle, b);
+                Rectangle work = DestinationWorkArea(b);
                 if (!work.IsEmpty && work != layoutWorkUsed)
                 {
                     Log("shown: work area " + work + " differs from layout work area " + layoutWorkUsed);
@@ -2380,7 +2393,7 @@ namespace IPbind
                 {
                     pendingDpi = 0;
                     Log("dpi " + dpi + " suggested " + suggested + " clamp=" + clamp);
-                    Rectangle work = DpiWindow.WorkAreaFor(Handle, suggested);
+                    Rectangle work = DestinationWorkArea(suggested);
                     float newSc = dpi / 96f;
                     SuspendLayout();
                     deferResize = true;
@@ -2431,7 +2444,7 @@ namespace IPbind
             Rectangle b = DpiWindow.Bounds(Handle);
             Size win = new Size(b.Width + layoutClient.Width - client.Width, b.Height + layoutClient.Height - client.Height);
             Rectangle target = new Rectangle(b.X, b.Y, win.Width, win.Height);
-            if (!inSizeMove) target = DpiWindow.Clamp(target, DpiWindow.WorkAreaFor(Handle, b));
+            if (!inSizeMove) target = DpiWindow.Clamp(target, DestinationWorkArea(b));
             DpiWindow.SetBounds(Handle, target);
             Log(why + ": client was " + client + ", fixed to " + DpiWindow.ClientBounds(Handle).Size);
         }
