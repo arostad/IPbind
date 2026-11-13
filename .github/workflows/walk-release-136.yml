@@ -15,15 +15,8 @@ jobs:
         shell: pwsh
         run: |
           $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-          $cargs = @(
-            '/nologo','/target:winexe','/win32manifest:app.manifest',
-            '/r:System.dll','/r:System.Core.dll','/r:System.Drawing.dll','/r:System.Net.Http.dll',
-            '/r:System.Windows.Forms.dll','/main:IPbindTest.UiShot',
-            '/resource:installer\privacy.txt,IPbind.privacy.txt',
-            '/resource:app-beta.ico,IPbind.app.ico','/out:uishot.exe'
-          )
-          & $csc @cargs IPbind.cs Version.cs .github\test\UiShot.cs .github\test\ScaleControl.cs
-          if ($LASTEXITCODE -ne 0) { throw 'uishot compile failed' }
+          & $csc /nologo /target:exe /out:setscale.exe .github\test\ScaleControl.cs .github\test\SetScaleMain.cs
+          if ($LASTEXITCODE -ne 0) { throw 'setscale compile failed' }
       - name: Verify 2.3.135 fixture and download published 2.3.136 installer
         shell: pwsh
         env:
@@ -51,7 +44,7 @@ jobs:
             -Installer135 (Resolve-Path 'fixtures\v2.3.135-beta\IPbind-Installer-v2.3.135-beta.exe').Path `
             -Installer136 (Resolve-Path 'published\IPbind-Installer-v2.3.136-beta.exe').Path `
             -Out "$PWD\shots" `
-            -SetScale "$PWD\uishot.exe"
+            -SetScale "$PWD\setscale.exe"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
