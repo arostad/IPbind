@@ -5241,6 +5241,8 @@ namespace IPbind
                 int before = FirstVisibleLine();
                 base.WndProc(ref m);
                 int after = FirstVisibleLine();
+                if (after == before)
+                    after = KeyboardScroll((int)m.WParam.ToInt64(), before);
                 if (after != before)
                 {
                     lastFirstLine = after;
@@ -5251,6 +5253,23 @@ namespace IPbind
                 return;
             }
             base.WndProc(ref m);
+        }
+
+        // Read-only boxes (the console) often swallow PageUp/PageDown/Home/End
+        // without scrolling once the native bar is gone. Do it ourselves when
+        // the base handler left the first visible line unchanged.
+        int KeyboardScroll(int key, int before)
+        {
+            const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24;
+            const int VK_UP = 0x26, VK_DOWN = 0x28;
+            if (key == VK_PRIOR) ScrollToFirst(before - VisibleLineCount());
+            else if (key == VK_NEXT) ScrollToFirst(before + VisibleLineCount());
+            else if (key == VK_HOME) ScrollToFirst(0);
+            else if (key == VK_END) ScrollToFirst(MaxFirstLine());
+            else if (key == VK_UP) LineScroll(-1);
+            else if (key == VK_DOWN) LineScroll(1);
+            else return before;
+            return FirstVisibleLine();
         }
 
         sealed class OverlayBar : Control
