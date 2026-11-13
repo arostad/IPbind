@@ -428,6 +428,8 @@ namespace IPbindTest
                 Capture(main.Handle, png);
                 CheckLayout(main, lines, "main gateway=" + gw);
                 problems += CheckAlign(main, png, lines);
+                problems += CheckAboutPlacement(main, lines);
+                problems += CheckComboChrome(main, png, lines);
                 // overlaps between visible siblings (ignore labels inside the update banner)
                 List<Control> vis = new List<Control>();
                 foreach (Control c in main.Controls) if (c.Visible) vis.Add(c);
@@ -505,6 +507,185 @@ namespace IPbindTest
             if (Math.Abs(delta) > 1) { lines.Add("ALIGN OFF"); bad++; }
             if (kpS.Top != gwS.Top || gwS.Bottom > rfS.Top) { lines.Add("ROW NOT ABOVE REFRESH"); bad++; }
             return bad;
+        }
+
+        static int CheckAboutPlacement(IPbind.MainForm main, List<string> lines)
+        {
+            if (typeof(IPbind.MainForm).GetField("lblVersion", F) != null)
+            {
+                lines.Add("VERSION LABEL STILL PRESENT");
+                return 1;
+            }
+            foreach (Control c in main.Controls)
+            {
+                if (c is Label && c.Text == ("v" + IPbind.BuildInfo.DisplayVersion))
+                {
+                    lines.Add("VERSION LABEL STILL PRESENT text='" + c.Text + "' " + c.Bounds);
+                    return 1;
+                }
+            }
+            Button about = (Button)typeof(IPbind.MainForm).GetField("btnAbout", F).GetValue(main);
+            TextBox console = (TextBox)typeof(IPbind.MainForm).GetField("console", F).GetValue(main);
+            float sc = (float)typeof(IPbind.MainForm).GetField("sc", F).GetValue(main);
+            int gap = (int)Math.Round(10 * sc);
+            int wantW = (int)Math.Round(96 * sc);
+            int wantH = (int)Math.Round(26 * sc);
+            int slop = 1;
+            lines.Add("about " + about.Bounds + " console " + console.Bounds + " rightDelta=" + (about.Right - console.Right)
+                + " belowDelta=" + (about.Top - (console.Bottom + gap)) + " sizeWant=" + wantW + "x" + wantH);
+            int bad = 0;
+            if (Math.Abs(about.Right - console.Right) > slop) { lines.Add("ABOUT NOT RIGHT ALIGNED"); bad++; }
+            if (Math.Abs(about.Top - (console.Bottom + gap)) > slop) { lines.Add("ABOUT VERTICAL CHANGED"); bad++; }
+            if (Math.Abs(about.Width - wantW) > slop || Math.Abs(about.Height - wantH) > slop)
+            { lines.Add("ABOUT SIZE CHANGED"); bad++; }
+            return bad;
+        }
+
+        // Crop a child HWND out of a window screenshot, with a little padding.
+        static void CropFromWindow(string windowPng, IntPtr window, IntPtr child, string dest, int pad)
+        {
+            Rectangle win = WinRect(window);
+            Rectangle ch = WinRect(child);
+            using (Bitmap b = new Bitmap(windowPng))
+            {
+                Rectangle crop = new Rectangle(ch.X - win.X - pad, ch.Y - win.Y - pad, ch.Width + pad * 2, ch.Height + pad * 2);
+                crop.Intersect(new Rectangle(0, 0, b.Width, b.Height));
+                if (crop.Width <= 0 || crop.Height <= 0) return;
+                using (Bitmap c = b.Clone(crop, b.PixelFormat))
+                    c.Save(dest, ImageFormat.Png);
+            }
+        }
+
+        // Share of near-white pixels in a rectangle, or the whole image if area is empty.
+        static int CountNearWhite(Bitmap b, Rectangle area)
+        {
+            if (area.IsEmpty) area = new Rectangle(0, 0, b.Width, b.Height);
+            area.Intersect(new Rectangle(0, 0, b.Width, b.Height));
+            if (area.Width <= 0 || area.Height <= 0) return 0;
+            int n = 0;
+            for (int y = area.Top; y < area.Bottom; y++)
+                for (int x = area.Left; x < area.Right; x++)
+                {
+                    Color c = b.GetPixel(x, y);
+                    if (c.R >= 220 && c.G >= 220 && c.B >= 220) n++;
+                }
+            return n * 100 / Math.Max(1, area.Width * area.Height);
+        }
+
+        // Sample the drop-arrow well, avoiding the centered chevron, which may be light on purpose.
+        static int ButtonWellBrightness(Bitmap b, Rectangle button)
+        {
+            Point[] pts = new Point[]
+            {
+                new Point(button.Left + 2, button.Top + 2),
+                new Point(button.Right - 3, button.Top + 2),
+                new Point(button.Left + 2, button.Bottom - 3),
+                new Point(button.Right - 3, button.Bottom - 3)
+            };
+            int s = 0, n = 0;
+            for (int i = 0; i < pts.Length; i++)
+            {
+                if (pts[i].X < 0 || pts[i].Y < 0 || pts[i].X >= b.Width || pts[i].Y >= b.Height) continue;
+                Color c = b.GetPixel(pts[i].X, pts[i].Y);
+                s += (c.R + c.G + c.B) / 3;
+                n++;
+            }
+            return n == 0 ? 255 : s / n;
+        }
+
+        static int CheckComboChrome(IPbind.MainForm main, string png, List<string> lines)
+        {
+            bool dark = (bool)typeof(IPbind.MainForm).GetField("dark", F).GetValue(main);
+            ComboBox adapter = (ComboBox)typeof(IPbind.MainForm).GetField("combo", F).GetValue(main);
+            ComboBox gateway = (ComboBox)typeof(IPbind.MainForm).GetField("cboGwIp", F).GetValue(main);
+            int bad = 0;
+            string adapterCrop = png.Replace(".png", "-combo-adapter.png");
+            CropFromWindow(png, main.Handle, adapter.Handle, adapterCrop, 2);
+            bad += ReportComboCrop(adapterCrop, "adapter-closed", dark, lines);
+            if (gateway.Visible)
+            {
+                string gwCrop = png.Replace(".png", "-combo-gateway.png");
+                CropFromWindow(png, main.Handle, gateway.Handle, gwCrop, 2);
+                bad += ReportComboCrop(gwCrop, "gateway-closed-empty", dark, lines);
+
+                bool wasEnabled = gateway.Enabled;
+                gateway.Enabled = false; Pump(200);
+                Capture(main.Handle, png.Replace(".png", "-combo-gateway-disabled-window.png"));
+                string gwOff = png.Replace(".png", "-combo-gateway-disabled.png");
+                CropFromWindow(png.Replace(".png", "-combo-gateway-disabled-window.png"), main.Handle, gateway.Handle, gwOff, 2);
+                bad += ReportComboCrop(gwOff, "gateway-disabled", dark, lines);
+                gateway.Enabled = wasEnabled; Pump(100);
+            }
+
+            if (dark)
+            {
+                adapter.Items.Add("Ethernet   |   Test adapter   [Up]");
+                adapter.Items.Add("Wi-Fi   |   Test wifi   [Up]");
+                adapter.DroppedDown = true; Pump(400);
+                IPbind.WindowTheme.ComboBoxInfo info;
+                if (IPbind.WindowTheme.TryGetComboBoxInfo(adapter.Handle, out info) && info.hwndList != IntPtr.Zero)
+                {
+                    string listPng = png.Replace(".png", "-combo-adapter-list.png");
+                    Capture(info.hwndList, listPng);
+                    bad += ReportComboCrop(listPng, "adapter-open-list", true, lines);
+                }
+                else
+                {
+                    lines.Add("COMBO LIST HWND missing");
+                    bad++;
+                }
+                adapter.DroppedDown = false; Pump(200);
+                // Put the closed field back how it was (empty, no selection).
+                adapter.Items.Clear();
+                adapter.Invalidate(); Pump(200);
+                Capture(main.Handle, png);
+            }
+            return bad;
+        }
+
+        static int ReportComboCrop(string png, string tag, bool dark, List<string> lines)
+        {
+            if (!File.Exists(png))
+            {
+                lines.Add("combo " + tag + " MISSING " + png);
+                return 1;
+            }
+            using (Bitmap b = new Bitmap(png))
+            {
+                int overall = CountNearWhite(b, Rectangle.Empty);
+                // Closed combos are wide; treat the right-hand square as the arrow well.
+                bool closed = b.Width > b.Height * 2;
+                int fieldPct = overall, well = -1, buttonPct = -1;
+                if (closed)
+                {
+                    int bw = Math.Max(16, b.Height - 4);
+                    Rectangle button = new Rectangle(b.Width - bw, 0, bw, b.Height);
+                    Rectangle field = new Rectangle(0, 0, Math.Max(1, b.Width - bw), b.Height);
+                    fieldPct = CountNearWhite(b, field);
+                    buttonPct = CountNearWhite(b, button);
+                    well = ButtonWellBrightness(b, button);
+                    lines.Add("combo " + tag + " whitePct=" + overall + " fieldWhite=" + fieldPct
+                        + " buttonWhite=" + buttonPct + " buttonWell=" + well + " file=" + png);
+                }
+                else
+                    lines.Add("combo " + tag + " whitePct=" + overall + " file=" + png);
+
+                if (!dark) return 0;
+                // A dark field may have light text; a dark arrow well may have a light
+                // chevron. The bug is a glaring white field or a white button well
+                // (measured ~240 on the system chrome, vs ~24-50 once themed).
+                if (closed && (fieldPct > 25 || buttonPct > 50 || well >= 180))
+                {
+                    lines.Add("COMBO WHITE " + tag);
+                    return 1;
+                }
+                if (!closed && overall > 25)
+                {
+                    lines.Add("COMBO WHITE " + tag);
+                    return 1;
+                }
+                return 0;
+            }
         }
 
         static void DumpFonts(Form f, List<string> lines)
