@@ -433,8 +433,6 @@ namespace IPbindTest
                 problems += CheckAboutPlacement(main, lines);
                 problems += CheckComboChrome(main, png, lines);
                 problems += CheckUncheckedBoxes(main, png, lines);
-                bool darkMain = (bool)typeof(IPbind.MainForm).GetField("dark", F).GetValue(main);
-                problems += CheckUncheckedBoxes(main, png, lines);
                 // overlaps between visible siblings (ignore labels inside the update banner)
                 List<Control> vis = new List<Control>();
                 foreach (Control c in main.Controls) if (c.Visible) vis.Add(c);
