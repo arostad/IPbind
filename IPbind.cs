@@ -3296,8 +3296,8 @@ namespace IPbind
                     int rad = Math.Max(2, (int)Math.Round(2f * g.DpiX / 96f));
                     Color checkFill = Color.FromArgb(0x00, 0x63, 0xB1);
                     CheckBoxChrome.DrawBox(g, box, rad, 1f, Checked, hot, Enabled, true, checkFill, Color.White);
-                    int textX = SystemTextOrigin();
-                    if (textX < box.Right) textX = box.Right + Math.Max(3, (int)Math.Round(3f * g.DpiX / 96f));
+                    int gap = Math.Max(8, (int)Math.Round(8f * (g.DpiX / 96f)));
+                    int textX = Math.Max(SystemTextOrigin(), box.Right + gap);
                     Rectangle textBounds = new Rectangle(textX, client.Top, Math.Max(0, client.Right - textX), client.Height);
                     Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
                     if (!string.IsNullOrEmpty(Text) && textBounds.Width > 0)
@@ -6153,17 +6153,19 @@ namespace IPbind
         public static readonly Color OkColor = Color.FromArgb(90, 200, 110);
         public static readonly Color WarnColor = Color.FromArgb(232, 180, 70);
         public static readonly Color ErrColor = Color.FromArgb(240, 100, 100);
+        public static readonly Color InfoColor = Color.FromArgb(64, 150, 230);
 
         public static Color LevelColor(string level, Color fallback)
         {
             if (level == "OK") return OkColor;
             if (level == "WARN") return WarnColor;
             if (level == "ERR" || level == "ERROR") return ErrColor;
+            if (level == "INFO") return InfoColor;
             return fallback;
         }
 
-        // "[hh:mm:ss] " stays the normal console gray; the level and message
-        // take the level color. INFO lines are all gray.
+        // "[hh:mm:ss] " and the message stay the normal console color; only
+        // the level tag (OK, WARN, ERR, INFO) is colored.
         public void AppendLogLine(string stamp, string level, string msg)
         {
             Select(TextLength, 0);
@@ -6171,7 +6173,10 @@ namespace IPbind
             AppendText(stamp);
             Select(TextLength, 0);
             SelectionColor = LevelColor(level, ForeColor);
-            AppendText(level + "  " + msg + "\r\n");
+            AppendText(level);
+            Select(TextLength, 0);
+            SelectionColor = ForeColor;
+            AppendText("  " + msg + "\r\n");
             Select(TextLength, 0);
             SelectionColor = ForeColor;
             ScrollToCaret();
@@ -6180,10 +6185,49 @@ namespace IPbind
     }
 
 
+    // Section title (bold) plus a muted note on the same line. Used so
+    // "IP addresses to bind" can be white/bold while the CIDR hint stays gray,
+    // without moving or resizing the heading's bounds.
+    sealed class TitleNoteLabel : Label
+    {
+        public string TitleText;
+        public string NoteText;
+        public Color NoteColor = Color.FromArgb(90, 90, 90);
+
+        public TitleNoteLabel()
+        {
+            AutoSize = false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            using (SolidBrush fill = new SolidBrush(BackColor))
+                e.Graphics.FillRectangle(fill, ClientRectangle);
+            string title = TitleText ?? "";
+            string note = NoteText ?? "";
+            TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis;
+            Size titleSize = TextRenderer.MeasureText(e.Graphics, title, Font,
+                new Size(int.MaxValue, Height), flags & ~TextFormatFlags.EndEllipsis);
+            int titleW = Math.Min(Math.Max(0, titleSize.Width), Width);
+            Rectangle titleBounds = new Rectangle(0, 0, titleW, Height);
+            if (title.Length > 0)
+                TextRenderer.DrawText(e.Graphics, title, Font, titleBounds, ForeColor, flags);
+            if (note.Length > 0)
+            {
+                int gap = Math.Max(8, (int)Math.Round(8f * (e.Graphics.DpiX / 96f)));
+                int nx = titleBounds.Right + gap;
+                Rectangle noteBounds = new Rectangle(nx, 0, Math.Max(0, Width - nx), Height);
+                using (Font regular = new Font(Font, FontStyle.Regular))
+                    TextRenderer.DrawText(e.Graphics, note, regular, noteBounds, NoteColor, flags);
+            }
+        }
+    }
+
     class MainForm : Form
     {
         static readonly string[] DefaultIPs = new string[] {
-            "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
+            "10.10.10.98/24",   "10.255.128.98/24", "10.255.255.98/24",
             "192.168.0.98/24",  "192.168.1.98/24",  "192.168.2.98/24",
             "192.168.4.98/24",  "192.168.255.98/24"
         };
@@ -6222,17 +6266,15 @@ namespace IPbind
         // Optional Gateway support: one listed address may carry a gateway and DNS.
         // The high metric keeps this route from beating Wi-Fi/corporate default routes.
         const int GatewayMetric = 9999;
-        const string IpLabelPlain =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
-        const string IpLabelGateway =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24):";
+        const string IpLabelTitle = "\u2461 IP addresses to bind";
+        const string IpLabelNote = "One per line, CIDR (e.g. 192.168.1.98/24)";
 
         float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
 
         ComboBox combo;
         CheckBox chkAll;
         TextBox txtIPs;
-        Label lblIPs;
+        TitleNoteLabel lblIPs;
         CheckBox chkGateway;
         ToolTip gatewayTip;   // field so the tooltip lives as long as the form
         Label lblGwOn, lblGateway, lblDns1, lblDns2;
@@ -6361,10 +6403,64 @@ namespace IPbind
             return outl.ToArray();
         }
 
+        // Numerical IPv4 order (octet by octet, then prefix). Invalid lines keep
+        // their relative order at the end. Duplicates are kept; nothing is dropped.
+        // Save List always runs this; LoadList does not (hand-edited files stay as saved).
+        internal static string[] SortIpList(string[] lines)
+        {
+            if (lines == null || lines.Length == 0)
+                return lines ?? new string[0];
+            List<int> order = new List<int>(lines.Length);
+            int[] o0 = new int[lines.Length];
+            int[] o1 = new int[lines.Length];
+            int[] o2 = new int[lines.Length];
+            int[] o3 = new int[lines.Length];
+            int[] pfx = new int[lines.Length];
+            bool[] valid = new bool[lines.Length];
+            for (int i = 0; i < lines.Length; i++)
+            {
+                order.Add(i);
+                int a, b, c, d, p;
+                valid[i] = TryParseIpv4Line(lines[i], out a, out b, out c, out d, out p);
+                o0[i] = a; o1[i] = b; o2[i] = c; o3[i] = d; pfx[i] = p;
+            }
+            order.Sort(delegate (int i, int j)
+            {
+                if (valid[i] != valid[j]) return valid[i] ? -1 : 1;
+                if (valid[i])
+                {
+                    if (o0[i] != o0[j]) return o0[i].CompareTo(o0[j]);
+                    if (o1[i] != o1[j]) return o1[i].CompareTo(o1[j]);
+                    if (o2[i] != o2[j]) return o2[i].CompareTo(o2[j]);
+                    if (o3[i] != o3[j]) return o3[i].CompareTo(o3[j]);
+                    if (pfx[i] != pfx[j]) return pfx[i].CompareTo(pfx[j]);
+                }
+                return i.CompareTo(j);
+            });
+            string[] result = new string[lines.Length];
+            for (int k = 0; k < order.Count; k++) result[k] = lines[order[k]] ?? "";
+            return result;
+        }
+
+        static bool TryParseIpv4Line(string line, out int a, out int b, out int c, out int d, out int prefix)
+        {
+            a = b = c = d = prefix = 0;
+            Match m = CidrRe.Match(line ?? "");
+            if (!m.Success) return false;
+            a = int.Parse(m.Groups[1].Value);
+            b = int.Parse(m.Groups[2].Value);
+            c = int.Parse(m.Groups[3].Value);
+            d = int.Parse(m.Groups[4].Value);
+            if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+            prefix = m.Groups[6].Success ? int.Parse(m.Groups[6].Value) : 24;
+            if (prefix < 0 || prefix > 32) return false;
+            return true;
+        }
+
         void SaveList(bool quiet)
         {
             EnsureAppDir();
-            string[] lines = CanonicalList();
+            string[] lines = SortIpList(CanonicalList());
             File.WriteAllLines(StoreFile, lines); DebugLog.LogSettingsFile(StoreFile, "save-iplist");
             txtIPs.Lines = lines;
             if (!quiet) Log("Saved " + lines.Length + " address(es) to disk.", "OK");
@@ -6589,7 +6685,6 @@ namespace IPbind
         {
             bool on = chkGateway.Checked;
             txtIPs.Height = U(on ? 134 : 196);
-            lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
             foreach (Control c in new Control[] {
                 lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
                 c.Visible = on;
@@ -7944,6 +8039,61 @@ namespace IPbind
             return box.Width - U(6);
         }
 
+        // Same measurement as the UI-suite ALIGN check: the right edge of the
+        // caption ink as this checkbox will actually paint it (native in light
+        // mode, Beta 8-DIP gap in dark chrome). Stand-alone probe so MainForm's
+        // handle is not created early.
+        int CaptionInkRight(CheckBox box)
+        {
+            try
+            {
+                ThemedCheckBox srcBox = box as ThemedCheckBox;
+                using (ThemedCheckBox probe = new ThemedCheckBox())
+                {
+                    probe.Text = box.Text;
+                    probe.Font = box.Font;
+                    probe.Size = box.Size;
+                    probe.CheckAlign = box.CheckAlign;
+                    probe.TextAlign = box.TextAlign;
+                    probe.FlatStyle = box.FlatStyle;
+                    Color bg = box.BackColor.IsEmpty ? Color.White : box.BackColor;
+                    probe.BackColor = bg;
+                    probe.ForeColor = box.ForeColor.IsEmpty ? Color.Black : box.ForeColor;
+                    if (srcBox != null && srcBox.UseDarkChrome) probe.ApplyDark(true);
+                    int w = Math.Max(1, probe.Width);
+                    int h = Math.Max(1, probe.Height);
+                    using (Bitmap bmp = new Bitmap(w, h))
+                    {
+                        probe.DrawToBitmap(bmp, new Rectangle(0, 0, w, h));
+                        Color sample = bmp.GetPixel(Math.Max(0, w - 1), Math.Min(1, h - 1));
+                        for (int x = w - 1; x >= 0; x--)
+                            for (int y = 0; y < h; y++)
+                            {
+                                Color c = bmp.GetPixel(x, y);
+                                if (Math.Abs(c.R - sample.R) + Math.Abs(c.G - sample.G) + Math.Abs(c.B - sample.B) > 300)
+                                    return x + 1;
+                            }
+                    }
+                }
+            }
+            catch { }
+            return TextInkRight(box);
+        }
+
+        // Slide only the Keep DHCP / Gateway support pair horizontally so the
+        // "Gateway support" caption ink lines up with Refresh's right edge.
+        // Y and every other control stay put. Call after ApplyTheme so dark
+        // chrome (and the Beta gap) is already in effect; light mode keeps the
+        // native ink and typically does not move.
+        void AlignGatewayPair(Button refresh)
+        {
+            if (refresh == null || chkGateway == null || chkKeepDhcp == null) return;
+            int ink = CaptionInkRight(chkGateway);
+            if (ink <= 0) return;
+            chkGateway.Location = new Point(refresh.Right - ink, U(72));
+            chkKeepDhcp.Location = new Point(chkGateway.Left - U(28) - chkKeepDhcp.Width, U(72));
+        }
+
         Label MakeRowLabel(string text, int x, int y)
         {
             Label l = new Label();
@@ -8338,7 +8488,8 @@ namespace IPbind
             Controls.Add(lblSub);
 
             Label lblAdapter = new Label();
-            lblAdapter.Text = "Select your LAN interface below:";
+            lblAdapter.Text = "\u2460 Select your LAN interface";
+            lblAdapter.Font = UiFont(9F, FontStyle.Bold);
             lblAdapter.Location = P(20, 74);
             lblAdapter.AutoSize = true;
             Controls.Add(lblAdapter);
@@ -8415,7 +8566,7 @@ namespace IPbind
             };
             Controls.Add(chkGateway);
             // Row y 72-92: under the subtitle (which ends at 72), above Refresh (93),
-            // level with "Select your LAN interface below:".
+            // level with "Select your LAN interface".
             chkGateway.Location = new Point(btnRefresh.Right - TextInkRight(chkGateway), U(72));
             chkKeepDhcp.Location = new Point(chkGateway.Left - U(28) - chkKeepDhcp.Width, U(72));
 
@@ -8427,9 +8578,10 @@ namespace IPbind
             gatewayTip.ShowAlways = true;
             gatewayTip.SetToolTip(chkGateway, "Only enable if you know what you're doing!");
 
-            lblIPs = new Label();
-            lblIPs.Text = IpLabelPlain;
-            lblIPs.Font = UiFont(8F, FontStyle.Regular);
+            lblIPs = new TitleNoteLabel();
+            lblIPs.TitleText = IpLabelTitle;
+            lblIPs.NoteText = IpLabelNote;
+            lblIPs.Font = UiFont(8F, FontStyle.Bold);
             lblIPs.Location = P(20, 146);
             lblIPs.Size = Z(530, 22);
             lblIPs.TextAlign = ContentAlignment.MiddleLeft;
@@ -8547,7 +8699,8 @@ namespace IPbind
             Controls.Add(lblStatus);
 
             Label lblConsole = new Label();
-            lblConsole.Text = "Console output:";
+            lblConsole.Text = "Console output";
+            lblConsole.Font = UiFont(9F, FontStyle.Bold);
             lblConsole.Location = P(560, 18);
             lblConsole.AutoSize = true;
             Controls.Add(lblConsole);
@@ -8608,6 +8761,9 @@ namespace IPbind
             Controls.Add(btnAbout);
 
             ApplyTheme();
+            if (lblIPs != null)
+                lblIPs.NoteColor = dark ? SubCol : Color.FromArgb(90, 90, 90);
+            AlignGatewayPair(btnRefresh);
             this.ResumeLayout(true);
         }
     }

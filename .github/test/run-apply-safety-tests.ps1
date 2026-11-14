@@ -30,7 +30,20 @@ if ($LASTEXITCODE -ne 0) { throw 'Adapter display test compile failed' }
 & .\adapter-display-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Adapter display tests failed' }
 
-# 2.3.143: console colors WARN / ERR / OK lines (real console control + LogConsole).
+# 2.3.144: Save List sorts the IP list numerically; defaults ship sorted; load does not sort.
+$sortArgs = @(
+  '/nologo', '/warnaserror+', '/target:exe', '/out:ip-list-sort-tests.exe',
+  '/main:IPbindTest.IpListSortTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\IpListSortTest.cs'
+)
+& $csc @sortArgs
+if ($LASTEXITCODE -ne 0) { throw 'IP list sort test compile failed' }
+& .\ip-list-sort-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'IP list sort tests failed' }
+
+# 2.3.144: console colors only the OK / WARN / ERR / INFO tags (real console control + LogConsole).
 $colorArgs = @(
   '/nologo', '/warnaserror+', '/target:exe', '/out:console-color-tests.exe',
   '/main:IPbindTest.ConsoleColorTest',
