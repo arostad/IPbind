@@ -5,6 +5,7 @@ IPbind-*.exe
 # Frozen 139 installer used by installer-clip-139 / run-clip-fixtures.
 !/.github/test/fixtures/IPbind-Installer-v2.3.139-beta.exe
 dist/
+dist-wpf/
 *.user
 .vs/
 bin/

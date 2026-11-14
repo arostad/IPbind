@@ -1,0 +1,74 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="640" SizeToContent="Height"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Background="{DynamicResource DialogBgBrush}"
+        Foreground="{DynamicResource FgBrush}"
+        FontFamily="Segoe UI" FontSize="14">
+  <DockPanel>
+    <Border x:Name="footer" DockPanel.Dock="Bottom" Background="{DynamicResource FooterBrush}" Padding="32,18,32,22">
+      <StackPanel>
+        <CheckBox x:Name="understandBox" Margin="0,0,0,8"/>
+        <CheckBox x:Name="dontShowBox" Margin="0,0,0,16"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="continueButton" Content="Continue" MinWidth="150" Height="40" Margin="0,0,10,0"
+                  IsEnabled="False"
+                  Background="{DynamicResource PrimaryBack}" Foreground="{DynamicResource PrimaryFore}"
+                  BorderBrush="{DynamicResource PrimaryBack}"/>
+          <Button x:Name="exitButton" Content="Exit IPbind" MinWidth="150" Height="40"
+                  Background="{DynamicResource SecondaryBack}" Foreground="{DynamicResource FgBrush}"
+                  BorderBrush="{DynamicResource SecondaryBorder}"/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+    <StackPanel Margin="32,28,32,20">
+      <DockPanel Margin="0,0,0,20">
+        <Border DockPanel.Dock="Left" Width="36" Height="36" CornerRadius="18" Margin="0,0,14,0"
+                Background="{DynamicResource AmberBrush}" VerticalAlignment="Top">
+          <TextBlock Text="!" FontWeight="Bold" FontSize="20" Foreground="#1F1F1F"
+                     HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <StackPanel>
+          <TextBlock x:Name="eyebrow" Text="BEFORE YOU START" FontWeight="SemiBold" FontSize="12"
+                     Foreground="{DynamicResource AmberBrush}"/>
+          <TextBlock x:Name="title" Text="Return to DHCP before joining a live network"
+                     FontWeight="SemiBold" FontSize="22" TextWrapping="Wrap"/>
+        </StackPanel>
+      </DockPanel>
+      <TextBlock x:Name="intro" TextWrapping="Wrap" Margin="0,0,0,20"/>
+      <Border x:Name="card" Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrushKey}"
+              BorderThickness="1" CornerRadius="6" Padding="18,16" Margin="0,0,0,20">
+        <DockPanel>
+          <Border x:Name="replica" DockPanel.Dock="Left" Background="#195AA0" CornerRadius="3"
+                  Padding="16,10" Margin="0,0,18,0" VerticalAlignment="Center">
+            <TextBlock x:Name="replicaText" Foreground="White" FontWeight="Bold" FontSize="15"/>
+          </Border>
+          <StackPanel>
+            <TextBlock x:Name="cardHead" FontWeight="SemiBold" TextWrapping="Wrap"
+                       Text="Look for this button in the main window"/>
+            <TextBlock x:Name="cardDesc" FontSize="13" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                       Text="Clicking it removes the addresses you bound and returns your selected interface to DHCP, ready for a live network."/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <TextBlock x:Name="lead" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,14"
+                 Text="If you skip it and plug into a live network (office, home, or public):"/>
+      <StackPanel x:Name="row0" Margin="0,0,0,14">
+        <TextBlock x:Name="rowHead0" FontWeight="SemiBold" Text="Your laptop may not have internet"/>
+        <TextBlock x:Name="rowDesc0" FontSize="13" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                   Text="No web, email, or network drives until the addresses are removed."/>
+      </StackPanel>
+      <StackPanel x:Name="row1" Margin="0,0,0,14">
+        <TextBlock x:Name="rowHead1" FontWeight="SemiBold" Text="You could knock an existing device offline"/>
+        <TextBlock x:Name="rowDesc1" FontSize="13" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                   Text="One of your addresses may already belong to something on that network."/>
+      </StackPanel>
+      <StackPanel x:Name="row2">
+        <TextBlock x:Name="rowHead2" FontWeight="SemiBold" Text="You could set off security alerts"/>
+        <TextBlock x:Name="rowDesc2" FontSize="13" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                   Text="Network admins may block your laptop until it&#x2019;s sorted out."/>
+      </StackPanel>
+    </StackPanel>
+  </DockPanel>
+</Window>

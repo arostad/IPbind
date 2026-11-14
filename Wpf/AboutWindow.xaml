@@ -1,0 +1,58 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="500" SizeToContent="Height"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Background="{DynamicResource DialogBgBrush}"
+        Foreground="{DynamicResource FgBrush}"
+        FontFamily="Segoe UI" FontSize="14">
+  <DockPanel>
+    <Border x:Name="footer" DockPanel.Dock="Bottom" Background="{DynamicResource FooterBrush}" Padding="28,16,28,18">
+      <DockPanel>
+        <Button x:Name="closeButton" DockPanel.Dock="Right" Content="Close" MinWidth="96" Padding="16,6"
+                FontWeight="SemiBold"
+                Background="{DynamicResource PrimaryBack}" Foreground="{DynamicResource PrimaryFore}"
+                BorderBrush="{DynamicResource PrimaryBack}"/>
+        <Button x:Name="checkButton" Content="Check for updates" MinWidth="96" Padding="16,6" HorizontalAlignment="Left"
+                Background="{DynamicResource SecondaryBack}" Foreground="{DynamicResource FgBrush}"
+                BorderBrush="{DynamicResource SecondaryBorder}"/>
+      </DockPanel>
+    </Border>
+    <StackPanel Margin="28,22,28,0">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="16"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Image x:Name="iconBox" Width="64" Height="64" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
+        <StackPanel Grid.Column="2" VerticalAlignment="Center">
+          <TextBlock x:Name="nameLabel" FontSize="22" FontWeight="SemiBold"/>
+          <TextBlock x:Name="versionLabel" FontSize="14" FontWeight="Bold" Margin="0,2,0,0"/>
+          <TextBlock Margin="0,2,0,0">
+            <Hyperlink x:Name="websiteLink" NavigateUri="https://ipbind.com/">ipbind.com</Hyperlink>
+            <Run x:Name="siteSeparator" Text="  ·  " Foreground="{DynamicResource QuietBrush}"/>
+            <Hyperlink x:Name="sourceLink" NavigateUri="https://github.com/arostad/IPbind">GitHub project page</Hyperlink>
+          </TextBlock>
+          <TextBlock x:Name="matchLabel" Text="Matches the current release" FontSize="12"
+                     Foreground="{DynamicResource QuietBrush}" Visibility="Collapsed" Margin="0,2,0,0"/>
+        </StackPanel>
+      </Grid>
+      <TextBlock x:Name="tagline" TextWrapping="Wrap" Margin="0,16,0,0"
+                 Foreground="{DynamicResource MutedBrush}"
+                 Text="One-click Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges"/>
+      <TextBlock Margin="0,18,0,0">
+        <Run Text="App created by "/><Hyperlink x:Name="creditLink" NavigateUri="https://github.com/arostad">Andy Rostad</Hyperlink>
+      </TextBlock>
+      <TextBlock Margin="0,8,0,0">
+        <Run Text="Released under the "/><Hyperlink x:Name="licenseLink" NavigateUri="https://github.com/arostad/IPbind/blob/main/LICENSE">MIT License</Hyperlink>
+      </TextBlock>
+      <CheckBox x:Name="launchCheckBox" Margin="0,16,0,0"
+                Content="Check for updates at launch (recommended)"/>
+      <TextBlock x:Name="statusLabel" TextWrapping="Wrap" Margin="0,16,0,0"
+                 Foreground="{DynamicResource QuietBrush}" FontSize="13" Visibility="Collapsed"/>
+      <TextBlock x:Name="privacyLabel" TextWrapping="Wrap" Margin="0,18,0,20" FontSize="12"
+                 Foreground="{DynamicResource QuietBrush}"/>
+    </StackPanel>
+  </DockPanel>
+</Window>

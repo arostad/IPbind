@@ -2101,16 +2101,36 @@ namespace IPbind
             try { SetPreferredAppMode(IsAppDark() ? 2 : 0); } catch { }   // ForceDark or Default
         }
 
-        // Tint a form's non-client title bar after its handle has been created.
-        public static void ApplyTitleBar(Form form, bool dark)
+        // Tint a window's non-client title bar after its handle has been created.
+        public static void ApplyTitleBar(IntPtr hwnd, bool dark)
         {
+            if (hwnd == IntPtr.Zero) return;
             try
             {
                 int on = dark ? 1 : 0;
                 // attribute 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/Win11);
                 // older builds used 19, so fall back to it.
-                if (DwmSetWindowAttribute(form.Handle, 20, ref on, 4) != 0)
-                    DwmSetWindowAttribute(form.Handle, 19, ref on, 4);
+                if (DwmSetWindowAttribute(hwnd, 20, ref on, 4) != 0)
+                    DwmSetWindowAttribute(hwnd, 19, ref on, 4);
+            }
+            catch { }
+        }
+
+        public static void ApplyTitleBar(Form form, bool dark)
+        {
+            if (form == null || !form.IsHandleCreated) return;
+            ApplyTitleBar(form.Handle, dark);
+        }
+
+        // DWMWA_BORDER_COLOR = 34. While maximized, DWMWA_COLOR_NONE hides the
+        // 1px border that otherwise shows around the window.
+        public static void ApplyMaximizedBorder(IntPtr hwnd, bool maximized)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                int color = maximized ? unchecked((int)0xFFFFFFFE) : unchecked((int)0xFFFFFFFF);
+                DwmSetWindowAttribute(hwnd, 34, ref color, 4);
             }
             catch { }
         }
@@ -5943,35 +5963,49 @@ namespace IPbind
     }
 
 
-    class MainForm : Form
+    interface IBindHost
     {
-        static readonly string[] DefaultIPs = new string[] {
-            "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
-            "192.168.0.98/24",  "192.168.1.98/24",  "192.168.2.98/24",
-            "192.168.4.98/24",  "192.168.255.98/24"
-        };
+        bool InvokeRequired { get; }
+        void BeginLogInvoke(Action<string, string> action, string msg, string level);
+        void LogConsole(string msg, string level);
 
-        // Every default list IPbind has shipped before the current DefaultIPs (from
-        // git history). A saved list that still equals one of these exactly was never
-        // edited, so it is upgraded to the current defaults on launch. ADD the old
-        // DefaultIPs here whenever the defaults change.
-        static readonly string[][] PreviousDefaultSets = new string[][] {
-            // 2.3.117 and earlier (all prod releases before 2.3.119)
-            new string[] {
-                "10.255.255.98/24", "10.255.128.98/24", "192.168.0.98/24",
-                "192.168.1.98/24",  "192.168.4.98/24",  "192.168.255.98/24" },
-            // briefly on the 2.3.118 development branch (never in a release)
-            new string[] {
-                "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
-                "192.168.0.98/24",  "192.168.1.98/24",  "192.168.4.98/24",
-                "192.168.255.98/24" }
-        };
+        string[] IpLines { get; set; }
+        bool ShowAllChecked { get; }
+        bool GatewayChecked { get; set; }
+        string GatewayText { get; set; }
+        string Dns1Text { get; set; }
+        string Dns2Text { get; set; }
+        string SelectedGatewayItem { get; }
+        int GatewayComboCount { get; }
+        string GatewayComboItemAt(int index);
+        int GatewaySelectedIndex { get; set; }
+        void ReplaceGatewayItems(List<string> keys);
+        void ApplyGatewayLayout();
 
-        static readonly Regex CidrRe =
-            new Regex(@"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*(/\s*(\d{1,2}))?\s*$");
-        static readonly Regex VirtualRe =
-            new Regex(@"virtual|hyper-?v|vmware|vbox|virtualbox|tap-|tunnel|vpn|loopback|wan miniport|bluetooth|pseudo|wi-?fi|wireless|cellular|wwan",
-                      RegexOptions.IgnoreCase);
+        bool KeepDhcpChecked { get; set; }
+        bool KeepDhcpEnabled { get; set; }
+        void SetKeepDhcpToolTip(string text);
+
+        int SelectedAdapterIndex { get; }
+        void BindAdapterList(List<Adapter> adapters, int selectedIndex);
+
+        bool ConfirmDisconnected(string alias, string status);
+        void RunOnUi(Action action);
+        bool IsHostDisposed { get; }
+
+        void ShowUpdateAvailable(string remoteVersion);
+        void HideUpdateBanner();
+        void SetUpdatingBanner();
+        void ShowUpdateError(string message);
+        void ExitApp();
+
+        void ShowDhcpReminder(out bool proceed, out bool remember);
+        void CloseHost();
+    }
+
+    sealed class BindEngine
+    {
+        readonly IBindHost host;
 
         readonly string AppDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), BuildInfo.AppName);
@@ -5979,67 +6013,45 @@ namespace IPbind
         readonly string AdapterFile;
         readonly string UpdateCheckFile;
         readonly string GatewayFile;
-        readonly string DhcpReminderFile;   // exists once "Don't show this again" was confirmed
-        readonly string KeepDhcpFile;       // "1"/"0": Keep DHCP preference (missing = on)
+        readonly string DhcpReminderFile;
+        readonly string KeepDhcpFile;
 
-        // Optional Gateway support: one listed address may carry a gateway and DNS.
-        // The high metric keeps this route from beating Wi-Fi/corporate default routes.
         const int GatewayMetric = 9999;
-        const string IpLabelPlain =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
-        const string IpLabelGateway =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24):";
-
-        float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
-
-        ComboBox combo;
-        CheckBox chkAll;
-        TextBox txtIPs;
-        Label lblIPs;
-        CheckBox chkGateway;
-        ToolTip gatewayTip;   // field so the tooltip lives as long as the form
-        Label lblGwOn, lblGateway, lblDns1, lblDns2;
-        ComboBox cboGwIp;
-        TextBox txtGateway, txtDns1, txtDns2;
-        string gwChoice = "";     // remembered "ip/prefix" that uses the gateway
-        bool loadingGateway;
-        TextBox console;
-        Label lblStatus;
-        Button btnBind, btnDhcp;
-        Panel updateBanner;
-        Label lblUpdateBanner;
-        Button btnUpdateNow, btnUpdateLater;
-        Button btnClear;
-        Button btnAbout;
-        CheckBox chkKeepDhcp;
-        ToolTip keepDhcpTip;
-        bool keepDhcpPref = true;     // what the user chose; the box is forced off where unsupported
-        bool settingKeepDhcp;
-        string coexistNoteFor;        // adapter whose "not available" note was already logged
         const string KeepDhcpTipOn =
             "On: DHCP stays on and these addresses are added alongside it.\r\n" +
             "Off: static addresses only, no DHCP.";
         const string KeepDhcpTipOff =
             "Needs Windows 10 version 1703 or later.\r\n" +
             "Apply uses static addresses only.";
-        bool dark;
+
+        string gwChoice = "";
+        bool loadingGateway;
+        bool keepDhcpPref = true;
+        bool settingKeepDhcp;
+        string coexistNoteFor;
+        bool defaultsUpgraded;
         bool launchUpdateCheckStarted;
         bool updateDismissed;
-        bool shown;
-        bool fittingWorkingArea;
-        Rectangle fittedWorkingArea = Rectangle.Empty;
-        Color BgCol, PanelCol, FgCol, SubCol, BorderCol, InputCol;
         readonly List<Adapter> adapters = new List<Adapter>();
+        public string UpdateCheckPath { get { return UpdateCheckFile; } }
+        public bool SettingKeepDhcp { get { return settingKeepDhcp; } }
+        public bool LoadingGateway { get { return loadingGateway; } }
+        public bool KeepDhcpPref { get { return keepDhcpPref; } }
+        public string GwChoice { get { return gwChoice; } set { gwChoice = value ?? ""; } }
 
-        public MainForm()
+        public BindEngine(IBindHost host)
         {
+            this.host = host;
             StoreFile = Path.Combine(AppDir, "ip-list.txt");
             AdapterFile = Path.Combine(AppDir, "adapter.txt");
             UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
             GatewayFile = Path.Combine(AppDir, "gateway.txt");
             DhcpReminderFile = Path.Combine(AppDir, "dhcp-reminder-dismissed.txt");
             KeepDhcpFile = Path.Combine(AppDir, "keep-dhcp.txt");
-            BuildUi();
+        }
+
+        public void Startup()
+        {
             LoadKeepDhcpPref();
             LoadAdapters();
             LoadList();
@@ -6049,48 +6061,36 @@ namespace IPbind
                 Log("Default address list updated to the latest defaults.", "INFO");
             if (BuildInfo.IsBeta)
                 Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
-            DebugLog.WatchForm(this);
             LogAdaptersRaw();
         }
 
-        // scale helper: design pixels -> device pixels
-        int U(int v) { return (int)Math.Round(v * sc); }
-        Point P(int x, int y) { return new Point(U(x), U(y)); }
-        Size Z(int w, int h) { return new Size(U(w), U(h)); }
-
-        // ---------------- helpers ----------------
         void EnsureAppDir()
         {
             if (!Directory.Exists(AppDir)) Directory.CreateDirectory(AppDir);
         }
 
-        void Log(string msg) { Log(msg, "INFO"); }
-        void Log(string msg, string level)
+        public void Log(string msg) { Log(msg, "INFO"); }
+        public void Log(string msg, string level)
         {
             string fileLevel = level == "ERR" ? "ERROR" : (string.IsNullOrEmpty(level) ? "INFO" : level);
             DebugLog.Write(fileLevel, msg);
-            if (console.InvokeRequired)
+            if (host.InvokeRequired)
             {
-                console.BeginInvoke((Action<string, string>)LogConsole, msg, level);
+                host.BeginLogInvoke(LogConsole, msg, level);
                 return;
             }
             LogConsole(msg, level);
         }
 
-        void LogConsole(string msg, string level)
+        public void LogConsole(string msg, string level)
         {
-            string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
-            console.AppendText(line);
-            console.SelectionStart = console.TextLength;
-            console.ScrollToCaret();
-            AutoHideScrollBox box = console as AutoHideScrollBox;
-            if (box != null) box.SyncThumbOnly();
+            host.LogConsole(msg, level);
         }
 
-        bool TryCidr(string s, out string ip, out int prefix)
+        public bool TryCidr(string s, out string ip, out int prefix)
         {
             ip = null; prefix = 0;
-            Match m = CidrRe.Match(s ?? "");
+            Match m = MainForm.CidrRe.Match(s ?? "");
             if (!m.Success) return false;
             int[] o = new int[4];
             for (int i = 0; i < 4; i++)
@@ -6104,17 +6104,17 @@ namespace IPbind
             return true;
         }
 
-        string MaskFromPrefix(int p)
+        public string MaskFromPrefix(int p)
         {
             uint m = p == 0 ? 0u : (0xFFFFFFFFu << (32 - p));
             return ((m >> 24) & 0xFF) + "." + ((m >> 16) & 0xFF) + "." + ((m >> 8) & 0xFF) + "." + (m & 0xFF);
         }
 
-        string[] CanonicalList()
+        public string[] CanonicalList()
         {
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             List<string> outl = new List<string>();
-            foreach (string l in txtIPs.Lines)
+            foreach (string l in host.IpLines)
             {
                 string t = (l ?? "").Trim();
                 if (t.Length == 0) continue;
@@ -6129,65 +6129,16 @@ namespace IPbind
             return outl.ToArray();
         }
 
-        void SaveList(bool quiet)
+        public void SaveList(bool quiet)
         {
             EnsureAppDir();
             string[] lines = CanonicalList();
             File.WriteAllLines(StoreFile, lines); DebugLog.LogSettingsFile(StoreFile, "save-iplist");
-            txtIPs.Lines = lines;
+            host.IpLines = lines;
             if (!quiet) Log("Saved " + lines.Length + " address(es) to disk.", "OK");
         }
 
-        // BEGIN DefaultsUpgrade (self-contained; exercised by a host-side test)
-        // Order-, case- and whitespace-insensitive key for one saved line; CIDR entries
-        // are canonicalised exactly like TryCidr (missing prefix = /24).
-        static string DefaultsKey(string line)
-        {
-            string t = (line ?? "").Trim();
-            if (t.Length == 0) return null;
-            Match m = CidrRe.Match(t);
-            if (m.Success)
-            {
-                int[] o = new int[4];
-                bool ok = true;
-                for (int i = 0; i < 4; i++)
-                {
-                    o[i] = int.Parse(m.Groups[i + 1].Value);
-                    if (o[i] > 255) ok = false;
-                }
-                int prefix = m.Groups[6].Success ? int.Parse(m.Groups[6].Value) : 24;
-                if (ok && prefix >= 0 && prefix <= 32)
-                    return o[0] + "." + o[1] + "." + o[2] + "." + o[3] + "/" + prefix;
-            }
-            return Regex.Replace(t, @"\s+", "").ToLowerInvariant();
-        }
-
-        static HashSet<string> DefaultsKeySet(IEnumerable<string> lines)
-        {
-            HashSet<string> set = new HashSet<string>(StringComparer.Ordinal);
-            foreach (string l in lines)
-            {
-                string k = DefaultsKey(l);
-                if (k != null) set.Add(k);
-            }
-            return set;
-        }
-
-        // True only when the saved list is exactly an earlier shipped default list
-        // (never edited) and differs from the current defaults.
-        static bool IsUneditedOldDefaults(IEnumerable<string> saved, string[] current, string[][] previous)
-        {
-            HashSet<string> have = DefaultsKeySet(saved);
-            if (have.Count == 0 || have.SetEquals(DefaultsKeySet(current))) return false;
-            foreach (string[] old in previous)
-                if (have.SetEquals(DefaultsKeySet(old))) return true;
-            return false;
-        }
-        // END DefaultsUpgrade
-
-        bool defaultsUpgraded;
-
-        void LoadList()
+        public void LoadList()
         {
             if (File.Exists(StoreFile))
             {
@@ -6200,27 +6151,27 @@ namespace IPbind
                 }
                 if (lines.Count > 0)
                 {
-                    if (IsUneditedOldDefaults(lines, DefaultIPs, PreviousDefaultSets))
+                    if (MainForm.IsUneditedOldDefaults(lines, MainForm.DefaultIPs, MainForm.PreviousDefaultSets))
                     {
-                        txtIPs.Lines = DefaultIPs;
+                        host.IpLines = MainForm.DefaultIPs;
                         SaveList(true);
-                        defaultsUpgraded = true;   // logged after the startup line
+                        defaultsUpgraded = true;
                         return;
                     }
-                    txtIPs.Lines = lines.ToArray();
+                    host.IpLines = lines.ToArray();
                     return;
                 }
             }
-            txtIPs.Lines = DefaultIPs;
+            host.IpLines = MainForm.DefaultIPs;
             SaveList(true);
         }
 
-        void RestoreDefaults()
+        public void RestoreDefaults()
         {
             SaveList(true);
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             List<string> merged = new List<string>();
-            foreach (string l in txtIPs.Lines)
+            foreach (string l in host.IpLines)
             {
                 string t = (l ?? "").Trim();
                 if (t.Length == 0) continue;
@@ -6229,25 +6180,21 @@ namespace IPbind
                 else if (seen.Add("raw:" + t)) merged.Add(t);
             }
             int added = 0;
-            foreach (string d in DefaultIPs)
+            foreach (string d in MainForm.DefaultIPs)
             {
                 string ip; int pfx; TryCidr(d, out ip, out pfx);
                 string k = ip + "/" + pfx;
                 if (seen.Add(k)) { merged.Add(k); added++; }
             }
-            txtIPs.Lines = merged.ToArray();
+            host.IpLines = merged.ToArray();
             SaveList(true);
             Log("Restored defaults (added " + added + " missing; kept custom entries).", "OK");
         }
 
-        void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); DebugLog.LogSettingsFile(AdapterFile, "save-adapter"); }
-        string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
+        public void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); DebugLog.LogSettingsFile(AdapterFile, "save-adapter"); }
+        public string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
 
-        // update-check.txt is written by the installer: "auto" (default) or "manual".
-        // Only an explicit "manual" turns off the launch check; a missing or unreadable
-        // file keeps automatic checks, so portable copies behave as before. Manual
-        // checks from About always work.
-        bool LaunchUpdateCheckEnabled()
+        public bool LaunchUpdateCheckEnabled()
         {
             try
             {
@@ -6258,10 +6205,7 @@ namespace IPbind
             catch { return true; }
         }
 
-        // ---------------- gateway support ----------------
-        // gateway.txt holds key=value lines: enabled, ip, gateway, dns1, dns2. A missing
-        // or unreadable file means Gateway support is off.
-        void LoadGatewaySettings()
+        public void LoadGatewaySettings()
         {
             loadingGateway = true;
             try
@@ -6295,40 +6239,37 @@ namespace IPbind
                     }
                 }
                 catch { enabled = false; gw = ""; d1 = ""; d2 = ""; gwChoice = ""; }
-                txtGateway.Text = gw;
-                txtDns1.Text = d1;
-                txtDns2.Text = d2;
+                host.GatewayText = gw;
+                host.Dns1Text = d1;
+                host.Dns2Text = d2;
                 RefreshGatewayChoices();
-                chkGateway.Checked = enabled;
-                ApplyGatewayLayout();
+                host.GatewayChecked = enabled;
+                host.ApplyGatewayLayout();
             }
             finally { loadingGateway = false; }
         }
 
-        void SaveGatewaySettings()
+        public void SaveGatewaySettings()
         {
             if (loadingGateway) return;
             try
             {
                 EnsureAppDir();
                 File.WriteAllLines(GatewayFile, new string[] {
-                    "enabled=" + (chkGateway.Checked ? "1" : "0"),
+                    "enabled=" + (host.GatewayChecked ? "1" : "0"),
                     "ip=" + gwChoice,
-                    "gateway=" + txtGateway.Text.Trim(),
-                    "dns1=" + txtDns1.Text.Trim(),
-                    "dns2=" + txtDns2.Text.Trim()
+                    "gateway=" + host.GatewayText.Trim(),
+                    "dns1=" + host.Dns1Text.Trim(),
+                    "dns2=" + host.Dns2Text.Trim()
                 }); DebugLog.LogSettingsFile(GatewayFile, "save-gateway");
             }
             catch { }
         }
 
-        // Fill "Use gateway on" from the valid entries currently in the list, keeping
-        // the remembered choice selected whenever it is still present.
-        void RefreshGatewayChoices()
+        public void RefreshGatewayChoices()
         {
-            if (cboGwIp == null) return;
             List<string> keys = new List<string>();
-            foreach (string l in txtIPs.Lines)
+            foreach (string l in host.IpLines)
             {
                 string ip; int pfx;
                 if (TryCidr(l, out ip, out pfx))
@@ -6337,75 +6278,63 @@ namespace IPbind
                     if (!keys.Contains(k)) keys.Add(k);
                 }
             }
-            bool same = keys.Count == cboGwIp.Items.Count;
+            bool same = keys.Count == host.GatewayComboCount;
             for (int i = 0; same && i < keys.Count; i++)
-                if ((string)cboGwIp.Items[i] != keys[i]) same = false;
+                if (host.GatewayComboItemAt(i) != keys[i]) same = false;
             if (!same)
-            {
-                cboGwIp.BeginUpdate();
-                cboGwIp.Items.Clear();
-                foreach (string k in keys) cboGwIp.Items.Add(k);
-                cboGwIp.EndUpdate();
-            }
+                host.ReplaceGatewayItems(keys);
             int idx = gwChoice.Length > 0 ? keys.IndexOf(gwChoice) : -1;
-            if (cboGwIp.SelectedIndex != idx) cboGwIp.SelectedIndex = idx;
+            if (host.GatewaySelectedIndex != idx) host.GatewaySelectedIndex = idx;
         }
 
-        // Shows or hides the gateway rows. The IP list gives up exactly the height the
-        // two rows need, so nothing below the list moves.
-        void ApplyGatewayLayout()
+        public void OnGatewayCheckedChanged()
         {
-            bool on = chkGateway.Checked;
-            txtIPs.Height = U(on ? 134 : 196);
-            lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
-            foreach (Control c in new Control[] {
-                lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
-                c.Visible = on;
+            host.ApplyGatewayLayout();
+            SaveGatewaySettings();
+            if (!loadingGateway)
+                Log(host.GatewayChecked
+                    ? "Gateway support on (remembered). Choose one address and enter its gateway and optional DNS."
+                    : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
         }
 
-        static bool TryIPv4(string s, out uint value)
+        public void OnGatewayIpChosen()
         {
-            value = 0;
-            Match m = Regex.Match(s ?? "", @"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*$");
-            if (!m.Success) return false;
-            for (int i = 1; i <= 4; i++)
-            {
-                int o = int.Parse(m.Groups[i].Value);
-                if (o > 255) return false;
-                value = (value << 8) | (uint)o;
-            }
-            return true;
+            gwChoice = host.GatewaySelectedIndex >= 0 ? host.SelectedGatewayItem : "";
+            SaveGatewaySettings();
         }
 
-        static string IPv4Text(uint v)
+        public void OnKeepDhcpCheckedChanged()
         {
-            return ((v >> 24) & 0xFF) + "." + ((v >> 16) & 0xFF) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
+            if (settingKeepDhcp) return;
+            keepDhcpPref = host.KeepDhcpChecked;
+            SaveKeepDhcpPref();
+            Log(keepDhcpPref
+                ? "Keep DHCP on (remembered). Apply adds the addresses alongside DHCP."
+                : "Keep DHCP off (remembered). Apply sets static addresses only.");
         }
 
-        // Usable as a gateway or DNS server: not 0.x, loopback, multicast/reserved, or broadcast.
-        static bool IsUsableHost(uint v)
+        public void OnAdapterChosen()
         {
-            uint first = v >> 24;
-            return first != 0 && first != 127 && first < 224;
+            string a = GetSelectedAlias();
+            if (a != null) { SaveAdapter(a); Log("Interface set to '" + a + "' (remembered)."); }
+            RefreshKeepDhcp(a);
         }
 
         sealed class GatewayPlan
         {
-            public string Ip;       // chosen address (dotted)
+            public string Ip;
             public int Prefix;
             public string Gateway;
-            public string Dns1;     // may be null
-            public string Dns2;     // may be null
+            public string Dns1;
+            public string Dns2;
         }
 
-        // Returns true when Gateway support is off (plan = null) or every field is valid.
-        // Logs the reason and returns false otherwise; nothing is applied in that case.
         bool TryBuildGatewayPlan(out GatewayPlan plan)
         {
             plan = null;
-            if (!chkGateway.Checked) return true;
+            if (!host.GatewayChecked) return true;
 
-            string choice = cboGwIp.SelectedIndex >= 0 ? (string)cboGwIp.SelectedItem : null;
+            string choice = host.GatewaySelectedIndex >= 0 ? host.SelectedGatewayItem : null;
             if (choice == null)
             {
                 Log("Gateway support is on, but no address is chosen in 'Use gateway on'. Pick one or turn Gateway support off.", "ERR");
@@ -6425,15 +6354,15 @@ namespace IPbind
                 return false;
             }
 
-            string gwText = txtGateway.Text.Trim();
+            string gwText = host.GatewayText.Trim();
             uint gw, ipv;
-            TryIPv4(ip, out ipv);
+            MainForm.TryIPv4(ip, out ipv);
             if (gwText.Length == 0)
             {
                 Log("Gateway support is on, but no gateway is entered. Enter one or turn Gateway support off.", "ERR");
                 return false;
             }
-            if (!TryIPv4(gwText, out gw) || !IsUsableHost(gw))
+            if (!MainForm.TryIPv4(gwText, out gw) || !MainForm.IsUsableHost(gw))
             {
                 Log("Gateway '" + gwText + "' is not a valid IPv4 address.", "ERR");
                 return false;
@@ -6443,35 +6372,35 @@ namespace IPbind
             uint bcast = net | ~mask;
             if ((gw & mask) != net)
             {
-                Log("Gateway " + IPv4Text(gw) + " is not in the same subnet as " + choice +
-                    " (" + IPv4Text(net) + "/" + pfx + ").", "ERR");
+                Log("Gateway " + MainForm.IPv4Text(gw) + " is not in the same subnet as " + choice +
+                    " (" + MainForm.IPv4Text(net) + "/" + pfx + ").", "ERR");
                 return false;
             }
             if (gw == ipv)
             {
-                Log("Gateway " + IPv4Text(gw) + " is the same as the address it is for. Use the router's address.", "ERR");
+                Log("Gateway " + MainForm.IPv4Text(gw) + " is the same as the address it is for. Use the router's address.", "ERR");
                 return false;
             }
             if (pfx <= 30 && (gw == net || gw == bcast))
             {
-                Log("Gateway " + IPv4Text(gw) + " is the " + (gw == net ? "network" : "broadcast") +
-                    " address of " + IPv4Text(net) + "/" + pfx + ", not a usable host.", "ERR");
+                Log("Gateway " + MainForm.IPv4Text(gw) + " is the " + (gw == net ? "network" : "broadcast") +
+                    " address of " + MainForm.IPv4Text(net) + "/" + pfx + ", not a usable host.", "ERR");
                 return false;
             }
 
-            string d1Text = txtDns1.Text.Trim(), d2Text = txtDns2.Text.Trim();
+            string d1Text = host.Dns1Text.Trim(), d2Text = host.Dns2Text.Trim();
             uint d1 = 0, d2 = 0;
             if (d2Text.Length > 0 && d1Text.Length == 0)
             {
                 Log("DNS 2 is filled in but DNS 1 is empty. Put the first DNS server in DNS 1.", "ERR");
                 return false;
             }
-            if (d1Text.Length > 0 && (!TryIPv4(d1Text, out d1) || !IsUsableHost(d1)))
+            if (d1Text.Length > 0 && (!MainForm.TryIPv4(d1Text, out d1) || !MainForm.IsUsableHost(d1)))
             {
                 Log("DNS 1 '" + d1Text + "' is not a valid IPv4 address.", "ERR");
                 return false;
             }
-            if (d2Text.Length > 0 && (!TryIPv4(d2Text, out d2) || !IsUsableHost(d2)))
+            if (d2Text.Length > 0 && (!MainForm.TryIPv4(d2Text, out d2) || !MainForm.IsUsableHost(d2)))
             {
                 Log("DNS 2 '" + d2Text + "' is not a valid IPv4 address.", "ERR");
                 return false;
@@ -6485,19 +6414,18 @@ namespace IPbind
             plan = new GatewayPlan();
             plan.Ip = ip;
             plan.Prefix = pfx;
-            plan.Gateway = IPv4Text(gw);
-            plan.Dns1 = d1Text.Length > 0 ? IPv4Text(d1) : null;
-            plan.Dns2 = d2Text.Length > 0 ? IPv4Text(d2) : null;
+            plan.Gateway = MainForm.IPv4Text(gw);
+            plan.Dns1 = d1Text.Length > 0 ? MainForm.IPv4Text(d1) : null;
+            plan.Dns2 = d2Text.Length > 0 ? MainForm.IPv4Text(d2) : null;
             return true;
         }
 
-        void LoadAdapters()
+        public void LoadAdapters()
         {
-            combo.Items.Clear();
             adapters.Clear();
             NetworkInterface[] nics;
             try { nics = NetworkInterface.GetAllNetworkInterfaces(); }
-            catch (Exception ex) { Log("Could not list adapters: " + ex.Message, "ERR"); return; }
+            catch (Exception ex) { Log("Could not list adapters: " + ex.Message, "ERR"); host.BindAdapterList(adapters, -1); return; }
 
             foreach (NetworkInterface ni in nics)
             {
@@ -6507,10 +6435,10 @@ namespace IPbind
                     ni.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
                     ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT ||
                     ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx;
-                if (!chkAll.Checked)
+                if (!host.ShowAllChecked)
                 {
                     if (!isEthernet) continue;
-                    if (VirtualRe.IsMatch(ni.Description ?? "")) continue;
+                    if (MainForm.VirtualRe.IsMatch(ni.Description ?? "")) continue;
                 }
                 adapters.Add(new Adapter
                 {
@@ -6523,23 +6451,10 @@ namespace IPbind
             {
                 return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
             });
-            foreach (Adapter a in adapters)
-                combo.Items.Add(AdapterDisplay.Format(a.Name, a.Description, a.Status));
 
-            // Keep long "Name | Description [Status]" entries readable when the list
-            // opens. TextRenderer measures in device pixels; design padding and the
-            // generous minimum are explicitly scaled through U().
-            int dropDownWidth = Math.Max(combo.Width + U(40), U(800));
-            foreach (object item in combo.Items)
+            if (adapters.Count == 0)
             {
-                int itemWidth =
-                    TextRenderer.MeasureText(item.ToString(), combo.Font).Width + U(32);
-                dropDownWidth = Math.Max(dropDownWidth, itemWidth);
-            }
-            combo.DropDownWidth = dropDownWidth;
-
-            if (combo.Items.Count == 0)
-            {
+                host.BindAdapterList(adapters, -1);
                 Log("No wired LAN interfaces found. Tick 'Show all' to list every adapter.", "WARN");
                 return;
             }
@@ -6552,19 +6467,18 @@ namespace IPbind
                 for (int i = 0; i < adapters.Count; i++)
                     if (adapters[i].Status == "Up") { idx = i; break; }
             if (idx < 0) idx = 0;
-            combo.SelectedIndex = idx;
-            Log("Listed " + adapters.Count + " interface(s)" + (chkAll.Checked ? " (all)" : " (wired only)") + ".");
+            host.BindAdapterList(adapters, idx);
+            Log("Listed " + adapters.Count + " interface(s)" + (host.ShowAllChecked ? " (all)" : " (wired only)") + ".");
         }
 
-        // The real Windows connection name. Never parse the dropdown's display
-        // string (that is tidied for reading only and is not an interface ID).
-        string GetSelectedAlias()
+        public string GetSelectedAlias()
         {
-            if (combo.SelectedIndex < 0 || combo.SelectedIndex >= adapters.Count) return null;
-            return adapters[combo.SelectedIndex].Name;
+            int i = host.SelectedAdapterIndex;
+            if (i < 0 || i >= adapters.Count) return null;
+            return adapters[i].Name;
         }
 
-        string AdapterStatus(string name)
+        public string AdapterStatus(string name)
         {
             try
             {
@@ -6575,7 +6489,7 @@ namespace IPbind
             return "Unknown";
         }
 
-        int RunProc(string file, string args, out string output)
+        public int RunProc(string file, string args, out string output)
         {
             ProcessStartInfo psi = new ProcessStartInfo(file, args);
             psi.UseShellExecute = false;
@@ -6607,7 +6521,7 @@ namespace IPbind
 
         int Netsh(string args, out string output) { return RunProc("netsh", args, out output); }
 
-        bool ValidateAdapterAlias(string alias)
+        public bool ValidateAdapterAlias(string alias)
         {
             if (string.IsNullOrEmpty(alias))
             {
@@ -6635,7 +6549,7 @@ namespace IPbind
             return false;
         }
 
-        void ShowCurrentConfig(string alias)
+        public void ShowCurrentConfig(string alias)
         {
             if (!ValidateAdapterAlias(alias)) return;
             Log("Current IPv4 config for '" + alias + "':");
@@ -6646,7 +6560,6 @@ namespace IPbind
                 string t = raw.Trim();
                 if (t.Length > 0) Log("  " + t);
             }
-            // netsh lists DHCP and static addresses alike; say which is which.
             AdapterInfo info = GetAdapterInfo(alias);
             if (info == null || !info.Dhcp) return;
             List<string> dhcp = new List<string>(), stat = new List<string>();
@@ -6660,32 +6573,6 @@ namespace IPbind
                     ", plus static: " + string.Join(", ", stat.ToArray()));
         }
 
-        // ---------------- Keep DHCP (DHCP/static coexistence) ----------------
-        // Windows 10 1703+ can keep DHCP on while static addresses sit alongside it
-        // (netsh "dhcpstaticipcoexistence"). Without it, adding an address silently turns
-        // DHCP off. Support shows up as a line in "netsh interface ipv4 show interface".
-        // IPbind records exactly what it added, so Return to DHCP removes only that:
-        // "set address source=dhcp" does NOT remove statics while coexistence is on, and
-        // "delete address ... gateway=all" would also delete the DHCP default route.
-
-        // BEGIN CoexistParse (self-contained; exercised by a unit test)
-        internal enum CoexistState { Unsupported, Disabled, Enabled }
-
-        internal static CoexistState ParseCoexistence(string showInterfaceOutput)
-        {
-            foreach (string raw in (showInterfaceOutput ?? "").Replace("\r", "").Split('\n'))
-            {
-                string t = raw.Trim();
-                if (!t.StartsWith("DHCP/Static IP coexistence", StringComparison.OrdinalIgnoreCase)) continue;
-                int colon = t.IndexOf(':');
-                string v = colon < 0 ? "" : t.Substring(colon + 1).Trim();
-                return string.Equals(v, "enabled", StringComparison.OrdinalIgnoreCase)
-                    ? CoexistState.Enabled : CoexistState.Disabled;
-            }
-            return CoexistState.Unsupported;
-        }
-        // END CoexistParse
-
         sealed class AdapterInfo
         {
             public string Guid;
@@ -6695,7 +6582,7 @@ namespace IPbind
             public readonly List<string> Gateways = new List<string>();
         }
 
-        void LogAdaptersRaw()
+        public void LogAdaptersRaw()
         {
             try
             {
@@ -6710,7 +6597,7 @@ namespace IPbind
             }
         }
 
-        string CaptureAdapterState(string alias)
+        public string CaptureAdapterState(string alias)
         {
             if (string.IsNullOrEmpty(alias)) return "(no adapter)";
             try
@@ -6766,7 +6653,7 @@ namespace IPbind
             }
         }
 
-        void LogAdapterDiff(string when, string before, string after)
+        public void LogAdapterDiff(string when, string before, string after)
         {
             DebugLog.Info("adapter state " + when + " before: " + before);
             DebugLog.Info("adapter state " + when + " after:  " + after);
@@ -6802,15 +6689,15 @@ namespace IPbind
             return null;
         }
 
-        CoexistState DetectCoexist(AdapterInfo info)
+        MainForm.CoexistState DetectCoexist(AdapterInfo info)
         {
-            if (info == null || info.Index <= 0) return CoexistState.Unsupported;
+            if (info == null || info.Index <= 0) return MainForm.CoexistState.Unsupported;
             string outp;
             Netsh("interface ipv4 show interface " + info.Index, out outp);
-            return ParseCoexistence(outp);
+            return MainForm.ParseCoexistence(outp);
         }
 
-        void LoadKeepDhcpPref()
+        public void LoadKeepDhcpPref()
         {
             try
             {
@@ -6822,30 +6709,28 @@ namespace IPbind
             }
             catch { keepDhcpPref = true; }
             settingKeepDhcp = true;
-            try { chkKeepDhcp.Checked = keepDhcpPref; }
+            try { host.KeepDhcpChecked = keepDhcpPref; }
             finally { settingKeepDhcp = false; }
         }
 
-        void SaveKeepDhcpPref()
+        public void SaveKeepDhcpPref()
         {
             try { EnsureAppDir(); File.WriteAllText(KeepDhcpFile, keepDhcpPref ? "1" : "0"); DebugLog.LogSettingsFile(KeepDhcpFile, "save-keepdhcp"); }
             catch { }
         }
 
-        // Enables the box only where Windows supports coexistence for this adapter.
-        void RefreshKeepDhcp(string alias)
+        public void RefreshKeepDhcp(string alias)
         {
-            if (chkKeepDhcp == null) return;
-            CoexistState st = alias == null ? CoexistState.Unsupported : DetectCoexist(GetAdapterInfo(alias));
-            bool supported = st != CoexistState.Unsupported;
+            MainForm.CoexistState st = alias == null ? MainForm.CoexistState.Unsupported : DetectCoexist(GetAdapterInfo(alias));
+            bool supported = st != MainForm.CoexistState.Unsupported;
             settingKeepDhcp = true;
             try
             {
-                chkKeepDhcp.Enabled = supported;
-                chkKeepDhcp.Checked = supported && keepDhcpPref;
+                host.KeepDhcpEnabled = supported;
+                host.KeepDhcpChecked = supported && keepDhcpPref;
             }
             finally { settingKeepDhcp = false; }
-            keepDhcpTip.SetToolTip(chkKeepDhcp, supported ? KeepDhcpTipOn : KeepDhcpTipOff);
+            host.SetKeepDhcpToolTip(supported ? KeepDhcpTipOn : KeepDhcpTipOff);
             if (!supported && alias != null && coexistNoteFor != alias)
             {
                 coexistNoteFor = alias;
@@ -6854,13 +6739,11 @@ namespace IPbind
             }
         }
 
-        // What a Keep DHCP Apply added to one adapter, stored per adapter GUID in the
-        // app's settings folder so Return to DHCP works after a restart.
         sealed class KeepRecord
         {
             public string Adapter;
-            public readonly List<string[]> Addresses = new List<string[]>();   // { ip, prefix }
-            public string Gateway;     // null = none
+            public readonly List<string[]> Addresses = new List<string[]>();
+            public string Gateway;
             public bool DnsChanged;
         }
 
@@ -6871,7 +6754,6 @@ namespace IPbind
             return Path.Combine(AppDir, "keep-dhcp-" + safe.ToLowerInvariant() + ".txt");
         }
 
-        // Every value is re-validated, since it ends up in netsh commands.
         KeepRecord LoadRecord(string guid)
         {
             string path = RecordPath(guid);
@@ -6894,7 +6776,7 @@ namespace IPbind
                     else if (k == "gateway")
                     {
                         uint g;
-                        if (TryIPv4(v, out g) && IsUsableHost(g)) r.Gateway = IPv4Text(g);
+                        if (MainForm.TryIPv4(v, out g) && MainForm.IsUsableHost(g)) r.Gateway = MainForm.IPv4Text(g);
                     }
                     else if (k == "dns") r.DnsChanged = v == "1";
                     else if (k == "adapter") r.Adapter = v;
@@ -6939,7 +6821,6 @@ namespace IPbind
             try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
-        // Targeted undo. Route first, by next hop only: never "gateway=all".
         List<string> RevertCommands(string alias, KeepRecord r)
         {
             List<string> c = new List<string>();
@@ -6952,7 +6833,917 @@ namespace IPbind
             return c;
         }
 
-        static bool InSubnet(uint addr, uint ip, int prefix)
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        static extern int SendARP(uint destIP, uint srcIP, byte[] pMacAddr, ref int phyAddrLen);
+
+        static uint ToIpAddr(uint hostOrder)
+        {
+            byte[] b = new byte[]
+            {
+                (byte)((hostOrder >> 24) & 0xFF),
+                (byte)((hostOrder >> 16) & 0xFF),
+                (byte)((hostOrder >> 8) & 0xFF),
+                (byte)(hostOrder & 0xFF)
+            };
+            return BitConverter.ToUInt32(b, 0);
+        }
+
+        sealed class ArpHit
+        {
+            public string Ip;
+            public string Mac;
+        }
+
+        List<ArpHit> ProbeInUse(List<string> ips, Dictionary<string, uint> srcByIp)
+        {
+            List<ArpHit> hits = new List<ArpHit>();
+            if (ips == null || ips.Count == 0) return hits;
+            ArpHit[] found = new ArpHit[ips.Count];
+            Thread[] threads = new Thread[ips.Count];
+            for (int i = 0; i < ips.Count; i++)
+            {
+                int idx = i;
+                string ip = ips[i];
+                uint dest, src = 0;
+                if (!MainForm.TryIPv4(ip, out dest)) continue;
+                if (srcByIp != null) srcByIp.TryGetValue(ip, out src);
+                threads[idx] = new Thread(delegate()
+                {
+                    try
+                    {
+                        byte[] mac = new byte[8];
+                        int len = 6;
+                        int r = SendARP(ToIpAddr(dest), src == 0 ? 0u : ToIpAddr(src), mac, ref len);
+                        if (r == 0 && len >= 6)
+                        {
+                            ArpHit hit = new ArpHit();
+                            hit.Ip = ip;
+                            hit.Mac = MainForm.FormatMac(mac, 6);
+                            found[idx] = hit;
+                        }
+                    }
+                    catch { }
+                });
+                threads[idx].IsBackground = true;
+                threads[idx].Start();
+            }
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(1500);
+            for (int i = 0; i < threads.Length; i++)
+            {
+                if (threads[i] == null) continue;
+                int remain = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remain < 1) remain = 1;
+                if (remain > 1000) remain = 1000;
+                threads[i].Join(remain);
+            }
+            for (int i = 0; i < found.Length; i++)
+                if (found[i] != null) hits.Add(found[i]);
+            return hits;
+        }
+
+        string RunNetshBatch(List<string> cmds)
+        {
+            string outp = "";
+            string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
+            try
+            {
+                PrivateFile.WriteAllText(
+                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
+                RunProc("netsh", "-f \"" + script + "\"", out outp);
+            }
+            catch (Exception ex) { outp = ex.Message; }
+            finally { try { File.Delete(script); } catch { } }
+            return outp;
+        }
+
+        void LogNetshOutput(string outp)
+        {
+            foreach (string raw in (outp ?? "").Replace("\r", "").Split('\n'))
+            {
+                string t = raw.Trim();
+                if (t.Length == 0) continue;
+                string low = t.ToLowerInvariant();
+                bool looksBad = low.Contains("error") || low.Contains("failed")
+                    || low.Contains("cannot") || low.Contains("incorrect") || low.Contains("not found");
+                Log("  netsh: " + t, looksBad ? "WARN" : "INFO");
+            }
+        }
+
+        bool RevertKeepDhcp(string alias, AdapterInfo info, KeepRecord rec)
+        {
+            KeepRecord undo = rec;
+            if (undo != null)
+            {
+                Log("Removing the addresses IPbind added to '" + alias + "'. DHCP stays on...");
+            }
+            else
+            {
+                Log("No record of what IPbind added to '" + alias +
+                    "'. Removing listed addresses found on it.", "WARN");
+                undo = new KeepRecord();
+                HashSet<string> listed = new HashSet<string>();
+                foreach (string k in CanonicalList())
+                {
+                    string ip; int pfx;
+                    if (TryCidr(k, out ip, out pfx)) listed.Add(ip);
+                }
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    string ip = ua.Address.ToString();
+                    if (ua.PrefixOrigin == PrefixOrigin.Manual && listed.Contains(ip))
+                        undo.Addresses.Add(new string[] { ip, ua.PrefixLength.ToString() });
+                }
+                uint gw;
+                if (MainForm.TryIPv4(host.GatewayText.Trim(), out gw) && MainForm.IsUsableHost(gw) &&
+                    info.Gateways.Contains(MainForm.IPv4Text(gw)))
+                {
+                    bool mine = false, dhcpSide = false;
+                    foreach (string[] e in undo.Addresses)
+                    {
+                        uint v; if (MainForm.TryIPv4(e[0], out v) && MainForm.InSubnet(gw, v, int.Parse(e[1]))) mine = true;
+                    }
+                    foreach (UnicastIPAddressInformation ua in info.V4)
+                    {
+                        uint v;
+                        if (ua.PrefixOrigin == PrefixOrigin.Dhcp && MainForm.TryIPv4(ua.Address.ToString(), out v) &&
+                            MainForm.InSubnet(gw, v, ua.PrefixLength)) dhcpSide = true;
+                    }
+                    if (mine && !dhcpSide) undo.Gateway = MainForm.IPv4Text(gw);
+                }
+                if (undo.Addresses.Count == 0) Log("  None of the listed addresses are on the interface.");
+            }
+
+            HashSet<string> removing = new HashSet<string>();
+            foreach (string[] e in undo.Addresses) removing.Add(e[0]);
+            int others = 0;
+            foreach (UnicastIPAddressInformation ua in info.V4)
+                if (ua.PrefixOrigin == PrefixOrigin.Manual && !removing.Contains(ua.Address.ToString())) others++;
+
+            List<string> cmds = RevertCommands(alias, undo);
+            if (others == 0)
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+            else
+                Log("  Left " + others + " other static address(es) on '" + alias +
+                    "' alone, so Keep DHCP stays on for it.", "WARN");
+
+            LogNetshOutput(RunNetshBatch(cmds));
+            foreach (string[] e in undo.Addresses) Log("  - " + e[0] + "/" + e[1], "OK");
+            if (undo.Gateway != null) Log("  - gateway " + undo.Gateway, "OK");
+            if (undo.DnsChanged) Log("  DNS back to automatic (DHCP).", "OK");
+            Log("Back to DHCP - verifying:", "OK");
+            ShowCurrentConfig(alias);
+
+            AdapterInfo after = GetAdapterInfo(alias);
+            bool ok = after != null && after.Dhcp;
+            if (after != null && !after.Dhcp) Log("DHCP does not appear to be enabled on the interface.", "WARN");
+            if (after != null)
+                foreach (UnicastIPAddressInformation ua in after.V4)
+                    if (removing.Contains(ua.Address.ToString()))
+                    {
+                        ok = false;
+                        Log("  " + ua.Address + " is still on the interface.", "WARN");
+                    }
+            if (ok)
+            {
+                if (rec != null) DeleteRecord(info.Guid);
+                Log("  DHCP stayed on the whole time.", "OK");
+            }
+            return ok;
+        }
+
+        public bool InvokeBind()
+        {
+            string alias = GetSelectedAlias();
+            if (alias == null) { Log("No interface selected.", "WARN"); return false; }
+            if (!ValidateAdapterAlias(alias)) return false;
+
+            string status = AdapterStatus(alias);
+            if (status != "Up")
+            {
+                Log("Interface '" + alias + "' is '" + status + "', not connected (Up).", "WARN");
+                if (!host.ConfirmDisconnected(alias, status))
+                { Log("Apply cancelled - interface not connected.", "WARN"); return false; }
+                Log("Proceeding on a disconnected interface at user request.", "WARN");
+            }
+
+            SaveList(true);
+
+            GatewayPlan gwPlan;
+            if (!TryBuildGatewayPlan(out gwPlan))
+            {
+                Log("Nothing was applied. Fix the gateway settings and try again.", "ERR");
+                return false;
+            }
+
+            List<string[]> entries = new List<string[]>();
+            foreach (string line in host.IpLines)
+            {
+                if (string.IsNullOrEmpty((line ?? "").Trim())) continue;
+                string ip; int pfx;
+                if (TryCidr(line, out ip, out pfx)) entries.Add(new string[] { ip, pfx.ToString() });
+                else Log("Skipping invalid entry: '" + line.Trim() + "'", "WARN");
+            }
+            if (entries.Count == 0) { Log("No valid addresses to apply.", "WARN"); return false; }
+
+            if (gwPlan != null)
+            {
+                int gi = entries.FindIndex(delegate (string[] e)
+                {
+                    return e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString();
+                });
+                if (gi > 0) { string[] g = entries[gi]; entries.RemoveAt(gi); entries.Insert(0, g); }
+            }
+
+            AdapterInfo info = GetAdapterInfo(alias);
+            MainForm.CoexistState coexist = DetectCoexist(info);
+            bool keep = host.KeepDhcpChecked;
+            if (keep && coexist == MainForm.CoexistState.Unsupported)
+            {
+                Log("Keep DHCP isn't available on '" + alias +
+                    "' (needs Windows 10 version 1703 or later). Applying static addresses only.", "WARN");
+                keep = false;
+            }
+            KeepRecord old = info != null ? LoadRecord(info.Guid) : null;
+
+            List<string[]> leases = new List<string[]>();
+            if (info != null)
+            {
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
+                    uint leaseAddr;
+                    if (!MainForm.TryIPv4(ua.Address.ToString(), out leaseAddr)) continue;
+                    leases.Add(new string[] { ua.Address.ToString(), ua.PrefixLength.ToString(), MainForm.DhcpNetworkText(leaseAddr, ua.PrefixLength) });
+                }
+            }
+            foreach (string[] e in entries)
+            {
+                uint bindAddr;
+                if (!MainForm.TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!MainForm.TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (MainForm.ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) == MainForm.DhcpOverlapKind.SameAsLease)
+                    {
+                        Log(MainForm.EqualDhcpAddressLog(e[0]), "ERR");
+                        return false;
+                    }
+                }
+            }
+            Dictionary<string, uint> probeSrc = new Dictionary<string, uint>();
+            List<string> inside = new List<string>();
+            foreach (string[] e in entries)
+            {
+                uint bindAddr;
+                if (!MainForm.TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!MainForm.TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (MainForm.ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) != MainForm.DhcpOverlapKind.InsideSubnet)
+                        continue;
+                    Log(MainForm.InsideDhcpNetworkLog(e[0], lease[2]), "WARN");
+                    if (!probeSrc.ContainsKey(e[0]))
+                    {
+                        probeSrc[e[0]] = leaseAddr;
+                        inside.Add(e[0]);
+                    }
+                    break;
+                }
+            }
+            HashSet<string> alreadyHeld = new HashSet<string>(StringComparer.Ordinal);
+            if (info != null)
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                    alreadyHeld.Add(ua.Address.ToString());
+            if (old != null)
+                foreach (string[] e in old.Addresses)
+                    alreadyHeld.Add(e[0]);
+            List<string> toProbe = new List<string>();
+            foreach (string ip in inside)
+                if (!alreadyHeld.Contains(ip)) toProbe.Add(ip);
+            if (toProbe.Count > 0)
+            {
+                List<ArpHit> hits = ProbeInUse(toProbe, probeSrc);
+                if (hits.Count > 0)
+                {
+                    HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (ArpHit hit in hits)
+                    {
+                        used.Add(hit.Ip);
+                        Log(MainForm.AddressInUseLog(hit.Ip, hit.Mac), "WARN");
+                    }
+                    List<string[]> kept = new List<string[]>();
+                    foreach (string[] e in entries)
+                        if (!used.Contains(e[0])) kept.Add(e);
+                    if (kept.Count == 0)
+                    {
+                        Log(MainForm.AllAddressesInUseLog(), "ERR");
+                        return false;
+                    }
+                    if (gwPlan != null)
+                    {
+                        bool gwKept = false;
+                        foreach (string[] e in kept)
+                            if (e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString()) gwKept = true;
+                        if (!gwKept)
+                        {
+                            Log(gwPlan.Ip + " was the Gateway support address, so the gateway was not applied.", "WARN");
+                            gwPlan = null;
+                        }
+                    }
+                    entries = kept;
+                }
+            }
+
+            List<string> cmds = new List<string>();
+            cmds.Add("interface ipv4 set interface \"" + alias + "\" dadtransmits=0");
+            if (old != null) cmds.AddRange(RevertCommands(alias, old));
+            KeepRecord rec = null;
+            if (keep)
+            {
+                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' alongside DHCP (single batch)...");
+                if (!info.Dhcp)
+                {
+                    Log("  The interface is static; switching it to DHCP first.");
+                    cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
+                    cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
+                }
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=enabled");
+                foreach (string[] e in entries)
+                {
+                    string ip = e[0];
+                    string mask = MaskFromPrefix(int.Parse(e[1]));
+                    string c = "interface ipv4 add address name=\"" + alias + "\" address=" + ip + " mask=" + mask;
+                    if (gwPlan != null && ip == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString())
+                        c += " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric;
+                    cmds.Add(c);
+                }
+                rec = new KeepRecord();
+                rec.Adapter = alias;
+                rec.Addresses.AddRange(entries);
+                rec.Gateway = gwPlan != null ? gwPlan.Gateway : null;
+                rec.DnsChanged = gwPlan != null && gwPlan.Dns1 != null;
+            }
+            else
+            {
+                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' (single batch)...");
+                if (coexist == MainForm.CoexistState.Enabled)
+                    cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+                cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
+                bool first = true;
+                foreach (string[] e in entries)
+                {
+                    string ip = e[0];
+                    string mask = MaskFromPrefix(int.Parse(e[1]));
+                    if (first && gwPlan != null)
+                        cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=static address=" + ip +
+                                 " mask=" + mask + " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric);
+                    else
+                        cmds.Add(first
+                            ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
+                            : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
+                    first = false;
+                }
+            }
+            if (gwPlan != null && gwPlan.Dns1 != null)
+            {
+                cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=static address=" +
+                         gwPlan.Dns1 + " register=none validate=no");
+                if (gwPlan.Dns2 != null)
+                    cmds.Add("interface ipv4 add dnsservers name=\"" + alias + "\" address=" +
+                             gwPlan.Dns2 + " index=2 validate=no");
+            }
+
+            if (rec != null) SaveRecord(info.Guid, rec);
+            else if (old != null) DeleteRecord(info.Guid);
+
+            string outp = RunNetshBatch(cmds);
+
+            foreach (string[] e in entries) Log("  + " + e[0] + "/" + e[1], "OK");
+            if (gwPlan != null)
+            {
+                Log("  gateway " + gwPlan.Gateway + " (metric " + GatewayMetric + ") on " +
+                    gwPlan.Ip + "/" + gwPlan.Prefix, "OK");
+                if (gwPlan.Dns1 != null)
+                    Log("  DNS " + gwPlan.Dns1 + (gwPlan.Dns2 != null ? ", " + gwPlan.Dns2 : ""), "OK");
+                else if (!keep)
+                    Log("No DNS set. Website names may not work through this adapter. " +
+                        "Try your router's address (often the same as the gateway).", "WARN");
+            }
+            LogNetshOutput(outp);
+
+            Log("Bind complete - verifying:", "OK");
+            ShowCurrentConfig(alias);
+
+            List<string> want = new List<string>();
+            foreach (string[] e in entries) want.Add(e[0]);
+            int found = 0;
+            bool gwFound = false;
+            AdapterInfo after = GetAdapterInfo(alias);
+            if (after != null)
+            {
+                foreach (UnicastIPAddressInformation ua in after.V4)
+                    if (want.Contains(ua.Address.ToString())) found++;
+                if (gwPlan != null && after.Gateways.Contains(gwPlan.Gateway)) gwFound = true;
+            }
+            if (gwPlan != null && !gwFound)
+                Log("Gateway " + gwPlan.Gateway + " is not showing on the interface yet.", "WARN");
+            bool ok = found >= want.Count;
+            if (!ok) Log("Only " + found + " of " + want.Count + " addresses are present on the interface.", "WARN");
+            if (keep && after != null && !after.Dhcp)
+            {
+                ok = false;
+                Log("DHCP turned off on the interface; Keep DHCP did not take effect.", "WARN");
+            }
+            else if (keep && ok)
+                Log("  DHCP is still on.", "OK");
+            if (status != "Up") Log("Interface is not connected - addresses will activate once it comes up.", "WARN");
+            return ok;
+        }
+
+        public bool InvokeDhcp()
+        {
+            string alias = GetSelectedAlias();
+            if (alias == null) { Log("No interface selected.", "WARN"); return false; }
+            if (!ValidateAdapterAlias(alias)) return false;
+            Log("Returning '" + alias + "' to DHCP...");
+
+            AdapterInfo info = GetAdapterInfo(alias);
+            KeepRecord rec = info != null ? LoadRecord(info.Guid) : null;
+            MainForm.CoexistState coexist = DetectCoexist(info);
+            if (info != null && info.Dhcp && (rec != null || coexist == MainForm.CoexistState.Enabled))
+                return RevertKeepDhcp(alias, info, rec);
+
+            List<string> cmds = new List<string>();
+            if (rec != null) cmds.AddRange(RevertCommands(alias, rec));
+            cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
+            cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
+            if (coexist == MainForm.CoexistState.Enabled)
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+            string outp = RunNetshBatch(cmds);
+            if (rec != null && info != null) DeleteRecord(info.Guid);
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("ipconfig", "/renew \"" + alias + "\"");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                Process.Start(psi);
+            }
+            catch { }
+            Log("  DHCP re-enabled, DNS reset. Lease will refresh in the background.");
+            Log("Back to DHCP - verifying:", "OK");
+            ShowCurrentConfig(alias);
+
+            bool dhcpOk = false;
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.Name != alias) continue;
+                    IPv4InterfaceProperties p4 = ni.GetIPProperties().GetIPv4Properties();
+                    if (p4 != null && p4.IsDhcpEnabled) dhcpOk = true;
+                }
+            }
+            catch { }
+            if (!dhcpOk) Log("DHCP does not appear to be enabled on the interface.", "WARN");
+            else StartLeaseWatch(alias);
+            return dhcpOk;
+        }
+
+        public void StartLeaseWatch(string alias)
+        {
+            System.Threading.Thread t = new System.Threading.Thread(delegate()
+            {
+                for (int i = 0; i < 30; i++)
+                {
+                    System.Threading.Thread.Sleep(1000);
+                    try
+                    {
+                        foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                        {
+                            if (ni.Name != alias) continue;
+                            foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                            {
+                                string ip = ua.Address.ToString();
+                                if (ip.Contains(":")) continue;
+                                if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
+                                Log("DHCP lease acquired: " + ip + " on '" + alias + "'.", "OK");
+                                return;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                Log("No DHCP address seen yet on '" + alias + "' (lease may still be pending).", "INFO");
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        public void CheckForUpdatesOnLaunch()
+        {
+            if (launchUpdateCheckStarted) return;
+            launchUpdateCheckStarted = true;
+            if (!LaunchUpdateCheckEnabled()) return;
+            Thread thread = new Thread(delegate()
+            {
+                UpdateInfo info;
+                try { info = UpdateChecker.Check(); }
+                catch { return; }
+                if (!info.IsNewer) return;
+
+                try
+                {
+                    host.RunOnUi(delegate
+                    {
+                        if (host.IsHostDisposed || updateDismissed) return;
+                        host.ShowUpdateAvailable(info.RemoteVersion);
+                    });
+                }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        public void InstallUpdateFromBanner()
+        {
+            host.SetUpdatingBanner();
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    UpdateChecker.DownloadAndRestart();
+                    try { host.RunOnUi(delegate { host.ExitApp(); }); }
+                    catch { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        host.RunOnUi(delegate
+                        {
+                            if (host.IsHostDisposed) return;
+                            host.ShowUpdateError(UpdateChecker.DescribeError(ex));
+                        });
+                    }
+                    catch { }
+                }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        public void DismissUpdateBanner()
+        {
+            updateDismissed = true;
+            host.HideUpdateBanner();
+        }
+
+        public void ShowDhcpReminderIfNeeded()
+        {
+            if (host.IsHostDisposed) return;
+            try { if (File.Exists(DhcpReminderFile)) return; } catch { }
+            bool proceed, remember;
+            host.ShowDhcpReminder(out proceed, out remember);
+            if (!proceed)
+            {
+                host.CloseHost();
+                return;
+            }
+            if (!remember) return;
+            try
+            {
+                EnsureAppDir();
+                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + BuildInfo.DisplayVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
+            }
+            catch (Exception ex)
+            {
+                Log("Could not save the reminder setting: " + ex.Message, "WARN");
+            }
+        }
+    }
+
+    class MainForm : Form, IBindHost
+    {
+        internal static readonly string[] DefaultIPs = new string[] {
+            "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
+            "192.168.0.98/24",  "192.168.1.98/24",  "192.168.2.98/24",
+            "192.168.4.98/24",  "192.168.255.98/24"
+        };
+
+        // Every default list IPbind has shipped before the current DefaultIPs (from
+        // git history). A saved list that still equals one of these exactly was never
+        // edited, so it is upgraded to the current defaults on launch. ADD the old
+        // DefaultIPs here whenever the defaults change.
+        internal static readonly string[][] PreviousDefaultSets = new string[][] {
+            // 2.3.117 and earlier (all prod releases before 2.3.119)
+            new string[] {
+                "10.255.255.98/24", "10.255.128.98/24", "192.168.0.98/24",
+                "192.168.1.98/24",  "192.168.4.98/24",  "192.168.255.98/24" },
+            // briefly on the 2.3.118 development branch (never in a release)
+            new string[] {
+                "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
+                "192.168.0.98/24",  "192.168.1.98/24",  "192.168.4.98/24",
+                "192.168.255.98/24" }
+        };
+
+        internal static readonly Regex CidrRe =
+            new Regex(@"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*(/\s*(\d{1,2}))?\s*$");
+        internal static readonly Regex VirtualRe =
+            new Regex(@"virtual|hyper-?v|vmware|vbox|virtualbox|tap-|tunnel|vpn|loopback|wan miniport|bluetooth|pseudo|wi-?fi|wireless|cellular|wwan",
+                      RegexOptions.IgnoreCase);
+
+        // Settings paths live on BindEngine.
+
+        // Optional Gateway support: one listed address may carry a gateway and DNS.
+        // The high metric keeps this route from beating Wi-Fi/corporate default routes.
+        const int GatewayMetric = 9999;
+        const string IpLabelPlain =
+            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
+        const string IpLabelGateway =
+            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24):";
+
+        float sc = 1f;  // DPI scale factor (deviceDpi / 96), applied to all pixel coordinates
+
+        ComboBox combo;
+        CheckBox chkAll;
+        TextBox txtIPs;
+        Label lblIPs;
+        CheckBox chkGateway;
+        ToolTip gatewayTip;   // field so the tooltip lives as long as the form
+        Label lblGwOn, lblGateway, lblDns1, lblDns2;
+        ComboBox cboGwIp;
+        TextBox txtGateway, txtDns1, txtDns2;
+        TextBox console;
+        Label lblStatus;
+        Button btnBind, btnDhcp;
+        Panel updateBanner;
+        Label lblUpdateBanner;
+        Button btnUpdateNow, btnUpdateLater;
+        Button btnClear;
+        Button btnAbout;
+        CheckBox chkKeepDhcp;
+        ToolTip keepDhcpTip;
+        const string KeepDhcpTipOn =
+            "On: DHCP stays on and these addresses are added alongside it.\r\n" +
+            "Off: static addresses only, no DHCP.";
+        const string KeepDhcpTipOff =
+            "Needs Windows 10 version 1703 or later.\r\n" +
+            "Apply uses static addresses only.";
+        bool dark;
+        bool shown;
+        bool fittingWorkingArea;
+        Rectangle fittedWorkingArea = Rectangle.Empty;
+        Color BgCol, PanelCol, FgCol, SubCol, BorderCol, InputCol;
+
+        BindEngine engine;
+
+        public MainForm()
+        {
+            BuildUi();
+            engine = new BindEngine(this);
+            engine.Startup();
+            DebugLog.WatchForm(this);
+        }
+
+
+        // scale helper: design pixels -> device pixels
+        int U(int v) { return (int)Math.Round(v * sc); }
+        Point P(int x, int y) { return new Point(U(x), U(y)); }
+        Size Z(int w, int h) { return new Size(U(w), U(h)); }
+
+        // ---------------- helpers ----------------
+        void Log(string msg) { engine.Log(msg); }
+        void Log(string msg, string level) { engine.Log(msg, level); }
+
+
+        void LogConsole(string msg, string level)
+        {
+            string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
+            console.AppendText(line);
+            console.SelectionStart = console.TextLength;
+            console.ScrollToCaret();
+            AutoHideScrollBox box = console as AutoHideScrollBox;
+            if (box != null) box.SyncThumbOnly();
+        }
+
+        bool TryCidr(string s, out string ip, out int prefix) { return engine.TryCidr(s, out ip, out prefix); }
+
+
+        string MaskFromPrefix(int p) { return engine.MaskFromPrefix(p); }
+
+
+        string[] CanonicalList() { return engine.CanonicalList(); }
+
+
+        void SaveList(bool quiet) { engine.SaveList(quiet); }
+
+
+        // BEGIN DefaultsUpgrade (self-contained; exercised by a host-side test)
+        // Order-, case- and whitespace-insensitive key for one saved line; CIDR entries
+        // are canonicalised exactly like TryCidr (missing prefix = /24).
+        internal static string DefaultsKey(string line)
+        {
+            string t = (line ?? "").Trim();
+            if (t.Length == 0) return null;
+            Match m = CidrRe.Match(t);
+            if (m.Success)
+            {
+                int[] o = new int[4];
+                bool ok = true;
+                for (int i = 0; i < 4; i++)
+                {
+                    o[i] = int.Parse(m.Groups[i + 1].Value);
+                    if (o[i] > 255) ok = false;
+                }
+                int prefix = m.Groups[6].Success ? int.Parse(m.Groups[6].Value) : 24;
+                if (ok && prefix >= 0 && prefix <= 32)
+                    return o[0] + "." + o[1] + "." + o[2] + "." + o[3] + "/" + prefix;
+            }
+            return Regex.Replace(t, @"\s+", "").ToLowerInvariant();
+        }
+
+        internal static HashSet<string> DefaultsKeySet(IEnumerable<string> lines)
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string l in lines)
+            {
+                string k = DefaultsKey(l);
+                if (k != null) set.Add(k);
+            }
+            return set;
+        }
+
+        // True only when the saved list is exactly an earlier shipped default list
+        // (never edited) and differs from the current defaults.
+        internal static bool IsUneditedOldDefaults(IEnumerable<string> saved, string[] current, string[][] previous)
+        {
+            HashSet<string> have = DefaultsKeySet(saved);
+            if (have.Count == 0 || have.SetEquals(DefaultsKeySet(current))) return false;
+            foreach (string[] old in previous)
+                if (have.SetEquals(DefaultsKeySet(old))) return true;
+            return false;
+        }
+        // END DefaultsUpgrade
+
+        void LoadList() { engine.LoadList(); }
+
+
+        void RestoreDefaults() { engine.RestoreDefaults(); }
+
+
+        void SaveAdapter(string name) { engine.SaveAdapter(name); }
+        string GetSavedAdapter() { return engine.GetSavedAdapter(); }
+
+
+        // update-check.txt is written by the installer: "auto" (default) or "manual".
+        // Only an explicit "manual" turns off the launch check; a missing or unreadable
+        // file keeps automatic checks, so portable copies behave as before. Manual
+        // checks from About always work.
+        bool LaunchUpdateCheckEnabled() { return engine.LaunchUpdateCheckEnabled(); }
+
+
+        // ---------------- gateway support ----------------
+        // gateway.txt holds key=value lines: enabled, ip, gateway, dns1, dns2. A missing
+        // or unreadable file means Gateway support is off.
+        void LoadGatewaySettings() { engine.LoadGatewaySettings(); }
+
+
+        void SaveGatewaySettings() { engine.SaveGatewaySettings(); }
+
+
+        // Fill "Use gateway on" from the valid entries currently in the list, keeping
+        // the remembered choice selected whenever it is still present.
+        void RefreshGatewayChoices() { engine.RefreshGatewayChoices(); }
+
+
+        // Shows or hides the gateway rows. The IP list gives up exactly the height the
+        // two rows need, so nothing below the list moves.
+        void ApplyGatewayLayout()
+        {
+            bool on = chkGateway.Checked;
+            txtIPs.Height = U(on ? 134 : 196);
+            lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
+            foreach (Control c in new Control[] {
+                lblGwOn, cboGwIp, lblGateway, txtGateway, lblDns1, txtDns1, lblDns2, txtDns2 })
+                c.Visible = on;
+        }
+
+        internal static bool TryIPv4(string s, out uint value)
+        {
+            value = 0;
+            Match m = Regex.Match(s ?? "", @"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*$");
+            if (!m.Success) return false;
+            for (int i = 1; i <= 4; i++)
+            {
+                int o = int.Parse(m.Groups[i].Value);
+                if (o > 255) return false;
+                value = (value << 8) | (uint)o;
+            }
+            return true;
+        }
+
+        internal static string IPv4Text(uint v)
+        {
+            return ((v >> 24) & 0xFF) + "." + ((v >> 16) & 0xFF) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
+        }
+
+        // Usable as a gateway or DNS server: not 0.x, loopback, multicast/reserved, or broadcast.
+        internal static bool IsUsableHost(uint v)
+        {
+            uint first = v >> 24;
+            return first != 0 && first != 127 && first < 224;
+        }
+
+
+        // Returns true when Gateway support is off (plan = null) or every field is valid.
+        // Logs the reason and returns false otherwise; nothing is applied in that case.
+
+        void LoadAdapters() { engine.LoadAdapters(); }
+
+
+        // The real Windows connection name. Never parse the dropdown's display
+        // string (that is tidied for reading only and is not an interface ID).
+        string GetSelectedAlias() { return engine.GetSelectedAlias(); }
+
+
+        string AdapterStatus(string name) { return engine.AdapterStatus(name); }
+
+
+        int RunProc(string file, string args, out string output) { return engine.RunProc(file, args, out output); }
+
+
+        int Netsh(string args, out string output) { return engine.RunProc("netsh", args, out output); }
+
+
+        bool ValidateAdapterAlias(string alias) { return engine.ValidateAdapterAlias(alias); }
+
+
+        void ShowCurrentConfig(string alias) { engine.ShowCurrentConfig(alias); }
+
+
+        // ---------------- Keep DHCP (DHCP/static coexistence) ----------------
+        // Windows 10 1703+ can keep DHCP on while static addresses sit alongside it
+        // (netsh "dhcpstaticipcoexistence"). Without it, adding an address silently turns
+        // DHCP off. Support shows up as a line in "netsh interface ipv4 show interface".
+        // IPbind records exactly what it added, so Return to DHCP removes only that:
+        // "set address source=dhcp" does NOT remove statics while coexistence is on, and
+        // "delete address ... gateway=all" would also delete the DHCP default route.
+
+        // BEGIN CoexistParse (self-contained; exercised by a unit test)
+        internal enum CoexistState { Unsupported, Disabled, Enabled }
+
+        internal static CoexistState ParseCoexistence(string showInterfaceOutput)
+        {
+            foreach (string raw in (showInterfaceOutput ?? "").Replace("\r", "").Split('\n'))
+            {
+                string t = raw.Trim();
+                if (!t.StartsWith("DHCP/Static IP coexistence", StringComparison.OrdinalIgnoreCase)) continue;
+                int colon = t.IndexOf(':');
+                string v = colon < 0 ? "" : t.Substring(colon + 1).Trim();
+                return string.Equals(v, "enabled", StringComparison.OrdinalIgnoreCase)
+                    ? CoexistState.Enabled : CoexistState.Disabled;
+            }
+            return CoexistState.Unsupported;
+        }
+        // END CoexistParse
+
+
+        void LogAdaptersRaw() { engine.LogAdaptersRaw(); }
+
+
+        string CaptureAdapterState(string alias) { return engine.CaptureAdapterState(alias); }
+
+
+        void LogAdapterDiff(string when, string before, string after) { engine.LogAdapterDiff(when, before, after); }
+
+
+
+
+        void LoadKeepDhcpPref() { engine.LoadKeepDhcpPref(); }
+
+
+        void SaveKeepDhcpPref() { engine.SaveKeepDhcpPref(); }
+
+
+        // Enables the box only where Windows supports coexistence for this adapter.
+        void RefreshKeepDhcp(string alias) { engine.RefreshKeepDhcp(alias); }
+
+
+        // What a Keep DHCP Apply added to one adapter, stored per adapter GUID in the
+        // app's settings folder so Return to DHCP works after a restart.
+
+
+        // Every value is re-validated, since it ends up in netsh commands.
+
+
+
+        // Targeted undo. Route first, by next hop only: never "gateway=all".
+
+        internal static bool InSubnet(uint addr, uint ip, int prefix)
         {
             uint mask = prefix <= 0 ? 0u : (0xFFFFFFFFu << (32 - Math.Min(prefix, 32)));
             return (addr & mask) == (ip & mask);
@@ -7013,555 +7804,36 @@ namespace IPbind
         }
         // END ApplySafety
 
-        [DllImport("iphlpapi.dll", ExactSpelling = true)]
-        static extern int SendARP(uint destIP, uint srcIP, byte[] pMacAddr, ref int phyAddrLen);
 
-        static uint ToIpAddr(uint hostOrder)
-        {
-            byte[] b = new byte[]
-            {
-                (byte)((hostOrder >> 24) & 0xFF),
-                (byte)((hostOrder >> 16) & 0xFF),
-                (byte)((hostOrder >> 8) & 0xFF),
-                (byte)(hostOrder & 0xFF)
-            };
-            return BitConverter.ToUInt32(b, 0);
-        }
 
-        sealed class ArpHit
-        {
-            public string Ip;
-            public string Mac;
-        }
 
         // Probes only the given addresses, in parallel. SendARP is bounded by a
         // 1s per-address join and a 1.5s overall deadline so Apply stays responsive.
         // A timeout or error is treated as "not in use" (the address is not skipped).
-        List<ArpHit> ProbeInUse(List<string> ips, Dictionary<string, uint> srcByIp)
-        {
-            List<ArpHit> hits = new List<ArpHit>();
-            if (ips == null || ips.Count == 0) return hits;
-            ArpHit[] found = new ArpHit[ips.Count];
-            Thread[] threads = new Thread[ips.Count];
-            for (int i = 0; i < ips.Count; i++)
-            {
-                int idx = i;
-                string ip = ips[i];
-                uint dest, src = 0;
-                if (!TryIPv4(ip, out dest)) continue;
-                if (srcByIp != null) srcByIp.TryGetValue(ip, out src);
-                threads[idx] = new Thread(delegate()
-                {
-                    try
-                    {
-                        byte[] mac = new byte[8];
-                        int len = 6;
-                        int r = SendARP(ToIpAddr(dest), src == 0 ? 0u : ToIpAddr(src), mac, ref len);
-                        if (r == 0 && len >= 6)
-                        {
-                            ArpHit hit = new ArpHit();
-                            hit.Ip = ip;
-                            hit.Mac = FormatMac(mac, 6);
-                            found[idx] = hit;
-                        }
-                    }
-                    catch { }
-                });
-                threads[idx].IsBackground = true;
-                threads[idx].Start();
-            }
-            DateTime deadline = DateTime.UtcNow.AddMilliseconds(1500);
-            for (int i = 0; i < threads.Length; i++)
-            {
-                if (threads[i] == null) continue;
-                int remain = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
-                if (remain < 1) remain = 1;
-                if (remain > 1000) remain = 1000;
-                threads[i].Join(remain);
-            }
-            for (int i = 0; i < found.Length; i++)
-                if (found[i] != null) hits.Add(found[i]);
-            return hits;
-        }
 
         // All netsh commands run in ONE netsh process via a script file. Spawning a
         // separate netsh.exe per address is what made this slow: on a managed machine,
         // endpoint security inspects every child process as it launches.
-        string RunNetshBatch(List<string> cmds)
-        {
-            string outp = "";
-            string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
-            try
-            {
-                PrivateFile.WriteAllText(
-                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
-                RunProc("netsh", "-f \"" + script + "\"", out outp);
-            }
-            catch (Exception ex) { outp = ex.Message; }
-            finally { try { File.Delete(script); } catch { } }
-            return outp;
-        }
 
         // netsh prints harmless notes (e.g. "DHCP is already enabled") that are not
         // failures, so don't judge success by its output. Log real-looking errors as
         // warnings, everything else as info, then verify against the actual interface.
-        void LogNetshOutput(string outp)
-        {
-            foreach (string raw in (outp ?? "").Replace("\r", "").Split('\n'))
-            {
-                string t = raw.Trim();
-                if (t.Length == 0) continue;
-                string low = t.ToLowerInvariant();
-                bool looksBad = low.Contains("error") || low.Contains("failed")
-                    || low.Contains("cannot") || low.Contains("incorrect") || low.Contains("not found");
-                Log("  netsh: " + t, looksBad ? "WARN" : "INFO");
-            }
-        }
 
         // Return to DHCP while Keep DHCP is in effect: DHCP is already on, so remove just
         // what IPbind added (from the record, or, without one, the listed addresses that
         // are on the interface as manual addresses).
-        bool RevertKeepDhcp(string alias, AdapterInfo info, KeepRecord rec)
-        {
-            KeepRecord undo = rec;
-            if (undo != null)
-            {
-                Log("Removing the addresses IPbind added to '" + alias + "'. DHCP stays on...");
-            }
-            else
-            {
-                Log("No record of what IPbind added to '" + alias +
-                    "'. Removing listed addresses found on it.", "WARN");
-                undo = new KeepRecord();
-                HashSet<string> listed = new HashSet<string>();
-                foreach (string k in CanonicalList())
-                {
-                    string ip; int pfx;
-                    if (TryCidr(k, out ip, out pfx)) listed.Add(ip);
-                }
-                foreach (UnicastIPAddressInformation ua in info.V4)
-                {
-                    string ip = ua.Address.ToString();
-                    if (ua.PrefixOrigin == PrefixOrigin.Manual && listed.Contains(ip))
-                        undo.Addresses.Add(new string[] { ip, ua.PrefixLength.ToString() });
-                }
-                // The saved Gateway support gateway, only if it serves one of those
-                // addresses and is not on the DHCP address's subnet.
-                uint gw;
-                if (TryIPv4(txtGateway.Text.Trim(), out gw) && IsUsableHost(gw) &&
-                    info.Gateways.Contains(IPv4Text(gw)))
-                {
-                    bool mine = false, dhcpSide = false;
-                    foreach (string[] e in undo.Addresses)
-                    {
-                        uint v; if (TryIPv4(e[0], out v) && InSubnet(gw, v, int.Parse(e[1]))) mine = true;
-                    }
-                    foreach (UnicastIPAddressInformation ua in info.V4)
-                    {
-                        uint v;
-                        if (ua.PrefixOrigin == PrefixOrigin.Dhcp && TryIPv4(ua.Address.ToString(), out v) &&
-                            InSubnet(gw, v, ua.PrefixLength)) dhcpSide = true;
-                    }
-                    if (mine && !dhcpSide) undo.Gateway = IPv4Text(gw);
-                }
-                if (undo.Addresses.Count == 0) Log("  None of the listed addresses are on the interface.");
-            }
-
-            HashSet<string> removing = new HashSet<string>();
-            foreach (string[] e in undo.Addresses) removing.Add(e[0]);
-            int others = 0;
-            foreach (UnicastIPAddressInformation ua in info.V4)
-                if (ua.PrefixOrigin == PrefixOrigin.Manual && !removing.Contains(ua.Address.ToString())) others++;
-
-            List<string> cmds = RevertCommands(alias, undo);
-            if (others == 0)
-                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
-            else
-                Log("  Left " + others + " other static address(es) on '" + alias +
-                    "' alone, so Keep DHCP stays on for it.", "WARN");
-
-            LogNetshOutput(RunNetshBatch(cmds));
-            foreach (string[] e in undo.Addresses) Log("  - " + e[0] + "/" + e[1], "OK");
-            if (undo.Gateway != null) Log("  - gateway " + undo.Gateway, "OK");
-            if (undo.DnsChanged) Log("  DNS back to automatic (DHCP).", "OK");
-            Log("Back to DHCP - verifying:", "OK");
-            ShowCurrentConfig(alias);
-
-            AdapterInfo after = GetAdapterInfo(alias);
-            bool ok = after != null && after.Dhcp;
-            if (after != null && !after.Dhcp) Log("DHCP does not appear to be enabled on the interface.", "WARN");
-            if (after != null)
-                foreach (UnicastIPAddressInformation ua in after.V4)
-                    if (removing.Contains(ua.Address.ToString()))
-                    {
-                        ok = false;
-                        Log("  " + ua.Address + " is still on the interface.", "WARN");
-                    }
-            if (ok)
-            {
-                if (rec != null) DeleteRecord(info.Guid);
-                Log("  DHCP stayed on the whole time.", "OK");
-            }
-            return ok;
-        }
 
         // ---------------- actions ----------------
-        bool InvokeBind()
-        {
-            string alias = GetSelectedAlias();
-            if (alias == null) { Log("No interface selected.", "WARN"); return false; }
-            if (!ValidateAdapterAlias(alias)) return false;
+        bool InvokeBind() { return engine.InvokeBind(); }
 
-            string status = AdapterStatus(alias);
-            if (status != "Up")
-            {
-                Log("Interface '" + alias + "' is '" + status + "', not connected (Up).", "WARN");
-                DialogResult ans = MessageBox.Show(
-                    "The interface '" + alias + "' is currently '" + status + "', not connected.\r\n\r\n" +
-                    "Windows will not bind static addresses to a disconnected interface, so this likely " +
-                    "won't take effect until it is connected.\r\n\r\nApply anyway?",
-                    "Interface not connected", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                if (ans != DialogResult.Yes) { Log("Apply cancelled - interface not connected.", "WARN"); return false; }
-                Log("Proceeding on a disconnected interface at user request.", "WARN");
-            }
 
-            SaveList(true);
+        bool InvokeDhcp() { return engine.InvokeDhcp(); }
 
-            GatewayPlan gwPlan;
-            if (!TryBuildGatewayPlan(out gwPlan))
-            {
-                Log("Nothing was applied. Fix the gateway settings and try again.", "ERR");
-                return false;
-            }
-
-            List<string[]> entries = new List<string[]>();
-            foreach (string line in txtIPs.Lines)
-            {
-                if (string.IsNullOrEmpty((line ?? "").Trim())) continue;
-                string ip; int pfx;
-                if (TryCidr(line, out ip, out pfx)) entries.Add(new string[] { ip, pfx.ToString() });
-                else Log("Skipping invalid entry: '" + line.Trim() + "'", "WARN");
-            }
-            if (entries.Count == 0) { Log("No valid addresses to apply.", "WARN"); return false; }
-
-            // With a gateway, the chosen address goes first: it becomes the primary
-            // ("set address") entry, which is where netsh attaches the gateway.
-            if (gwPlan != null)
-            {
-                int gi = entries.FindIndex(delegate (string[] e)
-                {
-                    return e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString();
-                });
-                if (gi > 0) { string[] g = entries[gi]; entries.RemoveAt(gi); entries.Insert(0, g); }
-            }
-
-            AdapterInfo info = GetAdapterInfo(alias);
-            CoexistState coexist = DetectCoexist(info);
-            bool keep = chkKeepDhcp.Checked;
-            if (keep && coexist == CoexistState.Unsupported)
-            {
-                Log("Keep DHCP isn't available on '" + alias +
-                    "' (needs Windows 10 version 1703 or later). Applying static addresses only.", "WARN");
-                keep = false;
-            }
-            KeepRecord old = info != null ? LoadRecord(info.Guid) : null;
-
-            // Apply-time safety: never bind the adapter's own DHCP address, warn
-            // when a bind address sits in a DHCP lease subnet, and skip addresses
-            // that already answer ARP on that subnet. Isolated (non-DHCP-subnet)
-            // entries are not probed, so air-gapped use stays fast. Lease info is
-            // read here, before Keep DHCP or static mode changes the adapter.
-            List<string[]> leases = new List<string[]>();
-            if (info != null)
-            {
-                foreach (UnicastIPAddressInformation ua in info.V4)
-                {
-                    if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
-                    uint leaseAddr;
-                    if (!TryIPv4(ua.Address.ToString(), out leaseAddr)) continue;
-                    leases.Add(new string[] { ua.Address.ToString(), ua.PrefixLength.ToString(), DhcpNetworkText(leaseAddr, ua.PrefixLength) });
-                }
-            }
-            foreach (string[] e in entries)
-            {
-                uint bindAddr;
-                if (!TryIPv4(e[0], out bindAddr)) continue;
-                foreach (string[] lease in leases)
-                {
-                    uint leaseAddr;
-                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
-                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) == DhcpOverlapKind.SameAsLease)
-                    {
-                        Log(EqualDhcpAddressLog(e[0]), "ERR");
-                        return false;
-                    }
-                }
-            }
-            Dictionary<string, uint> probeSrc = new Dictionary<string, uint>();
-            List<string> inside = new List<string>();
-            foreach (string[] e in entries)
-            {
-                uint bindAddr;
-                if (!TryIPv4(e[0], out bindAddr)) continue;
-                foreach (string[] lease in leases)
-                {
-                    uint leaseAddr;
-                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
-                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) != DhcpOverlapKind.InsideSubnet)
-                        continue;
-                    Log(InsideDhcpNetworkLog(e[0], lease[2]), "WARN");
-                    if (!probeSrc.ContainsKey(e[0]))
-                    {
-                        probeSrc[e[0]] = leaseAddr;
-                        inside.Add(e[0]);
-                    }
-                    break;
-                }
-            }
-            HashSet<string> alreadyHeld = new HashSet<string>(StringComparer.Ordinal);
-            if (info != null)
-                foreach (UnicastIPAddressInformation ua in info.V4)
-                    alreadyHeld.Add(ua.Address.ToString());
-            if (old != null)
-                foreach (string[] e in old.Addresses)
-                    alreadyHeld.Add(e[0]);
-            List<string> toProbe = new List<string>();
-            foreach (string ip in inside)
-                if (!alreadyHeld.Contains(ip)) toProbe.Add(ip);
-            if (toProbe.Count > 0)
-            {
-                List<ArpHit> hits = ProbeInUse(toProbe, probeSrc);
-                if (hits.Count > 0)
-                {
-                    HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (ArpHit hit in hits)
-                    {
-                        used.Add(hit.Ip);
-                        Log(AddressInUseLog(hit.Ip, hit.Mac), "WARN");
-                    }
-                    List<string[]> kept = new List<string[]>();
-                    foreach (string[] e in entries)
-                        if (!used.Contains(e[0])) kept.Add(e);
-                    if (kept.Count == 0)
-                    {
-                        Log(AllAddressesInUseLog(), "ERR");
-                        return false;
-                    }
-                    if (gwPlan != null)
-                    {
-                        bool gwKept = false;
-                        foreach (string[] e in kept)
-                            if (e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString()) gwKept = true;
-                        if (!gwKept)
-                        {
-                            Log(gwPlan.Ip + " was the Gateway support address, so the gateway was not applied.", "WARN");
-                            gwPlan = null;
-                        }
-                    }
-                    entries = kept;
-                }
-            }
-
-            List<string> cmds = new List<string>();
-            cmds.Add("interface ipv4 set interface \"" + alias + "\" dadtransmits=0");
-            // Undo an earlier Keep DHCP Apply first, so its items never linger.
-            if (old != null) cmds.AddRange(RevertCommands(alias, old));
-            KeepRecord rec = null;
-            if (keep)
-            {
-                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' alongside DHCP (single batch)...");
-                if (!info.Dhcp)
-                {
-                    // Left static (e.g. by Static only): back to DHCP before adding.
-                    Log("  The interface is static; switching it to DHCP first.");
-                    cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
-                    cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
-                }
-                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=enabled");
-                foreach (string[] e in entries)
-                {
-                    string ip = e[0];
-                    string mask = MaskFromPrefix(int.Parse(e[1]));
-                    string c = "interface ipv4 add address name=\"" + alias + "\" address=" + ip + " mask=" + mask;
-                    if (gwPlan != null && ip == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString())
-                        c += " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric;
-                    cmds.Add(c);
-                }
-                rec = new KeepRecord();
-                rec.Adapter = alias;
-                rec.Addresses.AddRange(entries);
-                rec.Gateway = gwPlan != null ? gwPlan.Gateway : null;
-                rec.DnsChanged = gwPlan != null && gwPlan.Dns1 != null;
-            }
-            else
-            {
-                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' (single batch)...");
-                if (coexist == CoexistState.Enabled)
-                    cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
-                cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
-                bool first = true;
-                foreach (string[] e in entries)
-                {
-                    string ip = e[0];
-                    string mask = MaskFromPrefix(int.Parse(e[1]));
-                    if (first && gwPlan != null)
-                        cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=static address=" + ip +
-                                 " mask=" + mask + " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric);
-                    else
-                        cmds.Add(first
-                            ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
-                            : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
-                    first = false;
-                }
-            }
-            if (gwPlan != null && gwPlan.Dns1 != null)
-            {
-                // register=none: never publish these bench addresses to corporate DNS.
-                cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=static address=" +
-                         gwPlan.Dns1 + " register=none validate=no");
-                if (gwPlan.Dns2 != null)
-                    cmds.Add("interface ipv4 add dnsservers name=\"" + alias + "\" address=" +
-                             gwPlan.Dns2 + " index=2 validate=no");
-            }
-
-            // Record before running, so a crash mid-batch still leaves a way back.
-            if (rec != null) SaveRecord(info.Guid, rec);
-            else if (old != null) DeleteRecord(info.Guid);
-
-            string outp = RunNetshBatch(cmds);
-
-            foreach (string[] e in entries) Log("  + " + e[0] + "/" + e[1], "OK");
-            if (gwPlan != null)
-            {
-                Log("  gateway " + gwPlan.Gateway + " (metric " + GatewayMetric + ") on " +
-                    gwPlan.Ip + "/" + gwPlan.Prefix, "OK");
-                if (gwPlan.Dns1 != null)
-                    Log("  DNS " + gwPlan.Dns1 + (gwPlan.Dns2 != null ? ", " + gwPlan.Dns2 : ""), "OK");
-                else if (!keep)
-                    Log("No DNS set. Website names may not work through this adapter. " +
-                        "Try your router's address (often the same as the gateway).", "WARN");
-            }
-            LogNetshOutput(outp);
-
-            Log("Bind complete - verifying:", "OK");
-            ShowCurrentConfig(alias);
-
-            // Success = every intended address is actually present on the interface
-            // (and, with Keep DHCP, DHCP is still on).
-            List<string> want = new List<string>();
-            foreach (string[] e in entries) want.Add(e[0]);
-            int found = 0;
-            bool gwFound = false;
-            AdapterInfo after = GetAdapterInfo(alias);
-            if (after != null)
-            {
-                foreach (UnicastIPAddressInformation ua in after.V4)
-                    if (want.Contains(ua.Address.ToString())) found++;
-                if (gwPlan != null && after.Gateways.Contains(gwPlan.Gateway)) gwFound = true;
-            }
-            if (gwPlan != null && !gwFound)
-                Log("Gateway " + gwPlan.Gateway + " is not showing on the interface yet.", "WARN");
-            bool ok = found >= want.Count;
-            if (!ok) Log("Only " + found + " of " + want.Count + " addresses are present on the interface.", "WARN");
-            if (keep && after != null && !after.Dhcp)
-            {
-                ok = false;
-                Log("DHCP turned off on the interface; Keep DHCP did not take effect.", "WARN");
-            }
-            else if (keep && ok)
-                Log("  DHCP is still on.", "OK");
-            if (status != "Up") Log("Interface is not connected - addresses will activate once it comes up.", "WARN");
-            return ok;
-        }
-
-        bool InvokeDhcp()
-        {
-            string alias = GetSelectedAlias();
-            if (alias == null) { Log("No interface selected.", "WARN"); return false; }
-            if (!ValidateAdapterAlias(alias)) return false;
-            Log("Returning '" + alias + "' to DHCP...");
-
-            AdapterInfo info = GetAdapterInfo(alias);
-            KeepRecord rec = info != null ? LoadRecord(info.Guid) : null;
-            CoexistState coexist = DetectCoexist(info);
-            if (info != null && info.Dhcp && (rec != null || coexist == CoexistState.Enabled))
-                return RevertKeepDhcp(alias, info, rec);
-
-            // Same one-process batching as the bind path.
-            List<string> cmds = new List<string>();
-            if (rec != null) cmds.AddRange(RevertCommands(alias, rec));
-            cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
-            cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
-            if (coexist == CoexistState.Enabled)
-                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
-            string outp = RunNetshBatch(cmds);
-            if (rec != null && info != null) DeleteRecord(info.Guid);
-
-            // Kick off a lease renewal but DON'T wait for it. The interface is already
-            // configured for DHCP at this point; blocking on ipconfig /renew waits for the
-            // full discover/request handshake (often many seconds). Windows acquires the
-            // lease on its own - we just nudge it in the background.
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("ipconfig", "/renew \"" + alias + "\"");
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                Process.Start(psi);
-            }
-            catch { }
-            Log("  DHCP re-enabled, DNS reset. Lease will refresh in the background.");
-            Log("Back to DHCP - verifying:", "OK");
-            ShowCurrentConfig(alias);
-
-            // Success = the interface is configured for DHCP. This is a config flag, set the
-            // instant source=dhcp ran - it does not wait for a lease to be acquired.
-            bool dhcpOk = false;
-            try
-            {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.Name != alias) continue;
-                    IPv4InterfaceProperties p4 = ni.GetIPProperties().GetIPv4Properties();
-                    if (p4 != null && p4.IsDhcpEnabled) dhcpOk = true;
-                }
-            }
-            catch { }
-            if (!dhcpOk) Log("DHCP does not appear to be enabled on the interface.", "WARN");
-            else StartLeaseWatch(alias);
-            return dhcpOk;
-        }
 
         // Watches in the background for the DHCP server to actually hand the interface an
         // address, then logs it. Runs off the UI thread so it never holds up the button.
-        void StartLeaseWatch(string alias)
-        {
-            System.Threading.Thread t = new System.Threading.Thread(delegate()
-            {
-                for (int i = 0; i < 30; i++)
-                {
-                    System.Threading.Thread.Sleep(1000);
-                    try
-                    {
-                        foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
-                        {
-                            if (ni.Name != alias) continue;
-                            foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
-                            {
-                                string ip = ua.Address.ToString();
-                                if (ip.Contains(":")) continue;            // skip IPv6
-                                if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;  // only a real DHCP lease
-                                Log("DHCP lease acquired: " + ip + " on '" + alias + "'.", "OK");
-                                return;
-                            }
-                        }
-                    }
-                    catch { }
-                }
-                Log("No DHCP address seen yet on '" + alias + "' (lease may still be pending).", "INFO");
-            });
-            t.IsBackground = true;
-            t.Start();
-        }
+        void StartLeaseWatch(string alias) { engine.StartLeaseWatch(alias); }
+
 
         // ---------------- UI ----------------
         void SetBusy(string text)
@@ -7586,76 +7858,14 @@ namespace IPbind
             }
         }
 
-        void CheckForUpdatesOnLaunch()
-        {
-            if (launchUpdateCheckStarted) return;
-            launchUpdateCheckStarted = true;
-            if (!LaunchUpdateCheckEnabled()) return;   // user chose manual-only updates
-            Thread thread = new Thread(delegate()
-            {
-                UpdateInfo info;
-                try { info = UpdateChecker.Check(); }
-                catch { return; }
-                if (!info.IsNewer) return;
+        void CheckForUpdatesOnLaunch() { engine.CheckForUpdatesOnLaunch(); }
 
-                try
-                {
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        if (IsDisposed || updateDismissed) return;
-                        lblUpdateBanner.Text =
-                            "Version " + VersionText.ForDisplay(info.RemoteVersion) + " is available.";
-                        updateBanner.Visible = true;
-                        ApplyLeftColumnStatusLayout();
-                        updateBanner.BringToFront();
-                    });
-                }
-                catch { }
-            });
-            thread.IsBackground = true;
-            thread.Start();
-        }
 
-        void InstallUpdateFromBanner(object sender, EventArgs e)
-        {
-            btnUpdateNow.Enabled = false;
-            btnUpdateLater.Enabled = false;
-            btnUpdateNow.Text = "Updating...";
-            lblUpdateBanner.Text = "Downloading update; IPbind will restart.";
-            Thread thread = new Thread(delegate()
-            {
-                try
-                {
-                    UpdateChecker.DownloadAndRestart();
-                    try { BeginInvoke((MethodInvoker)delegate { Application.Exit(); }); }
-                    catch { }
-                }
-                catch (Exception ex)
-                {
-                    try
-                    {
-                        BeginInvoke((MethodInvoker)delegate
-                        {
-                            if (IsDisposed) return;
-                            lblUpdateBanner.Text = UpdateChecker.DescribeError(ex);
-                            btnUpdateNow.Text = "Update";
-                            btnUpdateNow.Enabled = true;
-                            btnUpdateLater.Enabled = true;
-                        });
-                    }
-                    catch { }
-                }
-            });
-            thread.IsBackground = true;
-            thread.Start();
-        }
+        void InstallUpdateFromBanner(object sender, EventArgs e) { engine.InstallUpdateFromBanner(); }
 
-        void DismissUpdateBanner(object sender, EventArgs e)
-        {
-            updateDismissed = true;
-            updateBanner.Visible = false;
-            ApplyLeftColumnStatusLayout();
-        }
+
+        void DismissUpdateBanner(object sender, EventArgs e) { engine.DismissUpdateBanner(); }
+
 
         Button MakeButton(string text, int x, int y, int w, int h)
         {
@@ -7810,34 +8020,8 @@ namespace IPbind
         // Shown at every launch until the user clicks Continue with "Don’t show this
         // again" ticked. Anything other than Continue closes IPbind. The flag file is new in 2.3.125, so fresh installs and the first
         // launch after updating from an older version both see it.
-        void ShowDhcpReminderIfNeeded()
-        {
-            if (IsDisposed) return;
-            try { if (File.Exists(DhcpReminderFile)) return; } catch { }
-            bool proceed, remember;
-            using (DhcpReminderForm reminder = new DhcpReminderForm(this, dark, sc))
-            {
-                proceed = reminder.ShowDialog(this) == DialogResult.OK;
-                remember = proceed && reminder.DontShowAgain;
-            }
-            if (!proceed)
-            {
-                // Exit, Esc, X or Alt+F4 on the reminder: quit without touching any
-                // adapter and without saving the opt-out.
-                Close();
-                return;
-            }
-            if (!remember) return;
-            try
-            {
-                EnsureAppDir();
-                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + BuildInfo.DisplayVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
-            }
-            catch (Exception ex)
-            {
-                Log("Could not save the reminder setting: " + ex.Message, "WARN");
-            }
-        }
+        void ShowDhcpReminderIfNeeded() { engine.ShowDhcpReminderIfNeeded(); }
+
 
         protected override void OnLocationChanged(EventArgs e)
         {
@@ -8121,9 +8305,7 @@ namespace IPbind
             combo.DropDownClosed += delegate { combo.Invalidate(); };
             combo.SelectedIndexChanged += delegate
             {
-                string a = GetSelectedAlias();
-                if (a != null) { SaveAdapter(a); Log("Interface set to '" + a + "' (remembered)."); }
-                RefreshKeepDhcp(a);
+                engine.OnAdapterChosen();
             };
             Controls.Add(combo);
 
@@ -8139,12 +8321,7 @@ namespace IPbind
             chkKeepDhcp.Checked = true;
             chkKeepDhcp.CheckedChanged += delegate
             {
-                if (settingKeepDhcp) return;
-                keepDhcpPref = chkKeepDhcp.Checked;
-                SaveKeepDhcpPref();
-                Log(keepDhcpPref
-                    ? "Keep DHCP on (remembered). Apply adds the addresses alongside DHCP."
-                    : "Keep DHCP off (remembered). Apply sets static addresses only.");
+                engine.OnKeepDhcpCheckedChanged();
             };
             Controls.Add(chkKeepDhcp);
             keepDhcpTip = new ToolTip();
@@ -8174,12 +8351,7 @@ namespace IPbind
             chkGateway.TextAlign = ContentAlignment.MiddleLeft;
             chkGateway.CheckedChanged += delegate
             {
-                ApplyGatewayLayout();
-                SaveGatewaySettings();
-                if (!loadingGateway)
-                    Log(chkGateway.Checked
-                        ? "Gateway support on (remembered). Choose one address and enter its gateway and optional DNS."
-                        : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
+                engine.OnGatewayCheckedChanged();
             };
             Controls.Add(chkGateway);
             // Row y 72-92: under the subtitle (which ends at 72), above Refresh (93),
@@ -8231,8 +8403,7 @@ namespace IPbind
             cboGwIp.DropDownClosed += delegate { cboGwIp.Invalidate(); };
             cboGwIp.SelectionChangeCommitted += delegate
             {
-                gwChoice = cboGwIp.SelectedIndex >= 0 ? (string)cboGwIp.SelectedItem : "";
-                SaveGatewaySettings();
+                engine.OnGatewayIpChosen();
             };
             Controls.Add(cboGwIp);
             lblGateway = MakeRowLabel("Gateway:", 284, 310);
@@ -8371,7 +8542,7 @@ namespace IPbind
             btnAbout.Click += delegate
             {
                 using (DebugLog.Time("About"))
-                using (AboutForm about = new AboutForm(this, dark, sc, UpdateCheckFile))
+                using (AboutForm about = new AboutForm(this, dark, sc, engine.UpdateCheckPath))
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);
@@ -8379,5 +8550,141 @@ namespace IPbind
             ApplyTheme();
             this.ResumeLayout(true);
         }
+
+        // ---------------- IBindHost ----------------
+        void IBindHost.LogConsole(string msg, string level) { LogConsole(msg, level); }
+        void IBindHost.ApplyGatewayLayout() { ApplyGatewayLayout(); }
+        bool IBindHost.InvokeRequired { get { return console != null && console.InvokeRequired; } }
+        void IBindHost.BeginLogInvoke(Action<string, string> action, string msg, string level)
+        {
+            console.BeginInvoke(action, msg, level);
+        }
+        string[] IBindHost.IpLines
+        {
+            get { return txtIPs.Lines; }
+            set { txtIPs.Lines = value; }
+        }
+        bool IBindHost.ShowAllChecked { get { return chkAll.Checked; } }
+        bool IBindHost.GatewayChecked
+        {
+            get { return chkGateway.Checked; }
+            set { chkGateway.Checked = value; }
+        }
+        string IBindHost.GatewayText
+        {
+            get { return txtGateway.Text; }
+            set { txtGateway.Text = value; }
+        }
+        string IBindHost.Dns1Text
+        {
+            get { return txtDns1.Text; }
+            set { txtDns1.Text = value; }
+        }
+        string IBindHost.Dns2Text
+        {
+            get { return txtDns2.Text; }
+            set { txtDns2.Text = value; }
+        }
+        string IBindHost.SelectedGatewayItem
+        {
+            get { return cboGwIp.SelectedIndex >= 0 ? (string)cboGwIp.SelectedItem : null; }
+        }
+        int IBindHost.GatewayComboCount { get { return cboGwIp.Items.Count; } }
+        string IBindHost.GatewayComboItemAt(int index) { return (string)cboGwIp.Items[index]; }
+        int IBindHost.GatewaySelectedIndex
+        {
+            get { return cboGwIp.SelectedIndex; }
+            set { cboGwIp.SelectedIndex = value; }
+        }
+        void IBindHost.ReplaceGatewayItems(List<string> keys)
+        {
+            cboGwIp.BeginUpdate();
+            cboGwIp.Items.Clear();
+            foreach (string k in keys) cboGwIp.Items.Add(k);
+            cboGwIp.EndUpdate();
+        }
+        bool IBindHost.KeepDhcpChecked
+        {
+            get { return chkKeepDhcp.Checked; }
+            set { chkKeepDhcp.Checked = value; }
+        }
+        bool IBindHost.KeepDhcpEnabled
+        {
+            get { return chkKeepDhcp.Enabled; }
+            set { chkKeepDhcp.Enabled = value; }
+        }
+        void IBindHost.SetKeepDhcpToolTip(string text)
+        {
+            keepDhcpTip.SetToolTip(chkKeepDhcp, text);
+        }
+        int IBindHost.SelectedAdapterIndex { get { return combo.SelectedIndex; } }
+        void IBindHost.BindAdapterList(List<Adapter> list, int selectedIndex)
+        {
+            combo.Items.Clear();
+            foreach (Adapter a in list)
+                combo.Items.Add(AdapterDisplay.Format(a.Name, a.Description, a.Status));
+            int dropDownWidth = Math.Max(combo.Width + U(40), U(800));
+            foreach (object item in combo.Items)
+            {
+                int itemWidth =
+                    TextRenderer.MeasureText(item.ToString(), combo.Font).Width + U(32);
+                dropDownWidth = Math.Max(dropDownWidth, itemWidth);
+            }
+            combo.DropDownWidth = dropDownWidth;
+            if (selectedIndex >= 0 && selectedIndex < combo.Items.Count)
+                combo.SelectedIndex = selectedIndex;
+        }
+        bool IBindHost.ConfirmDisconnected(string alias, string status)
+        {
+            DialogResult ans = MessageBox.Show(
+                "The interface '" + alias + "' is currently '" + status + "', not connected.\r\n\r\n" +
+                "Windows will not bind static addresses to a disconnected interface, so this likely " +
+                "won't take effect until it is connected.\r\n\r\nApply anyway?",
+                "Interface not connected", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            return ans == DialogResult.Yes;
+        }
+        void IBindHost.RunOnUi(Action action)
+        {
+            BeginInvoke(action);
+        }
+        bool IBindHost.IsHostDisposed { get { return IsDisposed; } }
+        void IBindHost.ShowUpdateAvailable(string remoteVersion)
+        {
+            lblUpdateBanner.Text =
+                "Version " + VersionText.ForDisplay(remoteVersion) + " is available.";
+            updateBanner.Visible = true;
+            ApplyLeftColumnStatusLayout();
+            updateBanner.BringToFront();
+        }
+        void IBindHost.HideUpdateBanner()
+        {
+            updateBanner.Visible = false;
+            ApplyLeftColumnStatusLayout();
+        }
+        void IBindHost.SetUpdatingBanner()
+        {
+            btnUpdateNow.Enabled = false;
+            btnUpdateLater.Enabled = false;
+            btnUpdateNow.Text = "Updating...";
+            lblUpdateBanner.Text = "Downloading update; IPbind will restart.";
+        }
+        void IBindHost.ShowUpdateError(string message)
+        {
+            lblUpdateBanner.Text = message;
+            btnUpdateNow.Text = "Update";
+            btnUpdateNow.Enabled = true;
+            btnUpdateLater.Enabled = true;
+        }
+        void IBindHost.ExitApp() { Application.Exit(); }
+        void IBindHost.ShowDhcpReminder(out bool proceed, out bool remember)
+        {
+            using (DhcpReminderForm reminder = new DhcpReminderForm(this, dark, sc))
+            {
+                proceed = reminder.ShowDialog(this) == DialogResult.OK;
+                remember = proceed && reminder.DontShowAgain;
+            }
+        }
+        void IBindHost.CloseHost() { Close(); }
+
     }
 }

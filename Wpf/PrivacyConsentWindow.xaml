@@ -1,0 +1,29 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="520" Height="400"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Background="{DynamicResource DialogBgBrush}"
+        Foreground="{DynamicResource FgBrush}"
+        FontFamily="Segoe UI" FontSize="12">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <TextBlock x:Name="intro" TextWrapping="Wrap" Margin="0,0,0,10"/>
+    <TextBox x:Name="privacyText" Grid.Row="1" IsReadOnly="True" TextWrapping="Wrap"
+             VerticalScrollBarVisibility="Auto" AcceptsReturn="True"
+             Background="{DynamicResource InputBrush}" Foreground="{DynamicResource FgBrush}"
+             BorderBrush="{DynamicResource BorderBrushKey}"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="agreeButton" Content="I Agree" MinWidth="100" Height="32" Margin="0,0,8,0"
+              Background="{DynamicResource PanelBrush}" Foreground="{DynamicResource FgBrush}"
+              BorderBrush="{DynamicResource BorderBrushKey}"/>
+      <Button x:Name="cancelButton" Content="Cancel" MinWidth="98" Height="32"
+              Background="{DynamicResource PanelBrush}" Foreground="{DynamicResource FgBrush}"
+              BorderBrush="{DynamicResource BorderBrushKey}"/>
+    </StackPanel>
+  </Grid>
+</Window>
