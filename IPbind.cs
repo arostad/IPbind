@@ -8039,6 +8039,61 @@ namespace IPbind
             return box.Width - U(6);
         }
 
+        // Same measurement as the UI-suite ALIGN check: the right edge of the
+        // caption ink as this checkbox will actually paint it (native in light
+        // mode, Beta 8-DIP gap in dark chrome). Stand-alone probe so MainForm's
+        // handle is not created early.
+        int CaptionInkRight(CheckBox box)
+        {
+            try
+            {
+                ThemedCheckBox srcBox = box as ThemedCheckBox;
+                using (ThemedCheckBox probe = new ThemedCheckBox())
+                {
+                    probe.Text = box.Text;
+                    probe.Font = box.Font;
+                    probe.Size = box.Size;
+                    probe.CheckAlign = box.CheckAlign;
+                    probe.TextAlign = box.TextAlign;
+                    probe.FlatStyle = box.FlatStyle;
+                    Color bg = box.BackColor.IsEmpty ? Color.White : box.BackColor;
+                    probe.BackColor = bg;
+                    probe.ForeColor = box.ForeColor.IsEmpty ? Color.Black : box.ForeColor;
+                    if (srcBox != null && srcBox.UseDarkChrome) probe.ApplyDark(true);
+                    int w = Math.Max(1, probe.Width);
+                    int h = Math.Max(1, probe.Height);
+                    using (Bitmap bmp = new Bitmap(w, h))
+                    {
+                        probe.DrawToBitmap(bmp, new Rectangle(0, 0, w, h));
+                        Color sample = bmp.GetPixel(Math.Max(0, w - 1), Math.Min(1, h - 1));
+                        for (int x = w - 1; x >= 0; x--)
+                            for (int y = 0; y < h; y++)
+                            {
+                                Color c = bmp.GetPixel(x, y);
+                                if (Math.Abs(c.R - sample.R) + Math.Abs(c.G - sample.G) + Math.Abs(c.B - sample.B) > 300)
+                                    return x + 1;
+                            }
+                    }
+                }
+            }
+            catch { }
+            return TextInkRight(box);
+        }
+
+        // Slide only the Keep DHCP / Gateway support pair horizontally so the
+        // "Gateway support" caption ink lines up with Refresh's right edge.
+        // Y and every other control stay put. Call after ApplyTheme so dark
+        // chrome (and the Beta gap) is already in effect; light mode keeps the
+        // native ink and typically does not move.
+        void AlignGatewayPair(Button refresh)
+        {
+            if (refresh == null || chkGateway == null || chkKeepDhcp == null) return;
+            int ink = CaptionInkRight(chkGateway);
+            if (ink <= 0) return;
+            chkGateway.Location = new Point(refresh.Right - ink, U(72));
+            chkKeepDhcp.Location = new Point(chkGateway.Left - U(28) - chkKeepDhcp.Width, U(72));
+        }
+
         Label MakeRowLabel(string text, int x, int y)
         {
             Label l = new Label();
@@ -8708,6 +8763,7 @@ namespace IPbind
             ApplyTheme();
             if (lblIPs != null)
                 lblIPs.NoteColor = dark ? SubCol : Color.FromArgb(90, 90, 90);
+            AlignGatewayPair(btnRefresh);
             this.ResumeLayout(true);
         }
     }
