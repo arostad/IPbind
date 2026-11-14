@@ -138,7 +138,39 @@ jobs:
           if ($version -notmatch '^\d+(?:\.\d+){2,3}$') { throw "Bad version '$version'" }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+      # A push that does not bump the version (README-only merge, re-run) must not
+      # replace the moving Latest assets with a new compile of a version that has
+      # already shipped (Nov 13 2026: a README merge rebuilt Latest 2.3.142 with a
+      # different SHA-256). If v<version> already exists, Latest must already be that
+      # version: leave both untouched. If v<version> exists but Latest is something
+      # else, stop for a human instead of guessing.
+      - name: Skip Latest if this version already shipped
+        id: guard
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          gh release view "v$env:VERSION" -R $repo --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "v$env:VERSION does not exist yet; publishing Latest."
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'latest-version'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          gh release download latest -R $repo --pattern version.txt --dir $dir --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read version.txt from the Latest release.' }
+          $published = (Get-Content -Raw (Join-Path $dir 'version.txt')).Trim()
+          if ($published -ne $env:VERSION) {
+            throw "v$env:VERSION already exists but Latest is '$published'. Bump the version or fix Latest by hand; not overwriting."
+          }
+          Write-Host "::notice::v$env:VERSION already shipped and Latest is $published; leaving Latest assets unchanged (bump the version to publish a new build)."
+          "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Update Latest release
+        if: steps.guard.outputs.skip != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: latest
@@ -168,6 +200,7 @@ jobs:
       # as IPbind-Portable.exe are overwritten by the upload above. Updater and
       # legacy assets are never touched.
       - name: Remove previous versioned downloads
+        if: steps.guard.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
