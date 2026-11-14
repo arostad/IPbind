@@ -2081,8 +2081,14 @@ namespace IPbind
             public IntPtr hwndList;
         }
 
+        static bool? forcedDark;
+
+        // WPF Beta --theme. Null uses the Windows app theme. Does not write the registry.
+        public static void SetForcedDark(bool? dark) { forcedDark = dark; }
+
         public static bool IsAppDark()
         {
+            if (forcedDark.HasValue) return forcedDark.Value;
             try
             {
                 object v = Microsoft.Win32.Registry.GetValue(
@@ -6034,6 +6040,8 @@ namespace IPbind
         bool updateDismissed;
         readonly List<Adapter> adapters = new List<Adapter>();
         public string UpdateCheckPath { get { return UpdateCheckFile; } }
+        // WPF banner refreshes when the DHCP lease watch ends. WinForms leaves this null.
+        public Action LeaseWatchFinished;
         public bool SettingKeepDhcp { get { return settingKeepDhcp; } }
         public bool LoadingGateway { get { return loadingGateway; } }
         public bool KeepDhcpPref { get { return keepDhcpPref; } }
@@ -7316,30 +7324,98 @@ namespace IPbind
         {
             System.Threading.Thread t = new System.Threading.Thread(delegate()
             {
-                for (int i = 0; i < 30; i++)
+                try
                 {
-                    System.Threading.Thread.Sleep(1000);
-                    try
+                    for (int i = 0; i < 30; i++)
                     {
-                        foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                        System.Threading.Thread.Sleep(1000);
+                        try
                         {
-                            if (ni.Name != alias) continue;
-                            foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                            foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                             {
-                                string ip = ua.Address.ToString();
-                                if (ip.Contains(":")) continue;
-                                if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
-                                Log("DHCP lease acquired: " + ip + " on '" + alias + "'.", "OK");
-                                return;
+                                if (ni.Name != alias) continue;
+                                foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                                {
+                                    string ip = ua.Address.ToString();
+                                    if (ip.Contains(":")) continue;
+                                    if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
+                                    Log("DHCP lease acquired: " + ip + " on '" + alias + "'.", "OK");
+                                    return;
+                                }
                             }
                         }
+                        catch { }
                     }
-                    catch { }
+                    Log("No DHCP address seen yet on '" + alias + "' (lease may still be pending).", "INFO");
                 }
-                Log("No DHCP address seen yet on '" + alias + "' (lease may still be pending).", "INFO");
+                finally
+                {
+                    RaiseLeaseWatchFinished();
+                }
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        void RaiseLeaseWatchFinished()
+        {
+            Action cb = LeaseWatchFinished;
+            if (cb == null || host.IsHostDisposed) return;
+            try
+            {
+                if (host.InvokeRequired) host.RunOnUi(cb);
+                else cb();
+            }
+            catch { }
+        }
+
+        // Read-only snapshot for the WPF safety banner. Uses GetAdapterInfo and
+        // LoadRecord (no netsh set/add/delete; no netsh at all).
+        public sealed class SafetyBanner
+        {
+            public int Kind; // 0 none, 1 safe (DHCP), 2 static, 3 error
+            public string Headline;
+            public string Detail;
+        }
+
+        public SafetyBanner ReadSafetyBanner(string alias)
+        {
+            SafetyBanner b = new SafetyBanner();
+            if (string.IsNullOrEmpty(alias))
+            {
+                b.Kind = 0;
+                b.Headline = "No interface selected";
+                b.Detail = "Choose a LAN interface below.";
+                return b;
+            }
+            AdapterInfo info = GetAdapterInfo(alias);
+            if (info == null)
+            {
+                b.Kind = 3;
+                b.Headline = "Can't read " + alias;
+                b.Detail = "Click Refresh, or pick another interface.";
+                return b;
+            }
+            KeepRecord rec = LoadRecord(info.Guid);
+            bool manual = false;
+            if (info.V4 != null)
+            {
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    if (ua.PrefixOrigin == PrefixOrigin.Manual) { manual = true; break; }
+                }
+            }
+            if (rec != null || !info.Dhcp || manual)
+            {
+                b.Kind = 2;
+                b.Headline = "Static addresses applied on " + alias;
+                b.Detail = "Click Return to DHCP before you plug into a live network.";
+                return b;
+            }
+            b.Kind = 1;
+            b.Headline = "No static addresses on " + alias;
+            b.Detail = "Safe to plug into a live network.";
+            return b;
         }
 
         public void CheckForUpdatesOnLaunch()

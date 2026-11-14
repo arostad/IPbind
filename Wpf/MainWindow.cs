@@ -7,6 +7,8 @@ using System.Windows.Documents;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
+using IoPath = System.IO.Path;
 
 namespace IPbind
 {
@@ -22,20 +24,20 @@ namespace IPbind
         ComboBox combo;
         CheckBox chkAll, chkKeepDhcp, chkGateway;
         TextBox txtIPs, txtGateway, txtDns1, txtDns2;
-        TextBlock lblIPs, lblStatus, lblUpdateBanner, lblTitle;
+        TextBlock lblIPs, lblStatus, lblUpdateBanner, bannerHeadline, bannerDetail;
         ComboBox cboGwIp;
         FrameworkElement gatewayRow1, gatewayRow2;
         Button btnBind, btnDhcp, btnSaveList, btnRestore, btnShow, btnRefresh, btnAbout, btnClear;
         Button btnUpdateNow, btnUpdateLater;
-        Border updateBanner;
+        Border updateBanner, statusBanner;
+        Ellipse bannerIcon;
+        Shape bannerGlyphCheck, bannerGlyphBang, bannerGlyphX, bannerGlyphDash;
         RichTextBox console;
         Paragraph consolePara;
         bool suppressingGateway;
+        int bannerSerial;
 
-        const string IpLabelPlain =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24). No gateway or DNS:";
-        const string IpLabelGateway =
-            "IP addresses to bind - one per line, CIDR (e.g. 192.168.1.98/24):";
+        const string IpHelp = "One per line, CIDR (e.g. 192.168.1.98/24)";
         const string KeepDhcpTipOn =
             "On: DHCP stays on and these addresses are added alongside it.\r\n" +
             "Off: static addresses only, no DHCP.";
@@ -44,10 +46,14 @@ namespace IPbind
             "Apply uses static addresses only.";
 
         public Window Window { get { return window; } }
+        public bool BannerReady { get; private set; }
 
-        public MainWindow() : this(false) { }
+        public MainWindow() : this(false, false) { }
 
-        public MainWindow(bool selftest)
+        public MainWindow(bool selftest) : this(selftest, false) { }
+
+        // quiet: load the real window (adapters, list) but skip the DHCP popup and the update check.
+        public MainWindow(bool selftest, bool quiet)
         {
             this.selftest = selftest;
             dark = WindowTheme.IsAppDark();
@@ -58,17 +64,16 @@ namespace IPbind
             ApplyChrome();
             LoadIcon();
             engine = new BindEngine(this);
-            if (!selftest)
-            {
-                engine.Startup();
+            engine.LeaseWatchFinished = delegate { RefreshBanner(); };
+            if (selftest) return;
+            engine.Startup();
+            RefreshBanner();
+            if (!quiet)
                 window.ContentRendered += OnFirstShown;
-            }
         }
 
         void Wire()
         {
-            lblTitle = WpfXaml.Find<TextBlock>(window, "lblTitle");
-            lblTitle.Text = BuildInfo.AppName;
             combo = WpfXaml.Find<ComboBox>(window, "combo");
             chkAll = WpfXaml.Find<CheckBox>(window, "chkAll");
             chkKeepDhcp = WpfXaml.Find<CheckBox>(window, "chkKeepDhcp");
@@ -94,25 +99,39 @@ namespace IPbind
             updateBanner = WpfXaml.Find<Border>(window, "updateBanner");
             lblUpdateBanner = WpfXaml.Find<TextBlock>(window, "lblUpdateBanner");
             lblStatus = WpfXaml.Find<TextBlock>(window, "lblStatus");
+            statusBanner = WpfXaml.Find<Border>(window, "statusBanner");
+            bannerHeadline = WpfXaml.Find<TextBlock>(window, "bannerHeadline");
+            bannerDetail = WpfXaml.Find<TextBlock>(window, "bannerDetail");
+            bannerIcon = WpfXaml.Find<Ellipse>(window, "bannerIcon");
+            bannerGlyphCheck = WpfXaml.Find<Shape>(window, "bannerGlyphCheck");
+            bannerGlyphBang = WpfXaml.Find<Shape>(window, "bannerGlyphBang");
+            bannerGlyphX = WpfXaml.Find<Shape>(window, "bannerGlyphX");
+            bannerGlyphDash = WpfXaml.Find<Shape>(window, "bannerGlyphDash");
             console = WpfXaml.Find<RichTextBox>(window, "console");
 
             btnBind.Content = UiCopy.ApplyButton;
             btnDhcp.Content = UiCopy.DhcpButton;
 
             console.Document = new FlowDocument();
-            console.Document.PagePadding = new Thickness(6, 4, 14, 4);
+            console.Document.PagePadding = new Thickness(8, 6, 16, 6);
             console.Document.FontFamily = new FontFamily("Consolas");
             console.Document.FontSize = 12;
             consolePara = new Paragraph();
             consolePara.Margin = new Thickness(0);
             console.Document.Blocks.Add(consolePara);
+            console.SizeChanged += delegate { FitConsolePage(); };
 
             chkKeepDhcp.ToolTip = KeepDhcpTipOn;
             chkGateway.ToolTip = "Only enable if you know what you're doing!";
 
-            combo.SelectionChanged += delegate { if (engine != null) engine.OnAdapterChosen(); };
-            chkAll.Checked += delegate { if (engine != null) engine.LoadAdapters(); };
-            chkAll.Unchecked += delegate { if (engine != null) engine.LoadAdapters(); };
+            combo.SelectionChanged += delegate
+            {
+                if (engine == null) return;
+                engine.OnAdapterChosen();
+                RefreshBanner();
+            };
+            chkAll.Checked += delegate { if (engine != null) { engine.LoadAdapters(); RefreshBanner(); } };
+            chkAll.Unchecked += delegate { if (engine != null) { engine.LoadAdapters(); RefreshBanner(); } };
             chkKeepDhcp.Checked += delegate { if (engine != null) engine.OnKeepDhcpCheckedChanged(); };
             chkKeepDhcp.Unchecked += delegate { if (engine != null) engine.OnKeepDhcpCheckedChanged(); };
             chkGateway.Checked += delegate { if (engine != null) engine.OnGatewayCheckedChanged(); };
@@ -130,7 +149,12 @@ namespace IPbind
             txtDns1.TextChanged += delegate { if (engine != null) engine.SaveGatewaySettings(); };
             txtDns2.TextChanged += delegate { if (engine != null) engine.SaveGatewaySettings(); };
 
-            btnRefresh.Click += delegate { if (engine != null) { using (DebugLog.Time("Refresh")) engine.LoadAdapters(); } };
+            btnRefresh.Click += delegate
+            {
+                if (engine == null) return;
+                using (DebugLog.Time("Refresh")) engine.LoadAdapters();
+                RefreshBanner();
+            };
             btnSaveList.Click += delegate { if (engine != null) engine.SaveList(false); };
             btnRestore.Click += delegate { if (engine != null) engine.RestoreDefaults(); };
             btnShow.Click += delegate
@@ -194,9 +218,18 @@ namespace IPbind
                 WpfXaml.Find<Border>(window, "consoleThumb"), dark);
         }
 
+        void FitConsolePage()
+        {
+            if (console == null || console.Document == null) return;
+            double w = console.ActualWidth - console.Document.PagePadding.Left - console.Document.PagePadding.Right - 4;
+            if (w < 40) return;
+            if (double.IsNaN(console.Document.PageWidth) || Math.Abs(console.Document.PageWidth - w) > 0.5)
+                console.Document.PageWidth = w;
+        }
+
         static string UpdateCheckPath()
         {
-            return Path.Combine(
+            return IoPath.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 BuildInfo.AppName, "update-check.txt");
         }
@@ -211,12 +244,23 @@ namespace IPbind
         void FitWorkArea()
         {
             Rect wa = SystemParameters.WorkArea;
-            window.MaxWidth = wa.Width;
-            window.MaxHeight = wa.Height;
-            window.MinWidth = Math.Min(720, wa.Width);
-            window.MinHeight = Math.Min(480, wa.Height);
+            window.MinWidth = Math.Min(980, wa.Width);
+            window.MinHeight = Math.Min(520, wa.Height);
+            window.MaxWidth = Math.Max(window.MinWidth, wa.Width);
+            window.MaxHeight = Math.Max(window.MinHeight, wa.Height);
             if (window.Width > wa.Width) window.Width = wa.Width;
             if (window.Height > wa.Height) window.Height = wa.Height;
+            if (!window.IsLoaded) return;
+            double w = window.ActualWidth > 1 ? window.ActualWidth : window.Width;
+            double h = window.ActualHeight > 1 ? window.ActualHeight : window.Height;
+            if (w > wa.Width) window.Width = wa.Width;
+            if (h > wa.Height) window.Height = wa.Height;
+            if (window.Left < wa.Left) window.Left = wa.Left;
+            if (window.Top < wa.Top) window.Top = wa.Top;
+            if (window.Left + window.Width > wa.Right)
+                window.Left = Math.Max(wa.Left, wa.Right - window.Width);
+            if (window.Top + window.Height > wa.Bottom)
+                window.Top = Math.Max(wa.Top, wa.Bottom - window.Height);
         }
 
         void ApplyChrome()
@@ -232,6 +276,7 @@ namespace IPbind
                 IntPtr hwnd = new WindowInteropHelper(window).Handle;
                 WindowTheme.ApplyMaximizedBorder(hwnd, window.WindowState == WindowState.Maximized);
             };
+            window.DpiChanged += delegate { FitWorkArea(); };
         }
 
         void LoadIcon()
@@ -249,6 +294,73 @@ namespace IPbind
             catch { }
         }
 
+        void RefreshBanner()
+        {
+            if (engine == null) return;
+            int serial = ++bannerSerial;
+            int count = combo.Items.Count;
+            string alias = engine.GetSelectedAlias();
+            if (count == 0)
+            {
+                ShowBanner(3, "No adapter can be read", "Click Refresh, or check that a network adapter is present.");
+                return;
+            }
+            if (string.IsNullOrEmpty(alias))
+            {
+                ShowBanner(0, "No interface selected", "Choose a LAN interface below.");
+                return;
+            }
+            string aliasCopy = alias;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                BindEngine.SafetyBanner snap;
+                try { snap = engine.ReadSafetyBanner(aliasCopy); }
+                catch
+                {
+                    snap = new BindEngine.SafetyBanner();
+                    snap.Kind = 3;
+                    snap.Headline = "Can't read " + aliasCopy;
+                    snap.Detail = "Click Refresh, or pick another interface.";
+                }
+                window.Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (serial != bannerSerial || snap == null) return;
+                    ShowBanner(snap.Kind, snap.Headline, snap.Detail);
+                }));
+            });
+        }
+
+        void ShowFailureBanner(string failMsg)
+        {
+            bannerSerial++;
+            string detail = "See the console, then try again.";
+            string headline = failMsg ?? "Something went wrong";
+            if (headline.IndexOf("DHCP", StringComparison.OrdinalIgnoreCase) >= 0)
+                headline = "Couldn't return to DHCP";
+            else if (headline.IndexOf("apply", StringComparison.OrdinalIgnoreCase) >= 0)
+                headline = "Couldn't apply static IPs";
+            ShowBanner(3, headline, detail);
+        }
+
+        // kind: 0 none, 1 safe, 2 static, 3 error
+        void ShowBanner(int kind, string headline, string detail)
+        {
+            string bg = "BannerNoneBg", border = "BannerNoneBorder", accent = "BannerNoneAccent";
+            if (kind == 1) { bg = "BannerSafeBg"; border = "BannerSafeBorder"; accent = "BannerSafeAccent"; }
+            else if (kind == 2) { bg = "BannerStaticBg"; border = "BannerStaticBorder"; accent = "BannerStaticAccent"; }
+            else if (kind == 3) { bg = "BannerErrorBg"; border = "BannerErrorBorder"; accent = "BannerErrorAccent"; }
+            statusBanner.Background = BrushOf(bg, Colors.DimGray);
+            statusBanner.BorderBrush = BrushOf(border, Colors.Gray);
+            bannerIcon.Fill = BrushOf(accent, Colors.Gray);
+            bannerHeadline.Text = headline ?? "";
+            bannerDetail.Text = detail ?? "";
+            bannerGlyphCheck.Visibility = kind == 1 ? Visibility.Visible : Visibility.Collapsed;
+            bannerGlyphBang.Visibility = kind == 2 ? Visibility.Visible : Visibility.Collapsed;
+            bannerGlyphX.Visibility = kind == 3 ? Visibility.Visible : Visibility.Collapsed;
+            bannerGlyphDash.Visibility = kind == 0 ? Visibility.Visible : Visibility.Collapsed;
+            BannerReady = true;
+        }
+
         void SetBusy(string text)
         {
             SetActionEnabled(false);
@@ -263,11 +375,18 @@ namespace IPbind
             {
                 lblStatus.Foreground = BrushOf("OkBrush", dark ? Color.FromRgb(90, 200, 110) : Color.FromRgb(30, 120, 40));
                 lblStatus.Text = "OK - " + okMsg;
+                RefreshBanner();
             }
             else
             {
                 lblStatus.Foreground = BrushOf("ErrBrush", dark ? Color.FromRgb(240, 100, 100) : Color.FromRgb(180, 40, 40));
                 lblStatus.Text = failMsg;
+                if (combo.Items.Count == 0)
+                    ShowBanner(3, "No adapter can be read", "Click Refresh, or check that a network adapter is present.");
+                else if (engine == null || string.IsNullOrEmpty(engine.GetSelectedAlias()))
+                    ShowBanner(0, "No interface selected", "Choose a LAN interface below.");
+                else
+                    ShowFailureBanner(failMsg);
             }
         }
 
@@ -286,7 +405,8 @@ namespace IPbind
         {
             object v = Application.Current != null ? Application.Current.TryFindResource(key) : null;
             SolidColorBrush b = v as SolidColorBrush;
-            return b ?? new SolidColorBrush(fallback);
+            if (b != null) return b;
+            return new SolidColorBrush(fallback);
         }
 
         // ---------------- IBindHost ----------------
@@ -302,14 +422,18 @@ namespace IPbind
 
         void IBindHost.LogConsole(string msg, string level)
         {
-            string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
-            Brush brush = console.Foreground;
-            if (level == "ERR") brush = BrushOf("ErrBrush", Color.FromRgb(240, 100, 100));
-            else if (level == "WARN") brush = BrushOf("WarnBrush", Color.FromRgb(255, 200, 61));
-            else if (level == "OK") brush = BrushOf("OkBrush", Color.FromRgb(90, 200, 110));
-            Run run = new Run(line);
-            run.Foreground = brush;
-            consolePara.Inlines.Add(run);
+            Brush body = console.Foreground;
+            if (level == "ERR") body = BrushOf("ErrBrush", Color.FromRgb(240, 100, 100));
+            else if (level == "WARN") body = BrushOf("WarnBrush", Color.FromRgb(255, 200, 61));
+            else if (level == "OK") body = BrushOf("OkBrush", Color.FromRgb(90, 200, 110));
+            Run stamp = new Run(DateTime.Now.ToString("HH:mm:ss") + "  ");
+            stamp.Foreground = BrushOf("TimestampBrush", Color.FromRgb(138, 138, 138));
+            Run text = new Run((string.IsNullOrEmpty(level) ? "INFO" : level) + "  " + msg);
+            text.Foreground = body;
+            consolePara.Inlines.Add(stamp);
+            consolePara.Inlines.Add(text);
+            consolePara.Inlines.Add(new LineBreak());
+            FitConsolePage();
             console.ScrollToEnd();
             if (consoleOverlay != null) consoleOverlay.SyncThumbOnly();
         }
@@ -382,7 +506,7 @@ namespace IPbind
             bool on = chkGateway.IsChecked == true;
             gatewayRow1.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
             gatewayRow2.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
-            lblIPs.Text = on ? IpLabelGateway : IpLabelPlain;
+            lblIPs.Text = IpHelp;
         }
 
         bool IBindHost.KeepDhcpChecked

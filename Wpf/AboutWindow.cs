@@ -28,6 +28,9 @@ namespace IPbind
         public Window Window { get { return window; } }
 
         public AboutWindow(Window owner, bool dark, string updateCheckFile)
+            : this(owner, dark, updateCheckFile, true) { }
+
+        public AboutWindow(Window owner, bool dark, string updateCheckFile, bool checkReleaseMatch)
         {
             this.dark = dark;
             this.updateCheckFile = updateCheckFile;
@@ -50,7 +53,7 @@ namespace IPbind
             privacyLabel.Text = PrivacyLine1 + "\r\n" + PrivacyLine2;
 
             bool launchEnabled = ReadLaunchCheckEnabled();
-            checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
+            checkMatchOnShow = checkReleaseMatch && BuildInfo.IsBeta && launchEnabled;
             settingLaunchCheck = true;
             try { launchCheckBox.IsChecked = launchEnabled; }
             finally { settingLaunchCheck = false; }
