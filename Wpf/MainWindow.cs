@@ -422,10 +422,16 @@ namespace IPbind
 
         void IBindHost.LogConsole(string msg, string level)
         {
+            // Same OK / WARN / ERR colors as the WinForms ConsoleBox (2.3.143). The
+            // console stays dark in both themes, like WinForms.
             Brush body = console.Foreground;
-            if (level == "ERR") body = BrushOf("ErrBrush", Color.FromRgb(240, 100, 100));
-            else if (level == "WARN") body = BrushOf("WarnBrush", Color.FromRgb(255, 200, 61));
-            else if (level == "OK") body = BrushOf("OkBrush", Color.FromRgb(90, 200, 110));
+            if (level == "OK" || level == "WARN" || level == "ERR" || level == "ERROR")
+            {
+                System.Drawing.Color c = ConsoleBox.LevelColor(level, System.Drawing.Color.Empty);
+                SolidColorBrush b = new SolidColorBrush(Color.FromRgb(c.R, c.G, c.B));
+                b.Freeze();
+                body = b;
+            }
             Run stamp = new Run(DateTime.Now.ToString("HH:mm:ss") + "  ");
             stamp.Foreground = BrushOf("TimestampBrush", Color.FromRgb(138, 138, 138));
             Run text = new Run((string.IsNullOrEmpty(level) ? "INFO" : level) + "  " + msg);
