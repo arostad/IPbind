@@ -305,3 +305,40 @@ jobs:
           path: shots/
           retention-days: 1
           if-no-files-found: warn
+
+  # Prod 2.3.128 -> current in-app update, then the new pre-uninstall prompt.
+  # Builds the prod channel (the reported upgrade path), independent of prepare.
+  upgrade-uninstaller:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build prod exe and installer
+        shell: pwsh
+        run: |
+          Remove-Item -ErrorAction SilentlyContinue .\IPbind.exe
+          powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
+          if (-not (Test-Path .\IPbind.exe)) { throw 'Build-Exe.ps1 did not produce IPbind.exe' }
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path)
+          if ($info.ProductName -ne 'IPbind') { throw "Expected product 'IPbind', got '$($info.ProductName)'" }
+          choco install innosetup --yes --no-progress | Out-Null
+          powershell -ExecutionPolicy Bypass -File .\Build-Installer.ps1 -ExePath .\IPbind.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Get-ChildItem .\dist\IPbind-Installer-v*.exe | Where-Object { $_.Name -notlike '*-beta.exe' })) {
+            throw 'prod installer missing'
+          }
+      - name: 128 to current in-app update then new uninstall prompt
+        shell: pwsh
+        run: |
+          $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path).ProductVersion
+          $installer = (Resolve-Path ".\dist\IPbind-Installer-v$version.exe").Path
+          New-Item -ItemType Directory shots\upgrade-uninstaller -Force | Out-Null
+          powershell -ExecutionPolicy Bypass -File .\.github\test\run-upgrade-uninstaller.ps1 `
+            -NewExe .\IPbind.exe -NewInstaller $installer -Out "$PWD\shots\upgrade-uninstaller"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-shots-upgrade-uninstaller
+          path: shots/
+          retention-days: 1
+          if-no-files-found: warn
