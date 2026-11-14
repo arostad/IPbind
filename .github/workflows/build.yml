@@ -21,6 +21,10 @@ jobs:
           Remove-Item -ErrorAction SilentlyContinue .\IPbind.exe
           powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
 
+      - name: Run Apply-safety unit tests
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\.github\test\run-apply-safety-tests.ps1
+
       - name: Write release metadata
         shell: pwsh
         run: |

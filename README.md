@@ -8,17 +8,19 @@ A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one
 
 By default IPbind sets no gateway and no DNS. Most equipment only needs an address on its own subnet. If you're on a LAN that also has internet, turn on **Gateway support** for one address and enter the router's gateway and up to two DNS servers. You can reach the local devices and stay online. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
-At launch, IPbind reminds you to click Return to DHCP before you plug the adapter into another network, since leftover static addresses can conflict with devices there. Tick **I understand** to continue, or click **Exit** to close IPbind. Tick **Don’t show this again** to stop the reminder.
+**Keep DHCP** adds the static addresses alongside the adapter's DHCP address instead of replacing it (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
+
+At launch, IPbind reminds you to click **Return to DHCP** before you plug into a live network, since leftover static addresses can conflict with devices there. Tick **I’ll click Return to DHCP before I plug into a live network** to continue, or click **Exit IPbind** to close. Tick **Don’t show this again** to stop the reminder.
 
 App created by [Andy Rostad](https://github.com/arostad).  Released under the [MIT License](https://github.com/arostad/IPbind/blob/main/LICENSE).
 
 <br clear="all">
 
-Current version: **2.3.128**
+Current version: **2.3.141**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.128.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.128.exe)
+### Download installer: [IPbind-Installer-v2.3.141.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.141.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
@@ -32,5 +34,5 @@ Prefer a single file? Download the portable version: [IPbind-Portable.exe](https
 
 ## Privacy
 
-IPbind does not upload your address list, adapter choices, or anything that identifies your computer. Your configuration stays in your Windows user profile. The only network call is an update check (at launch or from About), which asks for the latest version number. The check goes to a small Cloudflare Worker run by me (ipbind-update-pings.dataspike.workers.dev). If that can't be reached, IPbind asks GitHub for the same version file instead. That check bumps a simple daily update check count by country so I can see rough usage; the connection's IP address and user-agent are not stored. Like any web request, your IP address is seen by Cloudflare or GitHub when the connection is made. IPbind itself sends no identifier, and the counter keeps only the country. You can turn off the automatic check at launch during installation ('Check for updates at launch'). When it's off, IPbind makes no network calls on its own; updates are checked only when you click Check for updates in About. When an update is available, the file downloads directly from the IPbind GitHub repository. Downloading an update connects only to GitHub and happens only after you choose to update. Binding or reverting addresses is a local `netsh` action on your machine and does not phone home.
+IPbind does not upload your address list, adapter choices, or anything that identifies your computer. Your configuration stays in your Windows user profile. The only network call is an update check (at launch or from About), which asks for the latest version number. The check goes to a small Cloudflare Worker run by me (ipbind-update-pings.dataspike.workers.dev). If that can't be reached, IPbind asks GitHub for the same version file instead. That check bumps a simple daily update check count by country so I can see rough usage; the connection's IP address and user-agent are not stored. Like any web request, your IP address is seen by Cloudflare or GitHub when the connection is made. IPbind itself sends no identifier, and the counter keeps only the country. You can turn the automatic check at launch on or off during installation or any time in About ('Check for updates at launch (recommended)'). When it's off, IPbind makes no network calls on its own; updates are checked only when you click Check for updates in About. When an update is available, the file downloads directly from the IPbind GitHub repository. Downloading an update connects only to GitHub and happens only after you choose to update. Binding or reverting addresses is a local `netsh` action on your machine and does not phone home.
 

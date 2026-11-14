@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ui-suite.yml
+
   build:
     runs-on: windows-latest
     steps:
@@ -32,6 +35,10 @@ jobs:
           $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path)
           if ($info.ProductName -ne 'IPbind Beta') { throw "Expected product 'IPbind Beta', got '$($info.ProductName)'" }
           Write-Host "Built $($info.ProductName) $($info.ProductVersion)"
+
+      - name: Run Apply-safety unit tests
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\.github\test\run-apply-safety-tests.ps1
 
       - name: Write beta release metadata
         shell: pwsh
@@ -79,7 +86,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: build
+    needs: [build, ci]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -101,11 +108,25 @@ jobs:
           VERSION="$(tr -d '\r\n' < release/version.txt)"
           [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){2,3}$ ]] || { echo "Bad version '$VERSION'"; exit 1; }
           INSTALLER="IPbind-Installer-v${VERSION}-beta.exe"
+          # Publish-job only: never republish a version that is already on the
+          # beta release (different contents under the same number). This is
+          # not run on PRs, where a previously shipped version would trip it.
+          if gh release view beta -R "$REPO" >/dev/null 2>&1; then
+            if gh release download beta -R "$REPO" --pattern version.txt --dir /tmp/pub-beta >/dev/null 2>&1; then
+              PUB="$(tr -d '\r\n' < /tmp/pub-beta/version.txt)"
+              if [[ "$PUB" == "$VERSION" ]]; then
+                echo "::error::Beta $VERSION is already on the beta release. Bump the version; never republish."
+                exit 1
+              fi
+            fi
+          fi
           BASE="https://github.com/${REPO}/releases/download/beta"
           NOTES="$(cat <<NOTES_EOF
           **Pre-release test build. Not for general use.** This is IPbind Beta ${VERSION}, built from commit ${SHA}.
 
-          IPbind Beta is a separate app: its own name, orange icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
+          IPbind Beta is a separate app: its own name, dark-gray and amber icon, install folder, shortcuts and settings (%APPDATA%\\IPbind Beta). It installs side by side with IPbind and never changes it. Beta copies update only from this pre-release; IPbind (prod) updates only from the Latest release.
+
+          Keep DHCP and Gateway support now sit together above Refresh, so turning on Gateway support no longer squeezes the gateway fields. Uninstall now stops first and asks whether to also remove your saved data. Nothing is removed until you click Uninstall, and Cancel leaves everything as it was.
 
           **Installer:** [${INSTALLER}](${BASE}/${INSTALLER})
 

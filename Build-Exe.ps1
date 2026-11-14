@@ -10,8 +10,9 @@
         Patch  : tiny change      2.1.101 -> 2.1.102 -> 2.1.103 ...
         Minor  : bigger change    2.1.x   -> 2.2.101 (reset patch to 101)
         Major  : reserved for large overhauls
-      The value below is stamped into Version.cs (assembly metadata +
-      the in-app title/footer) so the UI and Properties > Details match.
+      The value below is stamped into Version.cs (assembly metadata and
+      BuildInfo.Version). Beta UI/log lines show it with a trailing "b"
+      (DisplayVersion); assembly, file, and installer versions stay numeric.
 
     LOCK-PROOF: if IPbind.exe is locked (antivirus or a running instance)
     the compiler cannot overwrite it, so this script deletes it first and,
@@ -19,7 +20,7 @@
     binary to run.
 
     CHANNEL: -Channel prod (default) builds IPbind. -Channel beta builds the
-    separate "IPbind Beta" app (own name, orange icon app-beta.ico, own
+    separate "IPbind Beta" app (own name, dark-gray and amber icon app-beta.ico, own
     settings folder, updates only from the beta pre-release). CI uses beta
     only for the beta branch.
 
@@ -33,7 +34,7 @@ param(
 )
 
 # ==============================================================
-$Version = '2.3.128'     # <-- BUMP THIS each change (see scheme above)
+$Version = '2.3.141'     # <-- BUMP THIS each change (see scheme above)
 # ==============================================================
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -70,6 +71,9 @@ namespace IPbind
         public const string Version = "$Version";
         public const string Channel = "$Channel";
         public static readonly bool IsBeta = Channel == "beta";
+        // Shown in the title bar, About, footer, and log. Beta appends "b"
+        // (e.g. 2.3.132b). Parsed versions stay the numeric Version above.
+        public static readonly string DisplayVersion = IsBeta ? Version + "b" : Version;
         // Window/About name and the %APPDATA% / %LOCALAPPDATA% folder name.
         public const string AppName = "$appName";
         // GitHub release tag the updater reads from (version.txt, IPbind.exe, .sha256).
@@ -107,6 +111,7 @@ $cscArgs = @(
     "/out:$out"
     "/win32manifest:$man"
     '/optimize+'
+    '/warnaserror+'
     '/r:System.dll'
     '/r:System.Core.dll'
     '/r:System.Drawing.dll'
@@ -130,7 +135,7 @@ if (Test-Path $out) {
     Write-Host ""
     Write-Host ("Done:  {0}" -f $out) -ForegroundColor Green
     Write-Host ("The finished file reports version: {0}" -f $fi.ProductVersion) -ForegroundColor Green
-    Write-Host "Open it and confirm the title bar shows v$Version." -ForegroundColor Green
+    Write-Host ("Open it and confirm the title bar shows v{0}." -f ($(if ($Channel -eq 'beta') { "$Version" + 'b' } else { $Version }))) -ForegroundColor Green
 } else {
     Write-Error 'Build did not produce an exe - check the compiler output above (and the lock warning, if any).'
 }

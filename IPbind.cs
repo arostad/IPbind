@@ -3,7 +3,8 @@
 // Binds multiple static IPv4 addresses to a chosen LAN interface for reaching
 // air-gapped equipment web GUIs across different IP ranges, with one-click DHCP revert.
 // By default no gateway or DNS is set; optional Gateway support adds a gateway (with a
-// high route metric) and DNS servers for one chosen address. Local network configuration is the app's purpose; update checks are the
+// high route metric) and DNS servers for one chosen address. Keep DHCP (Windows 10 1703+)
+// adds the static addresses alongside the DHCP address instead of replacing it. Local network configuration is the app's purpose; update checks are the
 // only intentional outbound internet traffic.
 //
 // DPI handling: the layout is scaled explicitly in code from the real device DPI read
@@ -11,10 +12,15 @@
 // relying on WinForms auto-scaling. Version metadata is generated per-build in Version.cs.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
+using System.Globalization;
 using System.IO;
+using Microsoft.Win32;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -32,9 +38,15 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Andy Rostad")]
 [assembly: AssemblyCopyright("Copyright © 2026 Andy Rostad. MIT License.")]
 // AssemblyTitle / AssemblyProduct / AssemblyVersion / AssemblyFileVersion /
-// AssemblyInformationalVersion and BuildInfo (Version, Channel, AppName,
-// ReleaseTag) are generated fresh on every compile into Version.cs by
+// AssemblyInformationalVersion and BuildInfo (Version, Channel, DisplayVersion,
+// AppName, ReleaseTag) are generated fresh on every compile into Version.cs by
 // Build-Exe.ps1. -Channel beta builds the separate "IPbind Beta" app.
+// DisplayVersion is Version plus a trailing "b" in Beta, and every on-screen
+// version in Beta must use it (title bar, About, main-window update text,
+// console, prompts, installer wizard, and Apps & Features). Parsed versions,
+// version.txt, file versions, tags, and updater comparisons stay the numeric
+// Version (strip a trailing b if a display string is parsed). Prod display
+// is unchanged.
 
 namespace IPbind
 {
@@ -43,20 +55,786 @@ namespace IPbind
         [STAThread]
         static void Main(string[] args)
         {
-            if (UpdateChecker.TryRunApplyUpdate(args)) return;
-            UpdateChecker.BeginHelperCleanup(args);
-            InstalledVersionSync.Run();
+            DebugLog.Start();
+            try
+            {
+                if (UpdateChecker.TryRunApplyUpdate(args)) return;
+                UpdateChecker.BeginHelperCleanup(args);
+                InstalledVersionSync.Run();
 
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                WindowTheme.ApplyPreferredAppMode();
+                Application.Run(new MainForm());
+            }
+            finally
+            {
+                DebugLog.Stop();
+            }
+        }
+    }
+
+    static class DebugLog
+    {
+        public static readonly bool Enabled = BuildInfo.IsBeta;
+
+        const int KeepDays = 14;
+        const long MaxTotalBytes = 10L * 1024L * 1024L;
+        const int FlushEveryMs = 5000;
+        const int FlushAtCount = 500;
+        const int UiStallMs = 250;
+        const int PaintWarnPerMinute = 300;
+        const int FirstChanceMaxPerWindow = 20;
+        const int FirstChanceWindowMs = 10000;
+
+        static readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+        static readonly AutoResetEvent pulse = new AutoResetEvent(false);
+        static readonly object startGate = new object();
+        static readonly object diskGate = new object();
+        static Thread writer;
+        static volatile bool started;
+        static volatile bool stopping;
+        static string logDir;
+        static string logDirOverride;
+        static int queuedCount;
+        static int diskWrites;
+        static readonly System.Collections.Generic.List<int> diskWriteSizes = new System.Collections.Generic.List<int>();
+        static System.Threading.Timer rotateTimer;
+        static SynchronizationContext uiContext;
+        static int lastUiTick;
+        static int lastStallLogTick;
+        static Thread watchdog;
+        static System.Threading.Timer metricsTimer;
+        static System.Threading.Timer paintTimer;
+        static readonly List<PaintHook> paintHooks = new List<PaintHook>();
+        static readonly object hookGate = new object();
+        static readonly Queue<long> workingSets = new Queue<long>();
+        static readonly Queue<int> gdiCounts = new Queue<int>();
+        static readonly Queue<int> userCounts = new Queue<int>();
+        static int firstChanceCount;
+        static int firstChanceWindowStart;
+        static bool firstChanceSuppressed;
+        static readonly Dictionary<string, string> linkState = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        [DllImport("user32.dll")]
+        static extern int GetGuiResources(IntPtr hProcess, int flags);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buf, int len, out int ret);
+        [DllImport("shcore.dll")]
+        static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X, Y; }
+        [DllImport("user32.dll")]
+        static extern IntPtr MonitorFromPoint(POINT pt, int flags);
+
+        public static void Start()
+        {
+            if (!Enabled) return;
+            lock (startGate)
+            {
+                if (started) return;
+                started = true;
+            }
+            try
+            {
+                if (!string.IsNullOrEmpty(logDirOverride))
+                    logDir = logDirOverride;
+                else
+                    logDir = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        BuildInfo.AppName, "logs");
+                Directory.CreateDirectory(logDir);
+                Rotate(CurrentLogPath());
+                rotateTimer = new System.Threading.Timer(delegate
+                {
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(logDir)) Rotate(CurrentLogPath());
+                    }
+                    catch { }
+                }, null, 60 * 60 * 1000, 60 * 60 * 1000);
+            }
+            catch (Exception ex)
+            {
+                started = false;
+                try { System.Diagnostics.Debug.WriteLine("DebugLog start failed: " + ex.Message); } catch { }
+                return;
+            }
+
+            writer = new Thread(WriterLoop);
+            writer.IsBackground = true;
+            writer.Name = "IPbind-DebugLog";
+            writer.Start();
+
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += OnThreadException;
+            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+            AppDomain.CurrentDomain.FirstChanceException += OnFirstChance;
+
+            try
+            {
+                NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+                NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+            }
+            catch { }
+            try
+            {
+                SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+                SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+                SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            }
+            catch { }
+
+            lastUiTick = Environment.TickCount;
+            watchdog = new Thread(WatchdogLoop);
+            watchdog.IsBackground = true;
+            watchdog.Name = "IPbind-UiWatchdog";
+            watchdog.Start();
+
+            metricsTimer = new System.Threading.Timer(delegate { SampleMetrics(); }, null, 30 * 1000, 5 * 60 * 1000);
+            paintTimer = new System.Threading.Timer(delegate { ReportPaints(); }, null, 60 * 1000, 60 * 1000);
+
+            Write("INFO", "Debug log started (local only, never sent). fileDir=" + logDir);
+            LogStartup();
+            LogElevation();
+            Flush();
+        }
+
+        public static void Stop()
+        {
+            if (!Enabled || !started) return;
+            stopping = true;
+            try
+            {
+                Application.ThreadException -= OnThreadException;
+                AppDomain.CurrentDomain.UnhandledException -= OnUnhandledException;
+                AppDomain.CurrentDomain.FirstChanceException -= OnFirstChance;
+                NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
+                NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+                SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+                SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+                SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            }
+            catch { }
+            try { if (metricsTimer != null) metricsTimer.Dispose(); } catch { }
+            try { if (paintTimer != null) paintTimer.Dispose(); } catch { }
+            try { if (rotateTimer != null) rotateTimer.Dispose(); } catch { }
+            pulse.Set();
+            try { if (writer != null) writer.Join(2000); } catch { }
+            FlushToDisk();
+        }
+
+        // Test hook: redirect logs away from the real Beta logs folder.
+        public static void SetLogDirectoryForTest(string dir)
+        {
+            logDirOverride = dir;
+        }
+
+        public static int DiskWriteCount
+        {
+            get { return diskWrites; }
+        }
+
+        public static void ResetDiskWriteCount()
+        {
+            Interlocked.Exchange(ref diskWrites, 0);
+            lock (diskWriteSizes) { diskWriteSizes.Clear(); }
+        }
+
+        public static int[] DiskWriteSizes
+        {
+            get { lock (diskWriteSizes) { return diskWriteSizes.ToArray(); } }
+        }
+
+        public static int QueuedCount
+        {
+            get { return queuedCount; }
+        }
+
+        public static void Write(string level, string message)
+        {
+            if (!Enabled || !started) return;
+            if (message == null) message = "";
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)
+                + " " + level + " " + message;
+            queue.Enqueue(line);
+            int n = Interlocked.Increment(ref queuedCount);
+            // Do not pulse the writer for every line (SSD wear). ERROR flushes
+            // immediately; other levels wait for the 5 s loop or a 500-line batch.
+            if (level != null && string.Equals(level, "ERROR", StringComparison.OrdinalIgnoreCase))
+                FlushToDisk();
+            else if (n == FlushAtCount)
+                pulse.Set();
+        }
+
+        public static void Debug(string message) { Write("DEBUG", message); }
+        public static void Info(string message) { Write("INFO", message); }
+        public static void Warn(string message) { Write("WARN", message); }
+        public static void Error(string message) { Write("ERROR", message); }
+
+        public static void Exception(string where, System.Exception ex)
+        {
+            if (!Enabled || !started) return;
+            if (ex == null) { Write("ERROR", where + ": (null exception)"); return; }
+            Write("ERROR", where + ": " + ex.GetType().FullName + ": " + ex.Message + "\r\n" + ex.ToString());
+        }
+
+        public static void Flush()
+        {
+            if (!Enabled || !started) return;
+            FlushToDisk();
+        }
+
+        public static IDisposable Time(string name)
+        {
+            return new ActionTimer(name);
+        }
+
+        public static void WatchForm(Form form)
+        {
+            if (!Enabled || !started || form == null) return;
+            form.Load += delegate
+            {
+                uiContext = SynchronizationContext.Current;
+                LogForm("open", form);
+                HookPaints(form);
+                try { form.BeginInvoke(new MethodInvoker(delegate { Heartbeat(); })); } catch { }
+            };
+            form.FormClosed += delegate { LogForm("close", form); };
+            form.Shown += delegate { LogForm("shown", form); };
+        }
+
+        public static void Heartbeat()
+        {
+            lastUiTick = Environment.TickCount;
+            if (uiContext == null) uiContext = SynchronizationContext.Current;
+        }
+
+        public static void LogSettingsFile(string path, string action)
+        {
+            if (!Enabled || !started) return;
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    Write("INFO", "settings " + action + " missing " + path);
+                    return;
+                }
+                string body = File.ReadAllText(path);
+                if (body.Length > 8000) body = body.Substring(0, 8000) + "\r\n...[truncated]";
+                Write("INFO", "settings " + action + " " + path + " (" + body.Length + " chars)\r\n" + body);
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "settings " + action + " " + path + " failed: " + ex.Message);
+            }
+        }
+
+        public static void LogProc(string file, string args, int exit, string output, string stderr, long ms)
+        {
+            if (!Enabled || !started) return;
+            string err = string.IsNullOrEmpty(stderr) ? "" : " stderr=" + OneLine(stderr);
+            string outp = string.IsNullOrEmpty(output) ? "" : " stdout=" + OneLine(output);
+            Write("DEBUG", "proc " + file + " " + args + " exit=" + exit + " " + ms + "ms" + err + outp);
+        }
+
+        public static void LogHttp(string url, int status, string detail)
+        {
+            if (!Enabled || !started) return;
+            Write("INFO", "http GET " + url + " status=" + status + (string.IsNullOrEmpty(detail) ? "" : " " + detail));
+        }
+
+        static string OneLine(string s)
+        {
+            if (s == null) return "";
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (s.Length > 2000) s = s.Substring(0, 2000) + "...";
+            return s;
+        }
+
+        static int MonitorDpi(Screen screen)
+        {
+            try
+            {
+                POINT pt = new POINT();
+                pt.X = screen.Bounds.X + 1;
+                pt.Y = screen.Bounds.Y + 1;
+                IntPtr mon = MonitorFromPoint(pt, 2);
+                uint x, y;
+                if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0, out x, out y) == 0 && x > 0)
+                    return (int)x;
+            }
+            catch { }
+            return DpiWindow.SystemDpi();
+        }
+
+        static void LogStartup()
+        {
+            try
+            {
+                OperatingSystem os = Environment.OSVersion;
+                string osBuild = "";
+                try
+                {
+                    object v = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber", "");
+                    object ubr = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR", null);
+                    osBuild = (v ?? "").ToString();
+                    if (ubr != null) osBuild += "." + ubr.ToString();
+                }
+                catch { }
+                Write("INFO", "startup version=" + BuildInfo.DisplayVersion
+                    + " channel=" + BuildInfo.Channel
+                    + " os=" + os.VersionString
+                    + " build=" + osBuild
+                    + " bitness=" + (Environment.Is64BitProcess ? "64" : "32")
+                    + " clr=" + Environment.Version);
+                foreach (Screen screen in Screen.AllScreens)
+                {
+                    int dpi = MonitorDpi(screen);
+                    Write("INFO", "monitor " + (screen.Primary ? "primary" : "secondary")
+                        + " bounds=" + screen.Bounds
+                        + " work=" + screen.WorkingArea
+                        + " dpi=" + dpi
+                        + " scale=" + (dpi / 96f).ToString("0.##", CultureInfo.InvariantCulture));
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "startup probe failed: " + ex.Message);
+            }
+        }
+
+        static void LogElevation()
+        {
+            try
+            {
+                WindowsIdentity id = WindowsIdentity.GetCurrent();
+                WindowsPrincipal principal = new WindowsPrincipal(id);
+                bool admin = principal.IsInRole(WindowsBuiltInRole.Administrator);
+                int elevType = 0;
+                try
+                {
+                    int ret;
+                    IntPtr buf = Marshal.AllocHGlobal(4);
+                    try
+                    {
+                        if (GetTokenInformation(id.Token, 18, buf, 4, out ret) && ret >= 4)
+                            elevType = Marshal.ReadInt32(buf);
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+                catch { }
+                string typeName = elevType == 1 ? "Default" : elevType == 2 ? "Full" : elevType == 3 ? "Limited" : ("unknown-" + elevType);
+                Write("INFO", "elevation isAdmin=" + admin + " tokenType=" + typeName + " user=" + id.Name);
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "elevation probe failed: " + ex.Message);
+            }
+        }
+
+        static void LogForm(string action, Form form)
+        {
+            try
+            {
+                string title = form.Text ?? form.GetType().Name;
+                Rectangle b = form.Bounds;
+                Screen screen = null;
+                try { screen = Screen.FromControl(form); } catch { }
+                int dpi = DpiWindow.SystemDpi();
+                try { if (form.IsHandleCreated) { int w = DpiWindow.WindowDpi(form.Handle); if (w > 0) dpi = w; } } catch { }
+                Write("INFO", "form " + action + " type=" + form.GetType().Name
+                    + " title='" + title + "'"
+                    + " bounds=" + b
+                    + " monitor=" + (screen == null ? "?" : screen.DeviceName + " " + screen.Bounds)
+                    + " dpi=" + dpi
+                    + " scale=" + (dpi / 96f).ToString("0.##", CultureInfo.InvariantCulture));
+            }
+            catch (Exception ex)
+            {
+                Write("WARN", "form " + action + " log failed: " + ex.Message);
+            }
+        }
+
+        static string CurrentLogPath()
+        {
+            string name = "ipbind-beta-" + DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".log";
+            return Path.Combine(logDir, name);
+        }
+
+        static void WriterLoop()
+        {
+            while (true)
+            {
+                pulse.WaitOne(FlushEveryMs);
+                FlushToDisk();
+                while (queuedCount >= FlushAtCount)
+                    FlushToDisk();
+                if (stopping && queue.IsEmpty) break;
+            }
+        }
+
+        static void FlushToDisk()
+        {
+            if (string.IsNullOrEmpty(logDir)) return;
+            lock (diskGate)
+            {
+                string path = CurrentLogPath();
+                StringBuilder batch = new StringBuilder();
+                string line;
+                int taken = 0;
+                while (queue.TryDequeue(out line))
+                {
+                    batch.Append(line).Append("\r\n");
+                    taken++;
+                }
+                if (taken > 0) Interlocked.Add(ref queuedCount, -taken);
+                if (batch.Length == 0) return;
+                try
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(batch.ToString());
+                    using (FileStream fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read))
+                    {
+                        fs.Write(bytes, 0, bytes.Length);
+                        fs.Flush();
+                    }
+                    Interlocked.Increment(ref diskWrites);
+                    lock (diskWriteSizes) { diskWriteSizes.Add(taken); }
+                }
+                catch { }
+            }
+        }
+
+        static void Rotate(string currentPath)
+        {
+            try
+            {
+                DateTime cutoff = DateTime.Now.Date.AddDays(-KeepDays);
+                List<FileInfo> files = new List<FileInfo>();
+                foreach (string f in Directory.GetFiles(logDir, "ipbind-beta-*.log"))
+                    files.Add(new FileInfo(f));
+                files.Sort(delegate(FileInfo a, FileInfo b) { return a.LastWriteTime.CompareTo(b.LastWriteTime); });
+                long total = 0;
+                foreach (FileInfo fi in files) total += fi.Length;
+                foreach (FileInfo fi in files)
+                {
+                    bool old = fi.LastWriteTime < cutoff;
+                    bool over = total > MaxTotalBytes && !string.Equals(fi.FullName, currentPath, StringComparison.OrdinalIgnoreCase);
+                    if (!old && !over) continue;
+                    try
+                    {
+                        total -= fi.Length;
+                        fi.Delete();
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        static void WatchdogLoop()
+        {
+            while (!stopping)
+            {
+                Thread.Sleep(50);
+                HeartbeatKick();
+                if (uiContext == null) continue;
+                int idle = Environment.TickCount - lastUiTick;
+                if (idle > UiStallMs && lastUiTick != 0)
+                {
+                    int now = Environment.TickCount;
+                    if (now - lastStallLogTick > 2000)
+                    {
+                        lastStallLogTick = now;
+                        Write("WARN", "UI thread stall " + idle + "ms (threshold " + UiStallMs + "ms)");
+                    }
+                }
+            }
+        }
+
+        static void HeartbeatKick()
+        {
+            SynchronizationContext ctx = uiContext;
+            if (ctx == null) return;
+            try { ctx.Post(delegate { Heartbeat(); }, null); } catch { }
+        }
+
+        static void SampleMetrics()
+        {
+            if (stopping) return;
+            try
+            {
+                Process proc = Process.GetCurrentProcess();
+                proc.Refresh();
+                long ws = proc.WorkingSet64;
+                int gdi = 0, user = 0;
+                try { gdi = GetGuiResources(proc.Handle, 0); } catch { }
+                try { user = GetGuiResources(proc.Handle, 1); } catch { }
+                Write("DEBUG", "metrics workingSet=" + ws + " gdi=" + gdi + " user=" + user
+                    + " handles=" + proc.HandleCount + " threads=" + proc.Threads.Count);
+                lock (hookGate)
+                {
+                    workingSets.Enqueue(ws);
+                    gdiCounts.Enqueue(gdi);
+                    userCounts.Enqueue(user);
+                    while (workingSets.Count > 3) { workingSets.Dequeue(); gdiCounts.Dequeue(); userCounts.Dequeue(); }
+                    if (workingSets.Count == 3 && IsRising(workingSets) && IsRisingInt(gdiCounts) && IsRisingInt(userCounts))
+                        Write("WARN", "possible leak: working set, GDI, and USER handles all kept growing over the last 15 minutes (ws=" + ws + " gdi=" + gdi + " user=" + user + ")");
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("DEBUG", "metrics failed: " + ex.Message);
+            }
+        }
+
+        static bool IsRising(Queue<long> q)
+        {
+            long prev = -1;
+            foreach (long v in q)
+            {
+                if (prev >= 0 && v <= prev) return false;
+                prev = v;
+            }
+            return true;
+        }
+
+        static bool IsRisingInt(Queue<int> q)
+        {
+            int prev = -1;
+            foreach (int v in q)
+            {
+                if (prev >= 0 && v <= prev) return false;
+                prev = v;
+            }
+            return true;
+        }
+
+        static void ReportPaints()
+        {
+            if (stopping) return;
+            List<PaintHook> hooks;
+            lock (hookGate) hooks = new List<PaintHook>(paintHooks);
+            StringBuilder sb = new StringBuilder();
+            foreach (PaintHook hook in hooks)
+            {
+                int n = Interlocked.Exchange(ref hook.Counter.Value, 0);
+                if (n <= 0) continue;
+                sb.Append(hook.Name).Append("=").Append(n).Append(" ");
+                if (n >= PaintWarnPerMinute)
+                    Write("WARN", "paint loop? " + hook.Name + " painted " + n + " times in the last minute (threshold " + PaintWarnPerMinute + ")");
+            }
+            if (sb.Length > 0) Write("DEBUG", "paints/min " + sb.ToString().Trim());
+        }
+
+        public static void HookPaints(Control root)
+        {
+            if (!Enabled || !started || root == null) return;
+            HookOne(root);
+            foreach (Control child in root.Controls) HookPaints(child);
+        }
+
+        static void HookOne(Control c)
+        {
+            try
+            {
+                if (c.IsHandleCreated) AttachHook(c);
+                c.HandleCreated += delegate { AttachHook(c); };
+            }
+            catch { }
+        }
+
+        static void AttachHook(Control c)
+        {
+            try
+            {
+                if (!c.IsHandleCreated) return;
+                PaintHook hook = new PaintHook();
+                hook.Name = c.GetType().Name + (string.IsNullOrEmpty(c.Name) ? (string.IsNullOrEmpty(c.Text) ? "" : (":" + TrimName(c.Text))) : (":" + c.Name));
+                hook.AssignHandle(c.Handle);
+                lock (hookGate) paintHooks.Add(hook);
+            }
+            catch { }
+        }
+
+        static string TrimName(string s)
+        {
+            s = (s ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+            if (s.Length > 40) s = s.Substring(0, 40);
+            return s;
+        }
+
+        sealed class PaintCount
+        {
+            public int Value;
+        }
+
+        sealed class PaintHook : NativeWindow
+        {
+            public string Name = "";
+            public readonly PaintCount Counter = new PaintCount();
+            public int Count { get { return Counter.Value; } set { Counter.Value = value; } }
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == 0x000F) Interlocked.Increment(ref Counter.Value);
+                base.WndProc(ref m);
+            }
+        }
+
+        sealed class ActionTimer : IDisposable
+        {
+            readonly string name;
+            readonly Stopwatch watch;
+            public ActionTimer(string name)
+            {
+                this.name = name;
+                watch = Stopwatch.StartNew();
+            }
+            public void Dispose()
+            {
+                watch.Stop();
+                Write("DEBUG", "ui action '" + name + "' " + watch.ElapsedMilliseconds + "ms");
+                Heartbeat();
+            }
+        }
+
+        static void OnThreadException(object sender, ThreadExceptionEventArgs e)
+        {
+            Exception("Application.ThreadException", e.Exception);
+        }
+
+        static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            System.Exception ex = e.ExceptionObject as System.Exception;
+            if (ex == null) ex = new System.Exception(Convert.ToString(e.ExceptionObject));
+            Exception("AppDomain.UnhandledException (term=" + e.IsTerminating + ")", ex);
+        }
+
+        static void OnFirstChance(object sender, System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs e)
+        {
+            if (!Enabled || !started || e == null || e.Exception == null) return;
+            int now = Environment.TickCount;
+            if (now - firstChanceWindowStart > FirstChanceWindowMs)
+            {
+                firstChanceWindowStart = now;
+                firstChanceCount = 0;
+                firstChanceSuppressed = false;
+            }
+            firstChanceCount++;
+            if (firstChanceCount > FirstChanceMaxPerWindow)
+            {
+                if (!firstChanceSuppressed)
+                {
+                    firstChanceSuppressed = true;
+                    Write("DEBUG", "first-chance exceptions rate-limited (" + FirstChanceMaxPerWindow + " / " + (FirstChanceWindowMs / 1000) + "s)");
+                }
+                return;
+            }
+            System.Exception ex = e.Exception;
+            string loc = "?";
+            if (ex.TargetSite != null)
+                loc = (ex.TargetSite.DeclaringType != null ? ex.TargetSite.DeclaringType.FullName + "." : "") + ex.TargetSite.Name;
+            Write("DEBUG", "first-chance " + ex.GetType().FullName + " at " + loc + ": " + ex.Message);
+        }
+
+        static void OnNetworkAddressChanged(object sender, EventArgs e)
+        {
+            Write("INFO", "NetworkChange.NetworkAddressChanged");
+            LogLinkStates();
+        }
+
+        static void OnNetworkAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
+        {
+            Write("INFO", "NetworkChange.NetworkAvailabilityChanged available=" + e.IsAvailable);
+        }
+
+        static void LogLinkStates()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    string st = ni.OperationalStatus.ToString();
+                    string prev;
+                    lock (linkState)
+                    {
+                        if (!linkState.TryGetValue(ni.Id, out prev)) prev = null;
+                        linkState[ni.Id] = st;
+                    }
+                    if (prev != st)
+                        Write("INFO", "link " + (st == "Up" ? "up" : (st == "Down" ? "down" : st))
+                            + " name='" + ni.Name + "' id=" + ni.Id + " type=" + ni.NetworkInterfaceType
+                            + (prev == null ? " (first seen)" : (" was " + prev)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Write("DEBUG", "link probe failed: " + ex.Message);
+            }
+        }
+
+        static void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            Write("INFO", "SystemEvents.DisplaySettingsChanged");
+            LogStartup();
+        }
+
+        static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category == UserPreferenceCategory.VisualStyle
+                || e.Category == UserPreferenceCategory.Color
+                || e.Category == UserPreferenceCategory.General)
+            {
+                bool highContrast = false;
+                try { highContrast = SystemInformation.HighContrast; } catch { }
+                Write("INFO", "SystemEvents.UserPreferenceChanged category=" + e.Category + " highContrast=" + highContrast);
+            }
+        }
+
+        static void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            Write("INFO", "SystemEvents.PowerModeChanged " + e.Mode);
+        }
+    }
+
+    // Display-only Beta suffix. File versions, version.txt, tags, and compares
+    // stay numeric; strip a trailing "b" before parsing.
+    internal static class VersionText
+    {
+        public static string Numeric(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return version;
+            char last = version[version.Length - 1];
+            if (last == 'b' || last == 'B')
+            {
+                string trimmed = version.Substring(0, version.Length - 1);
+                System.Version parsed;
+                if (System.Version.TryParse(trimmed, out parsed))
+                    return trimmed;
+            }
+            return version;
+        }
+
+        public static string ForDisplay(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return version;
+            string numeric = Numeric(version);
+            if (BuildInfo.IsBeta) return numeric + "b";
+            return numeric;
+        }
+
+        public static bool TryParse(string version, out System.Version result)
+        {
+            return System.Version.TryParse(Numeric(version), out result);
         }
     }
 
     // The in-app updater swaps only the exe, so the installer's Apps & Features entry
     // (which winget reads) would keep the old version. On launch, an installed copy
-    // raises DisplayVersion to the running version. Portable copies, other users'
-    // installs and any error are skipped silently.
+    // raises DisplayVersion to the running display version (Beta includes the trailing
+    // "b"). Portable copies, other users' installs and any error are skipped silently.
+    // Never lowers the numeric version. A numeric 2.3.139 entry is rewritten as
+    // 2.3.139b on Beta so Settings > Installed apps matches the title bar.
     static class InstalledVersionSync
     {
         const string UninstallKeyFormat =
@@ -83,17 +861,32 @@ namespace IPbind
                             Path.GetFullPath(location).TrimEnd('\\'), dir.TrimEnd('\\'),
                             StringComparison.OrdinalIgnoreCase))
                         return;
-                    System.Version running, listed;
-                    if (!System.Version.TryParse(BuildInfo.Version, out running)) return;
                     string current = key.GetValue("DisplayVersion") as string;
-                    if (current != null && System.Version.TryParse(current, out listed)
-                        && listed >= running)
+                    string writeValue;
+                    if (!ShouldWrite(current, BuildInfo.Version, BuildInfo.DisplayVersion, out writeValue))
                         return;
-                    key.SetValue("DisplayVersion", BuildInfo.Version,
+                    key.SetValue("DisplayVersion", writeValue,
                         Microsoft.Win32.RegistryValueKind.String);
                 }
             }
             catch { }
+        }
+
+        // currentDisplay is the Apps & Features value (may be numeric or end in b).
+        // runningNumeric is BuildInfo.Version; runningDisplay is BuildInfo.DisplayVersion.
+        public static bool ShouldWrite(string currentDisplay, string runningNumeric, string runningDisplay, out string writeValue)
+        {
+            writeValue = runningDisplay;
+            if (string.Equals(currentDisplay, runningDisplay, StringComparison.Ordinal))
+                return false;
+            System.Version running, listed;
+            if (!VersionText.TryParse(runningNumeric, out running))
+                return false;
+            if (!string.IsNullOrEmpty(currentDisplay)
+                && VersionText.TryParse(currentDisplay, out listed)
+                && listed > running)
+                return false;
+            return true;
         }
     }
 
@@ -143,9 +936,41 @@ namespace IPbind
 
     class Adapter
     {
-        public string Name;
-        public string Description;
+        public string Name;         // Windows connection name (real ID); never tidied
+        public string Description;  // hardware description as Windows reports it
         public string Status;
+    }
+
+    // Display-only tidy for the interface dropdown. Matching, the remembered
+    // adapter, and every netsh/WMI call keep using Adapter.Name and the raw
+    // description; this string is never fed back into those paths.
+    public static class AdapterDisplay
+    {
+        public static string CleanDescription(string description)
+        {
+            if (string.IsNullOrEmpty(description)) return "";
+            string s = description;
+            // (R) / (TM), with or without spaces, any case; also the symbol forms.
+            s = Regex.Replace(s, @"\(\s*R\s*\)", " ", RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, @"\(\s*TM\s*\)", " ", RegexOptions.IgnoreCase);
+            s = s.Replace("®", " ").Replace("™", " ");
+            // Intel-style generation tags: "(16)", "(7)", "( 16 )". Parentheses
+            // that are part of a real model name (letters or punctuation) stay.
+            s = Regex.Replace(s, @"\(\s*\d+\s*\)", " ");
+            s = Regex.Replace(s, @"\s+", " ").Trim();
+            return s;
+        }
+
+        public static string Format(string name, string description, string status)
+        {
+            string n = name ?? "";
+            string d = CleanDescription(description);
+            string st = status ?? "";
+            string text = d.Length > 0
+                ? n + " | " + d + " [" + st + "]"
+                : n + " [" + st + "]";
+            return Regex.Replace(text, @"\s+", " ").Trim();
+        }
     }
 
     sealed class UpdateInfo
@@ -396,6 +1221,7 @@ namespace IPbind
                 {
                     byte[] buffer = new byte[81920];
                     long total = 0;
+                    long lastLogged = 0;
                     int read;
                     while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
                     {
@@ -404,7 +1230,13 @@ namespace IPbind
                             throw new InvalidOperationException(
                                 "The update download was unexpectedly large.");
                         output.Write(buffer, 0, read);
+                        if (total - lastLogged >= 256 * 1024)
+                        {
+                            lastLogged = total;
+                            DebugLog.Debug("updater download progress " + total + " bytes");
+                        }
                     }
+                    DebugLog.Info("updater download finished bytes=" + total);
                 }
             }
         }
@@ -487,8 +1319,11 @@ namespace IPbind
                     long size = new FileInfo(pending).Length;
                     if (size < MinExeBytes)
                         throw new InvalidOperationException("Download failed.");
+                    string actual = Sha256(pending);
+                    DebugLog.Info("updater sha256 expected=" + expectedHash + " actual=" + actual
+                        + (string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase) ? " ok" : " MISMATCH"));
                     if (string.Equals(
-                        Sha256(pending), expectedHash, StringComparison.OrdinalIgnoreCase))
+                        actual, expectedHash, StringComparison.OrdinalIgnoreCase))
                         return pending;
 
                     try { File.Delete(pending); } catch { }
@@ -507,6 +1342,24 @@ namespace IPbind
                 "The downloaded update failed its integrity check.");
         }
 
+        // Beta builds only: the prod Latest version, read straight from the GitHub
+        // latest release (never the Worker, so it adds no usage count). Used by About
+        // to show "Matches the current release" when beta and prod are the same version.
+        const string ProdLatestVersionUrl =
+            "https://github.com/arostad/IPbind/releases/download/latest/version.txt";
+
+        public static bool BetaMatchesProdLatest()
+        {
+            if (!BuildInfo.IsBeta) return false;
+            string remoteText;
+            Version remote;
+            string error;
+            Version current;
+            if (!TryReadVersion(ProdLatestVersionUrl, out remoteText, out remote, out error)) return false;
+            if (!Version.TryParse(BuildInfo.Version, out current)) return false;
+            return remote.CompareTo(current) == 0;
+        }
+
         public static UpdateInfo Check()
         {
             string remoteText;
@@ -519,10 +1372,13 @@ namespace IPbind
                 Version current;
                 if (!Version.TryParse(BuildInfo.Version, out current))
                     current = new Version(0, 0);
+                bool newer = remote.CompareTo(current) > 0;
+                DebugLog.Info("update check current=" + BuildInfo.Version + " remote=" + remoteText
+                    + " compare=" + (newer ? "newer" : "same-or-older"));
                 return new UpdateInfo
                 {
                     RemoteVersion = remoteText,
-                    IsNewer = remote.CompareTo(current) > 0,
+                    IsNewer = newer,
                     Error = null
                 };
             }
@@ -545,6 +1401,7 @@ namespace IPbind
             {
                 using (HttpResponseMessage response = GetTrusted(url))
                 {
+                    DebugLog.LogHttp(url, (int)response.StatusCode, "update-check");
                     response.EnsureSuccessStatusCode();
                     string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                     if (string.IsNullOrWhiteSpace(body))
@@ -717,11 +1574,13 @@ namespace IPbind
                 }
 
                 ApplyUpdate(args);
+                DebugLog.Info("update helper ApplyUpdate completed target=" + target);
                 if (!string.IsNullOrEmpty(errorFile))
                     try { File.Delete(errorFile); } catch { }
             }
             catch (Exception ex)
             {
+                DebugLog.Exception("update helper ApplyUpdate", ex);
                 if (!string.IsNullOrEmpty(errorFile))
                 {
                     try
@@ -818,6 +1677,62 @@ namespace IPbind
         [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
 
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        public static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subId);
+
+        // uxtheme ordinal 135 (Win10 1903+): 0=Default, 1=AllowDark, 2=ForceDark.
+        [DllImport("uxtheme.dll", EntryPoint = "#135")]
+        static extern int SetPreferredAppMode(int mode);
+
+        // uxtheme ordinal 133 (Win10 1809+).
+        [DllImport("uxtheme.dll", EntryPoint = "#133")]
+        static extern int AllowDarkModeForWindow(IntPtr hWnd, int allow);
+
+        [DllImport("user32.dll")]
+        static extern bool GetComboBoxInfo(IntPtr hwndCombo, ref ComboBoxInfo info);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT
+        {
+            public int Left, Top, Right, Bottom;
+            public Rectangle ToRectangle()
+            {
+                return Rectangle.FromLTRB(Left, Top, Right, Bottom);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ComboBoxInfo
+        {
+            public int cbSize;
+            public RECT rcItem;
+            public RECT rcButton;
+            public int stateButton;
+            public IntPtr hwndCombo;
+            public IntPtr hwndItem;
+            public IntPtr hwndList;
+        }
+
+        public static bool IsAppDark()
+        {
+            try
+            {
+                object v = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "AppsUseLightTheme", 1);
+                if (v is int) return ((int)v) == 0;   // 0 = dark, 1 = light
+            }
+            catch { }
+            return false;
+        }
+
+        // Call once before any window is created so combo lists and other
+        // common-controls popups can use DarkMode_CFD / DarkMode_Explorer.
+        public static void ApplyPreferredAppMode()
+        {
+            try { SetPreferredAppMode(IsAppDark() ? 2 : 0); } catch { }   // ForceDark or Default
+        }
+
         // Tint a form's non-client title bar after its handle has been created.
         public static void ApplyTitleBar(Form form, bool dark)
         {
@@ -831,122 +1746,1893 @@ namespace IPbind
             }
             catch { }
         }
+
+        public static bool TryGetComboBoxInfo(IntPtr hwnd, out ComboBoxInfo info)
+        {
+            info = new ComboBoxInfo();
+            info.cbSize = Marshal.SizeOf(typeof(ComboBoxInfo));
+            try { return hwnd != IntPtr.Zero && GetComboBoxInfo(hwnd, ref info); }
+            catch { return false; }
+        }
+
+        // DarkMode_Explorer does not style combo chrome (field, drop arrow, list).
+        // DarkMode_CFD does, on the combo HWND and on its dropdown list HWND.
+        public static void ApplyCombo(ComboBox box, bool dark)
+        {
+            if (box == null || !box.IsHandleCreated) return;
+            try { AllowDarkModeForWindow(box.Handle, dark ? 1 : 0); } catch { }
+            try { SetWindowTheme(box.Handle, dark ? "DarkMode_CFD" : null, null); } catch { }
+            ComboBoxInfo info;
+            if (!TryGetComboBoxInfo(box.Handle, out info)) return;
+            if (info.hwndItem != IntPtr.Zero)
+            {
+                try { AllowDarkModeForWindow(info.hwndItem, dark ? 1 : 0); } catch { }
+                try { SetWindowTheme(info.hwndItem, dark ? "DarkMode_CFD" : null, null); } catch { }
+            }
+            if (info.hwndList != IntPtr.Zero)
+            {
+                try { AllowDarkModeForWindow(info.hwndList, dark ? 1 : 0); } catch { }
+                try { SetWindowTheme(info.hwndList, dark ? "DarkMode_CFD" : null, null); } catch { }
+            }
+        }
     }
 
-    sealed class AboutForm : Form
+    // Main-window dropdown (LAN interface and "Use gateway on"). Owner-draw
+    // keeps the closed field free of the system-blue focus highlight. In dark
+    // mode the OS still paints a white field and arrow (especially when the
+    // box is empty and DrawItem never runs), so we theme with DarkMode_CFD and
+    // overpaint the closed chrome ourselves. Layout is unchanged.
+    sealed class ThemedComboBox : ComboBox
     {
-        readonly Button checkButton;
-        readonly Label statusLabel;
-        readonly float sc;
+        const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
+        const int WM_PRINTCLIENT = 0x0318;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+        public bool UseDarkChrome;
+        public int DebugPaintCount;
+
+        public ThemedComboBox()
+        {
+            DrawMode = DrawMode.OwnerDrawFixed;
+            DropDownStyle = ComboBoxStyle.DropDownList;
+        }
+
+        public void ApplyDark(bool dark)
+        {
+            UseDarkChrome = dark;
+            if (dark) FlatStyle = FlatStyle.Standard;
+            if (IsHandleCreated) WindowTheme.ApplyCombo(this, dark);
+            Invalidate();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+        }
+
+        protected override void OnDropDown(EventArgs e)
+        {
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+            base.OnDropDown(e);
+        }
+
+        protected override void OnDropDownClosed(EventArgs e)
+        {
+            base.OnDropDownClosed(e);
+            Invalidate();
+        }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            base.OnEnabledChanged(e);
+            if (UseDarkChrome) WindowTheme.ApplyCombo(this, true);
+            Invalidate();
+        }
+
+        // Dark closed chrome must be painted once, on the WM_PAINT DC.
+        // The 2.3.136 path called base.WndProc (system paints the light/hot
+        // chrome, then EndPaint) and then overpainted with Graphics.FromHwnd
+        // after EndPaint. A focused DropDownList is also repainted on
+        // mouse-move hot-track, so that two-pass paint flashed continuously
+        // and FromHwnd-after-EndPaint could invalidate and loop.
+        protected override void WndProc(ref Message m)
+        {
+            if (UseDarkChrome && m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (UseDarkChrome && m.Msg == WM_PAINT)
+            {
+                DebugPaintCount++;
+                PAINTSTRUCT ps = new PAINTSTRUCT();
+                IntPtr hdc = BeginPaint(Handle, ref ps);
+                try
+                {
+                    if (hdc != IntPtr.Zero)
+                    {
+                        using (Graphics g = Graphics.FromHdc(hdc))
+                            DrawClosedChrome(g);
+                    }
+                }
+                finally
+                {
+                    EndPaint(Handle, ref ps);
+                }
+                return;
+            }
+            if (UseDarkChrome && m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                DebugPaintCount++;
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    DrawClosedChrome(g);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void DrawClosedChrome(Graphics dest)
+        {
+            if (!IsHandleCreated) return;
+            Rectangle client = ClientRectangle;
+            if (client.Width <= 0 || client.Height <= 0) return;
+            try
+            {
+                using (Bitmap bmp = new Bitmap(client.Width, client.Height))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(BackColor);
+                    WindowTheme.ComboBoxInfo info;
+                    bool have = WindowTheme.TryGetComboBoxInfo(Handle, out info);
+                    Color field = BackColor;
+                    Color border = Color.FromArgb(80, 80, 80);
+                    Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
+
+                    using (SolidBrush brush = new SolidBrush(field))
+                    {
+                        g.FillRectangle(brush, client);
+                        if (have)
+                        {
+                            Rectangle button = info.rcButton.ToRectangle();
+                            if (button.Width <= 0)
+                                button = new Rectangle(
+                                    client.Right - Math.Max(16, client.Height),
+                                    client.Top, Math.Max(16, client.Height), client.Height);
+                            g.FillRectangle(brush, button);
+                            DrawChevron(g, button, fore);
+                        }
+                    }
+
+                    using (Pen pen = new Pen(border))
+                        g.DrawRectangle(pen, client.X, client.Y, client.Width - 1, client.Height - 1);
+
+                    string text = Text;
+                    if (string.IsNullOrEmpty(text) && SelectedIndex >= 0 && SelectedIndex < Items.Count)
+                        text = Items[SelectedIndex].ToString();
+                    Rectangle item = have ? info.rcItem.ToRectangle() : client;
+                    int pad = Math.Max(3, (int)Math.Round(3 * g.DpiX / 96f));
+                    Rectangle textBounds = new Rectangle(
+                        item.X + pad, item.Y,
+                        Math.Max(0, item.Width - pad * 2), item.Height);
+                    if (!string.IsNullOrEmpty(text) && textBounds.Width > 0)
+                    {
+                        TextRenderer.DrawText(
+                            g, text, Font, textBounds, fore,
+                            TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                            TextFormatFlags.NoPadding);
+                    }
+                    dest.DrawImageUnscaled(bmp, 0, 0);
+                }
+            }
+            catch { }
+        }
+
+        static void DrawChevron(Graphics g, Rectangle button, Color color)
+        {
+            if (button.Width <= 0 || button.Height <= 0) return;
+            int cx = button.X + button.Width / 2;
+            int cy = button.Y + button.Height / 2;
+            int w = Math.Max(3, button.Height / 5);
+            int h = Math.Max(2, button.Height / 7);
+            Point[] pts = new Point[]
+            {
+                new Point(cx - w, cy - h / 2),
+                new Point(cx + w, cy - h / 2),
+                new Point(cx, cy + h + h / 2)
+            };
+            SmoothingMode old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (SolidBrush brush = new SolidBrush(color))
+                g.FillPolygon(brush, pts);
+            g.SmoothingMode = old;
+        }
+    }
+
+    // Native sizing for the per-monitor dialogs (About, setup reminder). WinForms on
+    // .NET Framework turns a client size into a window size with AdjustWindowRectEx,
+    // which uses the frame metrics of the system DPI, not the window's own DPI, and it
+    // reads screens through a cache. On a monitor whose scale differs from the system
+    // scale that gives the wrong window size. These helpers size, place and measure
+    // the window in physical pixels for the DPI the window really has.
+    static class DpiWindow
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public int dwFlags; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X, Y; }
+
+        const int GWL_STYLE = -16, GWL_EXSTYLE = -20;
+        const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+        const int MONITOR_DEFAULTTONEAREST = 2;
+
+        [DllImport("user32.dll")] static extern int GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int GetDpiForSystem();
+        [DllImport("user32.dll")] static extern bool AdjustWindowRectExForDpi(ref RECT rect, int style, bool menu, int exStyle, int dpi);
+        [DllImport("user32.dll")] static extern bool AdjustWindowRectEx(ref RECT rect, int style, bool menu, int exStyle);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr hwnd, int index);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref RECT rect, int flags);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
+        [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+        public static readonly IntPtr PerMonitorV2 = new IntPtr(-4);
+
+        // Runs native calls in the window's own DPI context so no coordinate
+        // virtualization happens, whatever context the calling thread is in.
+        static IntPtr Enter(IntPtr hwnd)
+        {
+            try
+            {
+                IntPtr ctx = hwnd != IntPtr.Zero ? GetWindowDpiAwarenessContext(hwnd) : PerMonitorV2;
+                if (ctx == IntPtr.Zero) ctx = PerMonitorV2;
+                return SetThreadDpiAwarenessContext(ctx);
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        static void Leave(IntPtr previous)
+        {
+            if (previous == IntPtr.Zero) return;
+            try { SetThreadDpiAwarenessContext(previous); } catch { }
+        }
+
+        public static int WindowDpi(IntPtr hwnd)
+        {
+            try { return hwnd != IntPtr.Zero ? GetDpiForWindow(hwnd) : 0; }
+            catch { return 0; }
+        }
+
+        public static int SystemDpi()
+        {
+            try { int dpi = GetDpiForSystem(); if (dpi > 0) return dpi; }
+            catch { }
+            try { using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return (int)Math.Round(g.DpiX); }
+            catch { return 96; }
+        }
+
+        // Window size for a client size, using the frame metrics of the given DPI.
+        public static Size WindowSizeFor(IntPtr hwnd, Size client, int dpi)
+        {
+            RECT r = new RECT();
+            r.Right = client.Width;
+            r.Bottom = client.Height;
+            int style = GetWindowLong32(hwnd, GWL_STYLE);
+            int ex = GetWindowLong32(hwnd, GWL_EXSTYLE);
+            bool ok = false;
+            try { if (dpi > 0) ok = AdjustWindowRectExForDpi(ref r, style, false, ex, dpi); }
+            catch { ok = false; }
+            if (!ok)
+            {
+                r = new RECT();
+                r.Right = client.Width;
+                r.Bottom = client.Height;
+                AdjustWindowRectEx(ref r, style, false, ex);
+            }
+            return new Size(r.Right - r.Left, r.Bottom - r.Top);
+        }
+
+        public static Rectangle WorkAreaFor(IntPtr hwnd, Rectangle bounds)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r = new RECT();
+                r.Left = bounds.Left; r.Top = bounds.Top; r.Right = bounds.Right; r.Bottom = bounds.Bottom;
+                IntPtr mon = MonitorFromRect(ref r, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO info = new MONITORINFO();
+                info.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+                if (mon != IntPtr.Zero && GetMonitorInfo(mon, ref info))
+                    return Rectangle.FromLTRB(info.rcWork.Left, info.rcWork.Top, info.rcWork.Right, info.rcWork.Bottom);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Screen.PrimaryScreen.WorkingArea;
+        }
+
+        public static Rectangle Bounds(IntPtr hwnd)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (GetWindowRect(hwnd, out r)) return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Rectangle.Empty;
+        }
+
+        // Client rectangle in screen pixels.
+        public static Rectangle ClientBounds(IntPtr hwnd)
+        {
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (!GetClientRect(hwnd, out r)) return Rectangle.Empty;
+                POINT p = new POINT();
+                ClientToScreen(hwnd, ref p);
+                return new Rectangle(p.X, p.Y, r.Right - r.Left, r.Bottom - r.Top);
+            }
+            catch { return Rectangle.Empty; }
+            finally { Leave(prev); }
+        }
+
+        public static void SetBounds(IntPtr hwnd, Rectangle bounds)
+        {
+            IntPtr prev = Enter(hwnd);
+            try { SetWindowPos(hwnd, IntPtr.Zero, bounds.X, bounds.Y, bounds.Width, bounds.Height, SWP_NOZORDER | SWP_NOACTIVATE); }
+            catch { }
+            finally { Leave(prev); }
+        }
+
+        // Keep the whole window, title bar first, inside one work area.
+        public static Rectangle Clamp(Rectangle window, Rectangle work)
+        {
+            int x = window.X, y = window.Y;
+            if (x + window.Width > work.Right) x = work.Right - window.Width;
+            if (y + window.Height > work.Bottom) y = work.Bottom - window.Height;
+            if (x < work.Left) x = work.Left;
+            if (y < work.Top) y = work.Top;
+            return new Rectangle(x, y, window.Width, window.Height);
+        }
+
+        // Use around paint, layout, and WndProc so a PMv2 dialog inside a
+        // system-aware process is not coordinate-virtualized to the system DPI.
+        public static IntPtr EnterContext(IntPtr hwnd)
+        {
+            return hwnd == IntPtr.Zero ? IntPtr.Zero : Enter(hwnd);
+        }
+
+        public static void LeaveContext(IntPtr previous)
+        {
+            Leave(previous);
+        }
+
+        public static Size ClientPixelSize(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return Size.Empty;
+            IntPtr prev = Enter(hwnd);
+            try
+            {
+                RECT r;
+                if (GetClientRect(hwnd, out r)) return new Size(r.Right - r.Left, r.Bottom - r.Top);
+            }
+            catch { }
+            finally { Leave(prev); }
+            return Size.Empty;
+        }
+    }
+
+    // Base for the About and setup-reminder dialogs. The handle is created Per-Monitor
+    // V2 (IPbind itself stays system-DPI aware), the content is laid out in code at
+    // scale sc, and the window is sized natively so that its client area is exactly
+    // the laid-out content at the DPI the window really has. On WM_DPICHANGED the
+    // content is laid out at the new scale first, then the window is moved to the
+    // top-left of the suggested rectangle with a size computed for the new DPI, in a
+    // single SetWindowPos (no intermediate resize at the old position, which could
+    // flip the window back to the other monitor).
+    abstract class PerMonitorDialog : Form
+    {
+        const int WM_DPICHANGED = 0x02E0;
+        const int WM_ENTERSIZEMOVE = 0x0231;
+        const int WM_EXITSIZEMOVE = 0x0232;
+        const int WM_GETDPISCALEDSIZE = 0x02E4;
+
+        protected float sc = 1f;
+        bool followSystemScale;
+        Size layoutClient;
+        bool deferResize;
+        bool dpiChanging;
+        bool inSizeMove;
+        Rectangle layoutWork = Rectangle.Empty;
+        Rectangle layoutWorkUsed = Rectangle.Empty;
+        int pendingDpi;
+        Rectangle pendingRect;
+
+        // Test and diagnostics hooks (read by the UI harness).
+        public Size LayoutClientSize { get { return layoutClient; } }
+        public float LayoutScale { get { return sc; } }
+        public readonly List<string> DpiLog = new List<string>();
+        // When set (Width and Height > 0), CurrentWorkArea uses this instead of
+        // the real monitor, so a test can simulate a 4K screen vs a 1080p one.
+        public Rectangle SimulatedWorkArea;
+
+        public void RelayoutForTest()
+        {
+            LayoutContent();
+            if (IsHandleCreated) EnsureClientMatchesLayout("test-relayout");
+        }
+
+        protected abstract void LayoutContent();
+
+        // scale is MainForm's system-DPI scale in the app, or a test scale. Only a
+        // real system scale follows the window's own DPI when it is first shown.
+        protected void InitScale(float scale)
+        {
+            sc = scale > 0f ? scale : 1f;
+            followSystemScale = Math.Abs(sc - DpiWindow.SystemDpi() / 96f) < 0.01f;
+        }
+
+        protected int U(int value) { return (int)Math.Round(value * sc); }
+
+        static string regularFamily, semiboldFamily;
+
+        // The mockups were drawn in Segoe UI Variable Text (Windows 11), which is
+        // lighter and a little narrower than classic Segoe UI. Use it when it is
+        // installed; Windows 10 falls back to Segoe UI. Weights follow the mockups:
+        // 400 Regular, 600 the "... Semibold" family (Regular style), 700 Bold.
+        // GDI's FontStyle.Bold is 700, which read much heavier than the 600 asked for.
+        // px is already in device pixels (callers multiply by sc exactly once).
+        protected static Font NewUiFont(float px, FontStyle style, bool semibold)
+        {
+            if (regularFamily == null)
+            {
+                bool variable = HasFamily("Segoe UI Variable Text") && HasFamily("Segoe UI Variable Text Semibold");
+                regularFamily = variable ? "Segoe UI Variable Text" : "Segoe UI";
+                semiboldFamily = variable ? "Segoe UI Variable Text Semibold"
+                    : (HasFamily("Segoe UI Semibold") ? "Segoe UI Semibold" : null);
+            }
+            if (semibold && semiboldFamily != null)
+                return new Font(semiboldFamily, px, style & ~FontStyle.Bold, GraphicsUnit.Pixel);
+            if (semibold) style |= FontStyle.Bold;
+            return new Font(regularFamily, px, style, GraphicsUnit.Pixel);
+        }
+
+        static bool HasFamily(string name)
+        {
+            try
+            {
+                using (Font f = new Font(name, 12f, FontStyle.Regular, GraphicsUnit.Pixel))
+                    return string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        int CurrentDpi()
+        {
+            int dpi = IsHandleCreated ? DpiWindow.WindowDpi(Handle) : 0;
+            return dpi > 0 ? dpi : DpiWindow.SystemDpi();
+        }
+
+        // Work area the layout must fit: the target monitor during a DPI change,
+        // otherwise the monitor the window is on. A test can override the real
+        // monitor with SimulatedWorkArea (for example a 4K screen on a 1080p runner).
+        protected Rectangle CurrentWorkArea()
+        {
+            if (!layoutWork.IsEmpty) return layoutWork;
+            return DestinationWorkArea(Rectangle.Empty);
+        }
+
+        // Prefer the test hook when it is set, so ApplyDpi / clamp / OnShown do
+        // not fall back to the runner's real 1080p work area and wrongly widen
+        // or clip a simulated 4K layout (CI dpirtrip on 2.3.140, SHA 73a4e91).
+        Rectangle DestinationWorkArea(Rectangle suggested)
+        {
+            if (SimulatedWorkArea.Width > 0 && SimulatedWorkArea.Height > 0)
+                return SimulatedWorkArea;
+            if (IsHandleCreated)
+            {
+                Rectangle hint = suggested.IsEmpty ? DpiWindow.Bounds(Handle) : suggested;
+                return DpiWindow.WorkAreaFor(Handle, hint);
+            }
+            return Screen.PrimaryScreen.WorkingArea;
+        }
+
+        // Frame size (window minus client) at the window's DPI.
+        protected Size ChromeSize()
+        {
+            if (!IsHandleCreated)
+                return new Size(SystemInformation.FixedFrameBorderSize.Width * 2,
+                    SystemInformation.CaptionHeight + SystemInformation.FixedFrameBorderSize.Height * 2);
+            Size client = new Size(200, 200);
+            Size win = DpiWindow.WindowSizeFor(Handle, client, CurrentDpi());
+            return new Size(Math.Max(0, win.Width - client.Width), Math.Max(0, win.Height - client.Height));
+        }
+
+        // Call at the end of LayoutContent instead of setting ClientSize.
+        protected void SetLayoutClientSize(Size client)
+        {
+            layoutClient = client;
+            layoutWorkUsed = CurrentWorkArea();
+            if (!IsHandleCreated) { ClientSize = client; return; }
+            if (deferResize) return;
+            Size win = DpiWindow.WindowSizeFor(Handle, client, CurrentDpi());
+            Rectangle b = DpiWindow.Bounds(Handle);
+            DpiWindow.SetBounds(Handle, new Rectangle(b.X, b.Y, win.Width, win.Height));
+        }
+
+        protected void FitOnScreen()
+        {
+            if (!IsHandleCreated) return;
+            Rectangle b = DpiWindow.Bounds(Handle);
+            Rectangle work = DestinationWorkArea(b);
+            Rectangle fit = DpiWindow.Clamp(b, work);
+            if (fit != b) DpiWindow.SetBounds(Handle, fit);
+        }
+
+        protected override void CreateHandle()
+        {
+            IntPtr previous = IntPtr.Zero;
+            bool changed = false;
+            try
+            {
+                previous = SetThreadDpiAwarenessContext(DpiWindow.PerMonitorV2);
+                changed = previous != IntPtr.Zero && previous != DpiWindow.PerMonitorV2;
+            }
+            catch { }
+            try { base.CreateHandle(); }
+            finally
+            {
+                if (changed)
+                {
+                    try { SetThreadDpiAwarenessContext(previous); } catch { }
+                }
+            }
+        }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+
+        protected override void OnShown(EventArgs e)
+        {
+            // Opened on a monitor whose scale is not the system scale (for example
+            // IPbind sits on a 100% secondary while the main screen is 150%): no
+            // WM_DPICHANGED arrives, so adopt the window's real DPI here.
+            if (followSystemScale && IsHandleCreated)
+            {
+                int dpi = DpiWindow.WindowDpi(Handle);
+                if (dpi > 0 && Math.Abs(dpi / 96f - sc) > 0.001f)
+                {
+                    Rectangle b = DpiWindow.Bounds(Handle);
+                    Log("shown: window dpi " + dpi + " differs from scale " + sc);
+                    ApplyDpi(dpi, b, false);
+                }
+            }
+            if (IsHandleCreated && !dpiChanging)
+            {
+                // The first layout ran before the window existed, against the
+                // primary screen's work area. If the dialog opened on a monitor
+                // with a different work area, lay it out again for that one.
+                Rectangle b = DpiWindow.Bounds(Handle);
+                Rectangle work = DestinationWorkArea(b);
+                if (!work.IsEmpty && work != layoutWorkUsed)
+                {
+                    Log("shown: work area " + work + " differs from layout work area " + layoutWorkUsed);
+                    ApplyDpi((int)Math.Round(sc * 96f), b, true, true);
+                }
+            }
+            base.OnShown(e);
+            EnsureClientMatchesLayout("shown");
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            IntPtr prev = IsHandleCreated ? DpiWindow.EnterContext(Handle) : IntPtr.Zero;
+            try
+            {
+                WndProcCore(ref m);
+            }
+            finally { DpiWindow.LeaveContext(prev); }
+        }
+
+        void WndProcCore(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                Rectangle suggested = Rectangle.Empty;
+                if (m.LParam != IntPtr.Zero)
+                {
+                    DpiWindow.RECT r = (DpiWindow.RECT)Marshal.PtrToStructure(m.LParam, typeof(DpiWindow.RECT));
+                    suggested = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+                }
+                if (suggested.IsEmpty && IsHandleCreated) suggested = DpiWindow.Bounds(Handle);
+                Size oldSize = Size;
+                int oldDpi = 0;
+                try { oldDpi = DpiWindow.WindowDpi(Handle); } catch { }
+                OnDpiMessage(dpi, suggested);
+                DebugLog.Info("WM_DPICHANGED " + GetType().Name + " oldDpi=" + oldDpi + " newDpi=" + dpi
+                    + " oldSize=" + oldSize + " newSize=" + Size + " suggested=" + suggested);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_GETDPISCALEDSIZE && m.LParam != IntPtr.Zero && !dpiChanging)
+            {
+                // Sent just before WM_DPICHANGED. Lay out at the new scale now and
+                // report the exact window size, so the rectangle Windows suggests
+                // (and the one a drag in progress keeps using) already fits the
+                // content instead of a linear guess from the old size.
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (dpi > 0)
+                {
+                    SuspendLayout();
+                    deferResize = true;
+                    // This message arrives before the window moves, so the
+                    // current work area is still the old monitor. Do not widen
+                    // or tighten against that; ApplyDpi re-lays out against the
+                    // destination work area once WM_DPICHANGED supplies it.
+                    layoutWork = new Rectangle(0, 0, 16384, 16384);
+                    try
+                    {
+                        sc = dpi / 96f;
+                        LayoutContent();
+                    }
+                    finally
+                    {
+                        layoutWork = Rectangle.Empty;
+                        deferResize = false;
+                        ResumeLayout(false);
+                    }
+                    Size win = DpiWindow.WindowSizeFor(Handle, layoutClient, dpi);
+                    Marshal.WriteInt32(m.LParam, 0, win.Width);
+                    Marshal.WriteInt32(m.LParam, 4, win.Height);
+                    Log("scaled-size dpi " + dpi + " -> " + win);
+                    m.Result = (IntPtr)1;
+                    return;
+                }
+            }
+            if (m.Msg == WM_ENTERSIZEMOVE) inSizeMove = true;
+            if (m.Msg == WM_EXITSIZEMOVE)
+            {
+                inSizeMove = false;
+                base.WndProc(ref m);
+                // After a drag, make sure the content scale matches the monitor
+                // and the whole dialog, title bar included, is on that monitor.
+                int dpi = DpiWindow.WindowDpi(Handle);
+                if (dpi > 0 && Math.Abs(dpi / 96f - sc) > 0.001f)
+                    ApplyDpi(dpi, DpiWindow.Bounds(Handle), true);
+                EnsureClientMatchesLayout("exit-size-move");
+                FitOnScreen();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void OnDpiMessage(int dpi, Rectangle suggested)
+        {
+            if (dpi <= 0) return;
+            if (dpiChanging)
+            {
+                // A nested change (the window crossed back while we resized it):
+                // remember the latest one and apply it after the current pass.
+                pendingDpi = dpi;
+                pendingRect = suggested;
+                return;
+            }
+            ApplyDpi(dpi, suggested, !inSizeMove);
+        }
+
+        void ApplyDpi(int dpi, Rectangle suggested, bool clamp)
+        {
+            ApplyDpi(dpi, suggested, clamp, false);
+        }
+
+        void ApplyDpi(int dpi, Rectangle suggested, bool clamp, bool relayout)
+        {
+            dpiChanging = true;
+            try
+            {
+                for (int pass = 0; pass < 4 && dpi > 0; pass++)
+                {
+                    pendingDpi = 0;
+                    Log("dpi " + dpi + " suggested " + suggested + " clamp=" + clamp);
+                    Rectangle work = DestinationWorkArea(suggested);
+                    float newSc = dpi / 96f;
+                    SuspendLayout();
+                    deferResize = true;
+                    layoutWork = work;
+                    try
+                    {
+                        // Always re-lay out. WM_GETDPISCALEDSIZE may already have
+                        // set sc and laid out against the old monitor's work area;
+                        // skipping here left the popup far too wide after a
+                        // 100% -> high-scale return trip (Andy's 2.3.139 catch).
+                        sc = newSc;
+                        LayoutContent();
+                        relayout = false;
+                    }
+                    finally
+                    {
+                        deferResize = false;
+                        layoutWork = Rectangle.Empty;
+                        ResumeLayout(false);
+                    }
+                    int frameDpi = DpiWindow.WindowDpi(Handle);
+                    if (frameDpi <= 0) frameDpi = dpi;
+                    Size win = DpiWindow.WindowSizeFor(Handle, layoutClient, frameDpi);
+                    Rectangle target = new Rectangle(suggested.X, suggested.Y, win.Width, win.Height);
+                    if (clamp) target = DpiWindow.Clamp(target, work);
+                    DpiWindow.SetBounds(Handle, target);
+                    Log("placed " + DpiWindow.Bounds(Handle) + " client " + DpiWindow.ClientBounds(Handle).Size
+                        + " layout " + layoutClient + " frameDpi " + frameDpi);
+                    PerformLayout();
+                    if (pendingDpi <= 0) break;
+                    dpi = pendingDpi;
+                    suggested = pendingRect;
+                }
+            }
+            finally { dpiChanging = false; pendingDpi = 0; }
+            Invalidate(true);
+            if (IsHandleCreated)
+                BeginInvoke((MethodInvoker)delegate { EnsureClientMatchesLayout("after-dpi"); });
+        }
+
+        // Safety net: if anything left the client area different from the laid-out
+        // content (for example a frame size from the wrong DPI), resize to match.
+        void EnsureClientMatchesLayout(string why)
+        {
+            if (!IsHandleCreated || IsDisposed || layoutClient.IsEmpty) return;
+            Size client = DpiWindow.ClientBounds(Handle).Size;
+            if (client == layoutClient) return;
+            Rectangle b = DpiWindow.Bounds(Handle);
+            Size win = new Size(b.Width + layoutClient.Width - client.Width, b.Height + layoutClient.Height - client.Height);
+            Rectangle target = new Rectangle(b.X, b.Y, win.Width, win.Height);
+            if (!inSizeMove) target = DpiWindow.Clamp(target, DestinationWorkArea(b));
+            DpiWindow.SetBounds(Handle, target);
+            Log(why + ": client was " + client + ", fixed to " + DpiWindow.ClientBounds(Handle).Size);
+        }
+
+        void Log(string line)
+        {
+            if (DpiLog.Count < 200) DpiLog.Add(line);
+        }
+    }
+
+    // 20 CSS-px checkbox for Per-Monitor V2 dialogs (About and the DHCP reminder).
+    // The themed WinForms glyph is sized at the process (system) DPI, so on a PMv2
+    // dialog it looks right on the system-DPI monitor and blows out or shrinks after
+    // a drag to a monitor at a different scale (Andy, 2.3.135, About on a 100%
+    // secondary). This control paints the box and check from the HWND's current
+    // pixel size so a stale scale cannot overflow the square.
+    // Shared dark-mode checkbox chrome. Unchecked boxes use a dark gray fill
+    // and a slightly lighter border; hover is a touch lighter; disabled is
+    // dimmer. Checked stays the caller's blue with a white (or given) check.
+    // Painted once onto the WM_PAINT DC; callers must never Invalidate from paint.
+    static class CheckBoxChrome
+    {
+        public static readonly Color DarkFill = Color.FromArgb(0x3A, 0x3A, 0x3C);
+        public static readonly Color DarkBorder = Color.FromArgb(0x6E, 0x6E, 0x73);
+        public static readonly Color DarkHoverFill = Color.FromArgb(0x48, 0x48, 0x4A);
+        public static readonly Color DarkHoverBorder = Color.FromArgb(0x8E, 0x8E, 0x93);
+        public static readonly Color DarkDisabledFill = Color.FromArgb(0x2C, 0x2C, 0x2E);
+        public static readonly Color DarkDisabledBorder = Color.FromArgb(0x55, 0x55, 0x58);
+        public static readonly Color DarkDisabledCheck = Color.FromArgb(0x40, 0x7A, 0x9A);
+        public static readonly Color LightFill = Color.White;
+        public static readonly Color LightBorder = Color.FromArgb(0x5A, 0x5A, 0x5A);
+
+        public static void DrawBox(Graphics g, Rectangle box, int radius, float penWidth,
+            bool isChecked, bool hot, bool enabled, bool dark, Color checkedFill, Color checkMark)
+        {
+            Color fill, border;
+            if (isChecked)
+            {
+                fill = enabled ? checkedFill : (dark ? DarkDisabledCheck : Color.FromArgb(0xA0, 0xA0, 0xA0));
+                border = fill;
+            }
+            else if (!enabled)
+            {
+                fill = dark ? DarkDisabledFill : Color.FromArgb(0xF0, 0xF0, 0xF0);
+                border = dark ? DarkDisabledBorder : Color.FromArgb(0xB0, 0xB0, 0xB0);
+            }
+            else if (hot)
+            {
+                fill = dark ? DarkHoverFill : Color.FromArgb(0xF3, 0xF3, 0xF3);
+                border = dark ? DarkHoverBorder : LightBorder;
+            }
+            else
+            {
+                fill = dark ? DarkFill : LightFill;
+                border = dark ? DarkBorder : LightBorder;
+            }
+            using (GraphicsPath path = Rounded(box, radius))
+            {
+                using (SolidBrush brush = new SolidBrush(fill)) g.FillPath(brush, path);
+                using (Pen pen = new Pen(border, Math.Max(1f, penWidth)))
+                    g.DrawPath(pen, path);
+            }
+            if (isChecked) DrawCheck(g, box, enabled ? checkMark : Color.FromArgb(0xE0, 0xE0, 0xE0));
+        }
+
+        public static void DrawCheck(Graphics g, Rectangle box, Color color)
+        {
+            float w = box.Width, h = box.Height;
+            PointF[] mark = new PointF[]
+            {
+                new PointF(box.X + w * 0.22f, box.Y + h * 0.52f),
+                new PointF(box.X + w * 0.42f, box.Y + h * 0.72f),
+                new PointF(box.X + w * 0.78f, box.Y + h * 0.30f)
+            };
+            using (Pen pen = new Pen(color, Math.Max(1.6f, box.Width * 2f / 20f)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                g.DrawLines(pen, mark);
+            }
+        }
+
+        public static GraphicsPath Rounded(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    sealed class RoundCheckBox : CheckBox
+    {
+        public const int DesignBox = 20;
+        public const int DesignRing = 3;
+        public const int DesignSide = DesignBox + 2 * DesignRing;
+        const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
+        const int WM_PRINTCLIENT = 0x0318;
+
+        public Color Surface = Color.Black, BoxFill = Color.White, BoxBorder = Color.Gray;
+        public Color CheckedFill = Color.DodgerBlue, CheckMark = Color.Black, FocusColor = Color.White;
+        public Color HoverFill, HoverBorder, DisabledFill, DisabledBorder;
+        public bool DarkChrome;
+        bool hot;
+
+        public static int RingFor(float scale) { return Math.Max(2, (int)Math.Round(DesignRing * scale)); }
+
+        public static int SideFor(float scale)
+        {
+            return Math.Max(1, (int)Math.Round(DesignBox * scale)) + 2 * RingFor(scale);
+        }
+
+        public RoundCheckBox()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            AutoSize = false;
+            UseMnemonic = false;
+            UseCompatibleTextRendering = false;
+            Text = "";
+            Cursor = Cursors.Hand;
+        }
+
+        public void ApplyDialogColors(Color surface, Color fore, Color checkedFill, Color checkMark, bool dark)
+        {
+            Surface = surface;
+            DarkChrome = dark;
+            if (dark)
+            {
+                BoxFill = CheckBoxChrome.DarkFill;
+                BoxBorder = CheckBoxChrome.DarkBorder;
+                HoverFill = CheckBoxChrome.DarkHoverFill;
+                HoverBorder = CheckBoxChrome.DarkHoverBorder;
+                DisabledFill = CheckBoxChrome.DarkDisabledFill;
+                DisabledBorder = CheckBoxChrome.DarkDisabledBorder;
+            }
+            else
+            {
+                BoxFill = CheckBoxChrome.LightFill;
+                BoxBorder = CheckBoxChrome.LightBorder;
+                HoverFill = Color.FromArgb(0xF3, 0xF3, 0xF3);
+                HoverBorder = CheckBoxChrome.LightBorder;
+                DisabledFill = Color.FromArgb(0xF0, 0xF0, 0xF0);
+                DisabledBorder = Color.FromArgb(0xB0, 0xB0, 0xB0);
+            }
+            CheckedFill = checkedFill;
+            CheckMark = checkMark;
+            FocusColor = fore;
+            Invalidate();
+        }
+
+        protected override void OnCheckedChanged(EventArgs e)
+        {
+            base.OnCheckedChanged(e);
+            Invalidate();
+        }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (!hot) { hot = true; Invalidate(); } }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (hot) { hot = false; Invalidate(); } }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+
+        // Paint once on the WM_PAINT DC. Do not call base (which would let the
+        // system paint a bright-white box) and never Invalidate from paint.
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (m.Msg == WM_PAINT)
+            {
+                ThemedComboBoxPaint(Handle);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    PaintBoxOn(g);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // BeginPaint/EndPaint live on ThemedComboBox; use the same pattern locally.
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+        void ThemedComboBoxPaint(IntPtr hwnd)
+        {
+            PAINTSTRUCT ps = new PAINTSTRUCT();
+            IntPtr hdc = BeginPaint(hwnd, ref ps);
+            try
+            {
+                if (hdc != IntPtr.Zero)
+                {
+                    using (Graphics g = Graphics.FromHdc(hdc))
+                        PaintBoxOn(g);
+                }
+            }
+            finally { EndPaint(hwnd, ref ps); }
+        }
+
+        void PaintBoxOn(Graphics dest)
+        {
+            int width = Width, height = Height;
+            IntPtr prev = IntPtr.Zero;
+            if (IsHandleCreated)
+            {
+                prev = DpiWindow.EnterContext(Handle);
+                Size px = DpiWindow.ClientPixelSize(Handle);
+                if (px.Width > 0) width = px.Width;
+                if (px.Height > 0) height = px.Height;
+            }
+            try
+            {
+                if (width <= 0 || height <= 0) return;
+                using (Bitmap bmp = new Bitmap(width, height))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    PaintBox(g, width, height);
+                    dest.DrawImageUnscaled(bmp, 0, 0);
+                }
+            }
+            finally { DpiWindow.LeaveContext(prev); }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            // WM_PAINT is handled in WndProc so the system never paints a white box.
+        }
+
+        void PaintBox(Graphics g, int width, int height)
+        {
+            g.ResetTransform();
+            g.PageUnit = GraphicsUnit.Pixel;
+            g.Clear(Surface);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            int side = Math.Min(width, height);
+            if (side < 8) return;
+            float paintScale = side / (float)DesignSide;
+            int ring = Math.Max(2, (int)Math.Round(DesignRing * paintScale));
+            int boxSide = Math.Max(4, side - 2 * ring - 1);
+            Rectangle box = new Rectangle((width - boxSide) / 2, (height - boxSide) / 2, boxSide, boxSide);
+            int rad = Math.Max(2, (int)Math.Round(3 * paintScale));
+            CheckBoxChrome.DrawBox(g, box, rad, paintScale, Checked, hot, Enabled, DarkChrome, CheckedFill, CheckMark);
+            if (Focused && ShowFocusCues)
+            {
+                Rectangle outer = new Rectangle(0, 0, width - 1, height - 1);
+                using (GraphicsPath focus = CheckBoxChrome.Rounded(outer, rad + ring))
+                using (Pen pen = new Pen(FocusColor, Math.Max(1f, paintScale)))
+                    g.DrawPath(pen, focus);
+            }
+        }
+
+        static GraphicsPath RoundedBox(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    // Main-window checkbox (Keep DHCP, Gateway support, Show all adapters).
+    // In dark mode the box is owner-drawn with CheckBoxChrome; in light mode
+    // the system checkbox is left alone so layout and TextInkRight stay the same.
+    // Paint once on the WM_PAINT DC; never Invalidate from paint.
+    sealed class ThemedCheckBox : CheckBox
+    {
+        const int WM_PAINT = 0x000F;
+        const int WM_ERASEBKGND = 0x0014;
+        const int WM_PRINTCLIENT = 0x0318;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct PAINTSTRUCT
+        {
+            public IntPtr hdc;
+            public int fErase;
+            public int left, top, right, bottom;
+            public int fRestore;
+            public int fIncUpdate;
+            public int r0, r1, r2, r3, r4, r5, r6, r7;
+        }
+        [DllImport("user32.dll")]
+        static extern IntPtr BeginPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+        [DllImport("user32.dll")]
+        static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+        public bool UseDarkChrome;
+        bool hot;
+        int cachedTextLeft = -1;
+        int cachedBearing = 0;
+        int cacheW, cacheH;
+        string cacheText;
+        Font cacheFont;
+
+        public void ApplyDark(bool dark)
+        {
+            UseDarkChrome = dark;
+            Invalidate();
+        }
+
+        protected override void OnCheckedChanged(EventArgs e) { base.OnCheckedChanged(e); Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            if (UseDarkChrome && !hot) { hot = true; Invalidate(); }
+        }
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (UseDarkChrome && hot) { hot = false; Invalidate(); }
+        }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); if (UseDarkChrome) Invalidate(); }
+        protected override void OnSizeChanged(EventArgs e) { cachedTextLeft = -1; base.OnSizeChanged(e); }
+        protected override void OnFontChanged(EventArgs e) { cachedTextLeft = -1; base.OnFontChanged(e); }
+        protected override void OnTextChanged(EventArgs e) { cachedTextLeft = -1; base.OnTextChanged(e); }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (!UseDarkChrome)
+            {
+                base.WndProc(ref m);
+                return;
+            }
+            if (m.Msg == WM_ERASEBKGND)
+            {
+                m.Result = (IntPtr)1;
+                return;
+            }
+            if (m.Msg == WM_PAINT)
+            {
+                PAINTSTRUCT ps = new PAINTSTRUCT();
+                IntPtr hdc = BeginPaint(Handle, ref ps);
+                try
+                {
+                    if (hdc != IntPtr.Zero)
+                    {
+                        using (Graphics g = Graphics.FromHdc(hdc))
+                            PaintChrome(g);
+                    }
+                }
+                finally { EndPaint(Handle, ref ps); }
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+            {
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                    PaintChrome(g);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        void PaintChrome(Graphics dest)
+        {
+            Rectangle client = ClientRectangle;
+            if (client.Width <= 0 || client.Height <= 0) return;
+            try
+            {
+                using (Bitmap bmp = new Bitmap(Math.Max(1, client.Width), Math.Max(1, client.Height)))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(BackColor);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    int glyph = Math.Max(13, (int)Math.Round(13f * (g.DpiX / 96f)));
+                    if (glyph > client.Height - 2) glyph = Math.Max(12, client.Height - 2);
+                    int boxY = client.Top + (client.Height - glyph) / 2;
+                    Rectangle box = new Rectangle(client.Left + 1, boxY, glyph, glyph);
+                    int rad = Math.Max(2, (int)Math.Round(2f * g.DpiX / 96f));
+                    Color checkFill = Color.FromArgb(0x00, 0x63, 0xB1);
+                    CheckBoxChrome.DrawBox(g, box, rad, 1f, Checked, hot, Enabled, true, checkFill, Color.White);
+                    int textX = SystemTextOrigin();
+                    if (textX < box.Right) textX = box.Right + Math.Max(3, (int)Math.Round(3f * g.DpiX / 96f));
+                    Rectangle textBounds = new Rectangle(textX, client.Top, Math.Max(0, client.Right - textX), client.Height);
+                    Color fore = Enabled ? ForeColor : Color.FromArgb(150, 150, 150);
+                    if (!string.IsNullOrEmpty(Text) && textBounds.Width > 0)
+                    {
+                        TextRenderer.DrawText(g, Text, Font, textBounds, fore,
+                            TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                            TextFormatFlags.NoPadding);
+                    }
+                    if (Focused && ShowFocusCues && textBounds.Width > 4)
+                    {
+                        Size ts = TextRenderer.MeasureText(g, Text ?? "", Font,
+                            textBounds.Size, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                        Rectangle focus = new Rectangle(textBounds.X, textBounds.Y + Math.Max(0, (textBounds.Height - ts.Height) / 2),
+                            Math.Min(ts.Width + 2, textBounds.Width), ts.Height);
+                        ControlPaint.DrawFocusRectangle(g, focus, fore, BackColor);
+                    }
+                    dest.DrawImageUnscaled(bmp, 0, 0);
+                }
+            }
+            catch { }
+        }
+
+        // Match the system checkbox caption origin so "Gateway support" still
+        // lines up with Refresh. Measured off a stock CheckBox of the same size.
+        int SystemTextOrigin()
+        {
+            if (cachedTextLeft >= 0 && cacheW == Width && cacheH == Height
+                && cacheText == Text && object.ReferenceEquals(cacheFont, Font))
+                return cachedTextLeft - cachedBearing;
+            cachedTextLeft = MeasureStockTextLeft();
+            cachedBearing = MeasureDrawTextBearing();
+            cacheW = Width;
+            cacheH = Height;
+            cacheText = Text;
+            cacheFont = Font;
+            if (cachedTextLeft < 0)
+                cachedTextLeft = 16;
+            return cachedTextLeft - cachedBearing;
+        }
+
+        int MeasureStockTextLeft()
+        {
+            try
+            {
+                int w = Math.Max(1, Width);
+                int h = Math.Max(1, Height);
+                using (CheckBox probe = new CheckBox())
+                using (Bitmap withText = new Bitmap(w, h))
+                using (Bitmap noText = new Bitmap(w, h))
+                {
+                    probe.Text = Text;
+                    probe.Font = Font;
+                    probe.Size = new Size(w, h);
+                    probe.CheckAlign = CheckAlign;
+                    probe.TextAlign = TextAlign;
+                    probe.FlatStyle = FlatStyle;
+                    probe.BackColor = Color.White;
+                    probe.ForeColor = Color.Black;
+                    probe.DrawToBitmap(withText, new Rectangle(0, 0, w, h));
+                    probe.Text = "";
+                    probe.DrawToBitmap(noText, new Rectangle(0, 0, w, h));
+                    for (int x = 0; x < w; x++)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            Color a = withText.GetPixel(x, y);
+                            Color b = noText.GetPixel(x, y);
+                            if ((a.R + a.G + a.B) + 40 < (b.R + b.G + b.B))
+                                return x;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        int MeasureDrawTextBearing()
+        {
+            if (string.IsNullOrEmpty(Text) || Width <= 0 || Height <= 0) return 0;
+            try
+            {
+                int w = Math.Max(1, Width);
+                int h = Math.Max(1, Height);
+                using (Bitmap bmp = new Bitmap(w, h))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.White);
+                    TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, w, h), Color.Black,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                    for (int x = 0; x < w; x++)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            Color c = bmp.GetPixel(x, y);
+                            if (c.R + c.G + c.B < 765 - 300)
+                                return x;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+    }
+
+    sealed class AboutForm : PerMonitorDialog
+    {
         readonly bool dark;
-        UpdateInfo availableUpdate;
         readonly string updateCheckFile;
-        readonly LinkLabel enableLaunchLink;
-        readonly CheckBox launchCheckBox;
-        readonly bool portableCopy;
+        readonly bool checkMatchOnShow;
+        readonly Color bodyBack, footerBack, footerRule, fore, muted, quiet, linkColor, linkActive;
+        readonly Color secondaryBack, secondaryBorder, secondaryFore, primaryBack, primaryFore;
+
+        readonly PictureBox iconBox;
+        readonly Label nameLabel;
+        readonly Label versionLabel;
+        readonly LinkLabel website;
+        readonly Label siteSeparator;
+        readonly Label matchLabel;
+        readonly Label tagline;
+        readonly LinkLabel creditLink;
+        readonly LinkLabel sourceLink;
+        readonly LinkLabel licenseLink;
+        readonly RoundCheckBox launchCheckBox;
+        readonly Label launchCheckLabel;
+        readonly Label statusLabel;
+        readonly Label privacyLabel;
+        readonly Panel footer;
+        readonly Button checkButton;
+        readonly Button closeButton;
+        Bitmap iconBitmap;
+        readonly List<Font> fonts = new List<Font>();
+        readonly List<Font> retiredFonts = new List<Font>();
+        Font fontName, fontVersion, fontBody, fontPrivacy, fontStatus, fontButton, fontButtonBold;
+        bool layingOut;
         bool settingLaunchCheck;
+        UpdateInfo availableUpdate;
+
+        const string PrivacyLine1 = "Each update check sends one anonymous request to the IPbind update server.";
+        const string PrivacyLine2 = "It counts only the country the request came from, for a rough guesstimate of the app\u2019s popularity (or lack thereof) for my own curiosity. Your IP address is never stored, and no identifiers, cookies, or telemetry are used.";
+
+        // Fixed design-pixel gaps (Andy, 2.3.136). If the privacy note needs
+        // more room, only the window height grows. These are never reduced.
+        const int GapAfterTagline = 18;
+        const int GapCreditToLicense = 8;
+        const int GapLicenseToCheckbox = 16;
+        const int GapCheckboxToStatus = 16;
+        const int GapAbovePrivacy = 18;
+        const int GapPrivacyToFooter = 20;
+        const int FooterPadX = 28, FooterPadTop = 16, FooterPadBot = 18, FooterBtnH = 32;
 
         public AboutForm(Form owner, bool dark, float scale, string updateCheckFile)
         {
+            DebugLog.WatchForm(this);
             this.updateCheckFile = updateCheckFile;
             this.dark = dark;
-            sc = scale > 0f ? scale : 1f;
+            InitScale(scale);
             Text = "About " + BuildInfo.AppName;
-            Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            // Installed copies: a "turn on" link only while update-check.txt = manual.
-            // Portable copies: a "Check for updates at launch" checkbox, always shown.
-            // The form is taller only while one of the two is shown.
-            portableCopy = !IsInstalledCopy();
-            bool launchEnabled = ReadLaunchCheckEnabled();
-            bool manualOnly = !portableCopy && !launchEnabled;
-            bool showRow = portableCopy || manualOnly;
-            ClientSize = Z(430, showRow ? 388 : 360);
             try { Icon = owner.Icon; } catch { }
 
-            Label title = MakeLabel(BuildInfo.AppName, 18F, FontStyle.Bold, 24, 20, 382, 34);
-            Label version = MakeLabel(
-                "Version " + BuildInfo.Version + (BuildInfo.IsBeta ? " (beta)" : ""), 9F, FontStyle.Regular, 24, 58, 382, 22);
-            Label tagline = MakeLabel(
-                "One-click Static IP Binder for easily accessing\r\n" +
-                "air-gapped equipment spread across multiple IP ranges",
-                9F, FontStyle.Regular, 24, 94, 382, 58);
-
-            LinkLabel directed = MakeLink(
-                "App created by Andy Rostad",
-                "Andy Rostad", "https://github.com/arostad", 24, 166, 382, 22);
-            LinkLabel source = MakeLink(
-                "Source", "Source", "https://github.com/arostad/IPbind", 24, 194, 382, 22);
-            LinkLabel license = MakeLink(
-                "Released under the MIT License", "MIT License",
-                "https://github.com/arostad/IPbind/blob/main/LICENSE", 24, 222, 382, 22);
-
-            checkButton = new Button();
-            checkButton.Text = "Check for updates";
-            checkButton.Location = P(120, 254);
-            checkButton.Size = Z(190, 34);
-            checkButton.Click += CheckUpdates;
-
-            // Installed copies: only offered when the user chose manual updates
-            // (installer task unticked); there is no way to turn checks off here.
-            enableLaunchLink = new LinkLabel();
-            enableLaunchLink.Text = "Turn on automatic update checks…";
-            enableLaunchLink.Location = P(24, 296);
-            enableLaunchLink.Size = Z(382, 22);
-            enableLaunchLink.TextAlign = ContentAlignment.MiddleCenter;
-            enableLaunchLink.LinkColor = Color.FromArgb(25, 90, 160);
-            enableLaunchLink.Visible = manualOnly;
-            enableLaunchLink.LinkClicked += EnableLaunchChecks;
-
-            launchCheckBox = new CheckBox();
-            launchCheckBox.Text = "Check for updates at launch";
-            launchCheckBox.AutoSize = true;
-            launchCheckBox.Checked = launchEnabled;
-            launchCheckBox.Visible = portableCopy;
-            launchCheckBox.CheckedChanged += LaunchCheckChanged;
-
-            statusLabel = MakeLabel(
-                "", 8.5F, FontStyle.Regular, 24, showRow ? 324 : 292, 382, 48);
-
-            Controls.Add(title);
-            Controls.Add(version);
-            Controls.Add(tagline);
-            Controls.Add(directed);
-            Controls.Add(source);
-            Controls.Add(license);
-            Controls.Add(checkButton);
-            Controls.Add(enableLaunchLink);
-            Controls.Add(launchCheckBox);
-            Controls.Add(statusLabel);
-            // Centre the auto-sized checkbox under the button (device pixels).
-            launchCheckBox.Location = new Point(
-                Math.Max(U(24), (ClientSize.Width - launchCheckBox.PreferredSize.Width) / 2), U(296));
+            bool launchEnabled = ReadLaunchCheckEnabled();
+            checkMatchOnShow = BuildInfo.IsBeta && launchEnabled;
 
             if (dark)
             {
-                BackColor = Color.FromArgb(32, 32, 32);
-                ForeColor = Color.FromArgb(230, 230, 230);
-                foreach (Control control in Controls)
+                bodyBack = Color.FromArgb(0x2B, 0x2B, 0x2B);
+                footerBack = Color.FromArgb(0x20, 0x20, 0x20);
+                footerRule = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                fore = Color.White;
+                muted = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                quiet = Color.FromArgb(0x9A, 0x9A, 0x9A);
+                linkColor = Color.FromArgb(0x60, 0xCD, 0xFF);
+                linkActive = Color.FromArgb(0x82, 0xD8, 0xFF);
+                secondaryBack = Color.FromArgb(0x33, 0x33, 0x33);
+                secondaryBorder = Color.FromArgb(0x4A, 0x4A, 0x4A);
+                secondaryFore = Color.White;
+                primaryBack = Color.FromArgb(0x60, 0xCD, 0xFF);
+                primaryFore = Color.FromArgb(0x10, 0x10, 0x10);
+            }
+            else
+            {
+                bodyBack = Color.White;
+                footerBack = Color.FromArgb(0xF3, 0xF3, 0xF3);
+                footerRule = Color.FromArgb(0xE5, 0xE5, 0xE5);
+                fore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                muted = Color.FromArgb(0x3B, 0x3B, 0x3B);
+                quiet = Color.FromArgb(0x6B, 0x6B, 0x6B);
+                linkColor = Color.FromArgb(0x00, 0x5F, 0xB8);
+                linkActive = Color.FromArgb(0x00, 0x47, 0x8A);
+                secondaryBack = Color.White;
+                secondaryBorder = Color.FromArgb(0xD0, 0xD0, 0xD0);
+                secondaryFore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                primaryBack = Color.FromArgb(0x00, 0x5F, 0xB8);
+                primaryFore = Color.White;
+            }
+
+            BackColor = bodyBack;
+            ForeColor = fore;
+
+            iconBox = new PictureBox();
+            iconBox.BackColor = Color.Transparent;
+            iconBox.SizeMode = PictureBoxSizeMode.Normal;
+            iconBox.TabStop = false;
+            nameLabel = MakeLabel();
+            nameLabel.Text = BuildInfo.AppName;
+            versionLabel = MakeLabel();
+            versionLabel.Text = "Version " + BuildInfo.DisplayVersion;
+            website = MakeLink("ipbind.com", "ipbind.com", "https://ipbind.com/");
+            matchLabel = MakeLabel();
+            matchLabel.Text = "Matches the current release";
+            matchLabel.Visible = false;
+            tagline = MakeLabel();
+            tagline.Text = "One-click Static IP Binder for easily accessing air-gapped equipment spread across multiple IP ranges";
+            creditLink = MakeLink("App created by Andy Rostad", "Andy Rostad", "https://github.com/arostad");
+            sourceLink = MakeLink("GitHub project page", "GitHub project page", "https://github.com/arostad/IPbind");
+            siteSeparator = MakeLabel();
+            siteSeparator.Text = "\u00B7";
+            siteSeparator.AccessibleRole = AccessibleRole.Separator;
+            licenseLink = MakeLink("Released under the MIT License", "MIT License",
+                "https://github.com/arostad/IPbind/blob/main/LICENSE");
+
+            launchCheckBox = new RoundCheckBox();
+            launchCheckBox.UseMnemonic = false;
+            launchCheckBox.AutoSize = false;
+            launchCheckBox.Checked = launchEnabled;
+            // Shown in installed and portable copies alike, whatever was picked at install.
+            launchCheckBox.Visible = true;
+            launchCheckBox.CheckedChanged += LaunchCheckChanged;
+            launchCheckLabel = MakeLabel();
+            launchCheckLabel.Text = "Check for updates at launch (recommended)";
+            launchCheckLabel.UseMnemonic = false;
+            launchCheckLabel.Cursor = Cursors.Hand;
+            launchCheckLabel.Click += delegate { launchCheckBox.Checked = !launchCheckBox.Checked; };
+            launchCheckBox.AccessibleName = launchCheckLabel.Text;
+
+            statusLabel = MakeLabel();
+            statusLabel.Text = "";
+            privacyLabel = MakeLabel();
+            privacyLabel.Text = PrivacyLine1 + "\r\n" + PrivacyLine2;
+
+            footer = new Panel();
+            footer.BackColor = footerBack;
+            footer.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                using (Pen pen = new Pen(footerRule))
+                    e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
+            };
+            checkButton = new Button();
+            checkButton.Text = "Check for updates";
+            checkButton.FlatStyle = FlatStyle.Flat;
+            checkButton.FlatAppearance.BorderSize = 1;
+            checkButton.Cursor = Cursors.Hand;
+            checkButton.Click += CheckUpdates;
+            closeButton = new Button();
+            closeButton.Text = "Close";
+            closeButton.FlatStyle = FlatStyle.Flat;
+            closeButton.FlatAppearance.BorderSize = 1;
+            closeButton.Cursor = Cursors.Hand;
+            closeButton.DialogResult = DialogResult.OK;
+            footer.Controls.Add(checkButton);
+            footer.Controls.Add(closeButton);
+            AcceptButton = closeButton;
+            CancelButton = closeButton;
+
+            Controls.Add(iconBox);
+            Controls.Add(nameLabel);
+            Controls.Add(versionLabel);
+            Controls.Add(website);
+            Controls.Add(siteSeparator);
+            Controls.Add(sourceLink);
+            Controls.Add(matchLabel);
+            Controls.Add(tagline);
+            Controls.Add(creditLink);
+            Controls.Add(licenseLink);
+            Controls.Add(launchCheckBox);
+            Controls.Add(launchCheckLabel);
+            Controls.Add(statusLabel);
+            Controls.Add(privacyLabel);
+            Controls.Add(footer);
+
+            LayoutContent();
+            Shown += delegate
+            {
+                FitOnScreen();
+                if (checkMatchOnShow) StartReleaseMatchCheck();
+            };
+        }
+
+        Label MakeLabel()
+        {
+            Label label = new Label();
+            label.AutoSize = false;
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
+            return label;
+        }
+
+        LinkLabel MakeLink(string text, string linkedText, string url)
+        {
+            LinkLabel label = new LinkLabel();
+            label.AutoSize = false;
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
+            label.Text = text;
+            label.LinkBehavior = LinkBehavior.AlwaysUnderline;
+            int start = text.IndexOf(linkedText, StringComparison.Ordinal);
+            if (start < 0) start = 0;
+            label.LinkArea = new LinkArea(start, linkedText.Length);
+            Uri safeUrl;
+            label.Links[0].LinkData = TryGetHttpsUrl(url, out safeUrl) ? safeUrl.AbsoluteUri : url;
+            if (url != null && url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
                 {
-                    control.ForeColor = ForeColor;
-                    LinkLabel link = control as LinkLabel;
-                    if (link != null)
+                    try
                     {
-                        link.LinkColor = Color.FromArgb(90, 160, 240);
-                        link.ActiveLinkColor = Color.FromArgb(130, 185, 255);
+                        Uri destination;
+                        if (!TryGetHttpsUrl(e.Link.LinkData as string, out destination))
+                            return;
+                        ProcessStartInfo info = new ProcessStartInfo(destination.AbsoluteUri);
+                        info.UseShellExecute = true;
+                        Process.Start(info);
+                    }
+                    catch { }
+                };
+            }
+            return label;
+        }
+
+        Font MakeFont(float px, FontStyle style)
+        {
+            Font font = NewUiFont(px * sc, style, false);
+            fonts.Add(font);
+            return font;
+        }
+
+        Font MakeSemibold(float px)
+        {
+            Font font = NewUiFont(px * sc, FontStyle.Regular, true);
+            fonts.Add(font);
+            return font;
+        }
+
+        const TextFormatFlags WrapFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl |
+            TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+        const TextFormatFlags LineFlags = TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding |
+            TextFormatFlags.SingleLine;
+
+        Size MeasureWrap(string text, Font font, int maxWidth)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue), WrapFlags);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        Size MeasureLine(string text, Font font)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue), LineFlags);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+
+        int LinkWidth(string text, Font font)
+        {
+            // NoPadding is tight; LinkLabel wraps (and our single-line height
+            // then clips the second line) if the width is even 1 CSS px short.
+            return MeasureLine(text, font).Width + U(16);
+        }
+
+        // Glyph centered on the first line of the label, same pattern as the
+        // DHCP reminder. The caption lives on a Label so it uses the same GDI
+        // TextRenderer as the rest of About (and stays clickable).
+        int LayoutLaunchCheck(int x, int y, int textW, int chkBox, Size textNeed)
+        {
+            int firstH = MeasureLine(launchCheckLabel.Text ?? "Ag", launchCheckLabel.Font).Height;
+            int rowH = Math.Max(chkBox, textNeed.Height + U(6));
+            launchCheckLabel.Location = new Point(x + chkBox + U(12), y);
+            launchCheckLabel.Size = new Size(textW, rowH);
+            int boxY = y + (firstH - chkBox) / 2;
+            int ring = RoundCheckBox.RingFor(sc);
+            launchCheckBox.Size = new Size(chkBox + 2 * ring, chkBox + 2 * ring);
+            launchCheckBox.Location = new Point(x - ring, boxY - ring);
+            launchCheckBox.Visible = true;
+            launchCheckLabel.Visible = true;
+            return rowH;
+        }
+
+        protected override void LayoutContent()
+        {
+            if (layingOut) return;
+            layingOut = true;
+            try
+            {
+                List<Font> previous = new List<Font>(fonts);
+                fonts.Clear();
+                fontName = MakeSemibold(22f);
+                fontVersion = MakeFont(14f, FontStyle.Bold);
+                fontBody = MakeFont(14f, FontStyle.Regular);
+                fontPrivacy = MakeFont(12f, FontStyle.Regular);
+                fontStatus = MakeFont(13f, FontStyle.Regular);
+                fontButton = MakeFont(14f, FontStyle.Regular);
+                fontButtonBold = MakeSemibold(14f);
+                Font = MakeFont(9f, FontStyle.Regular);
+
+                nameLabel.Font = fontName; nameLabel.ForeColor = fore;
+                versionLabel.Font = fontVersion; versionLabel.ForeColor = fore;
+                website.Font = fontBody;
+                StyleLink(website);
+                matchLabel.Font = MakeFont(12f, FontStyle.Regular);
+                matchLabel.ForeColor = quiet;
+                tagline.Font = fontBody; tagline.ForeColor = muted;
+                StyleLink(creditLink); creditLink.Font = fontBody; creditLink.ForeColor = fore;
+                StyleLink(sourceLink); sourceLink.Font = fontBody;
+                siteSeparator.Font = fontBody; siteSeparator.ForeColor = quiet;
+                StyleLink(licenseLink); licenseLink.Font = fontBody; licenseLink.ForeColor = fore;
+                launchCheckBox.Font = fontBody;
+                launchCheckBox.ForeColor = fore;
+                launchCheckBox.BackColor = bodyBack;
+                launchCheckBox.Text = "";
+                launchCheckBox.ApplyDialogColors(bodyBack, fore, primaryBack, primaryFore, dark);
+                launchCheckLabel.Font = fontBody;
+                launchCheckLabel.ForeColor = fore;
+                launchCheckLabel.BackColor = Color.Transparent;
+                launchCheckBox.AccessibleName = launchCheckLabel.Text;
+                statusLabel.Font = fontStatus; statusLabel.ForeColor = quiet;
+                privacyLabel.Font = fontPrivacy; privacyLabel.ForeColor = quiet;
+                checkButton.Font = fontButton;
+                checkButton.BackColor = secondaryBack;
+                checkButton.ForeColor = secondaryFore;
+                checkButton.FlatAppearance.BorderColor = secondaryBorder;
+                closeButton.Font = fontButtonBold;
+                closeButton.BackColor = primaryBack;
+                closeButton.ForeColor = primaryFore;
+                closeButton.FlatAppearance.BorderColor = primaryBack;
+
+                int iconPx = Math.Max(1, U(64));
+                Bitmap newIcon = LoadAppIcon(iconPx);
+                Image oldImage = iconBox.Image;
+                iconBox.Image = newIcon;
+                if (oldImage != null && oldImage != newIcon) oldImage.Dispose();
+                iconBitmap = newIcon;
+
+                int width = U(500);
+                int padX = U(28);
+                int padTop = U(22);
+                // The privacy note wraps inside the 500px mockup width. Extra
+                // lines make the dialog taller; gaps below stay as named above.
+                int inner = width - 2 * padX;
+                int y = padTop;
+
+                iconBox.Location = new Point(padX, y);
+                iconBox.Size = new Size(iconPx, iconPx);
+                int stackX = padX + iconPx + U(16);
+                int stackW = width - padX - stackX;
+                Size nameSize = MeasureLine(nameLabel.Text, fontName);
+                Size verSize = MeasureLine(versionLabel.Text, fontVersion);
+                Size siteSize = MeasureLine(website.Text, fontBody);
+                int stackH = nameSize.Height + U(2) + verSize.Height + U(2) + siteSize.Height;
+                {
+                    int lineW = siteSize.Width + 2 * U(8) + MeasureLine(siteSeparator.Text, fontBody).Width
+                        + MeasureLine(sourceLink.Text, fontBody).Width;
+                    if (lineW + U(4) > stackW)
+                        stackH += U(2) + MeasureLine(sourceLink.Text, fontBody).Height;
+                }
+                if (matchLabel.Visible)
+                    stackH += U(2) + MeasureLine(matchLabel.Text, matchLabel.Font).Height;
+                int heroH = Math.Max(iconPx, stackH);
+                iconBox.Top = y + (heroH - iconPx) / 2;
+                int stackY = y + (heroH - stackH) / 2;
+                nameLabel.Location = new Point(stackX, stackY);
+                nameLabel.Size = new Size(stackW, nameSize.Height);
+                versionLabel.Location = new Point(stackX, nameLabel.Bottom + U(2));
+                versionLabel.Size = new Size(stackW, verSize.Height);
+                // "ipbind.com  ·  GitHub project page" on one line; the GitHub link
+                // drops under the website only if the line would not fit.
+                Size srcSize = MeasureLine(sourceLink.Text, fontBody);
+                Size sepSize = MeasureLine(siteSeparator.Text, fontBody);
+                int sepGap = U(8);
+                int oneLineW = siteSize.Width + sepGap + sepSize.Width + sepGap + srcSize.Width;
+                bool siteOneLine = oneLineW + U(4) <= stackW;
+                website.Location = new Point(stackX, versionLabel.Bottom + U(2));
+                // LinkLabel needs slack or it wraps; the slack sits under the separator.
+                website.Size = new Size(Math.Min(stackW, siteSize.Width + U(16)), siteSize.Height);
+                int siteBottom = website.Bottom;
+                if (siteOneLine)
+                {
+                    siteSeparator.Visible = true;
+                    siteSeparator.Location = new Point(stackX + siteSize.Width + sepGap, website.Top);
+                    siteSeparator.Size = new Size(sepSize.Width + U(16), siteSize.Height);
+                    int srcX = siteSeparator.Left + sepSize.Width + sepGap;
+                    sourceLink.Location = new Point(srcX, website.Top);
+                    sourceLink.Size = new Size(Math.Max(1, Math.Min(stackX + stackW - srcX, LinkWidth(sourceLink.Text, fontBody))), srcSize.Height);
+                    siteSeparator.BringToFront();
+                    sourceLink.BringToFront();
+                }
+                else
+                {
+                    siteSeparator.Visible = false;
+                    sourceLink.Location = new Point(stackX, website.Bottom + U(2));
+                    sourceLink.Size = new Size(Math.Min(stackW, LinkWidth(sourceLink.Text, fontBody)), srcSize.Height);
+                    siteBottom = sourceLink.Bottom;
+                }
+                int afterHero = Math.Max(iconBox.Bottom, siteBottom);
+                if (matchLabel.Visible)
+                {
+                    Size matchSize = MeasureLine(matchLabel.Text, matchLabel.Font);
+                    matchLabel.Location = new Point(stackX, siteBottom + U(2));
+                    matchLabel.Size = new Size(stackW, matchSize.Height);
+                    afterHero = Math.Max(iconBox.Bottom, matchLabel.Bottom);
+                }
+                y = afterHero + U(16);
+
+                Size tagSize = MeasureWrap(tagline.Text, fontBody, inner);
+                tagline.Location = new Point(padX, y);
+                tagline.Size = new Size(inner, tagSize.Height);
+                y = tagline.Bottom + U(GapAfterTagline);
+
+                // Credit and license stacked, left-aligned, nothing to their right.
+                Size creditNeed = MeasureLine(creditLink.Text, fontBody);
+                creditLink.Location = new Point(padX, y);
+                creditLink.Size = new Size(Math.Min(inner, LinkWidth(creditLink.Text, fontBody)), creditNeed.Height);
+                y = creditLink.Bottom + U(GapCreditToLicense);
+                Size licNeed = MeasureLine(licenseLink.Text, fontBody);
+                licenseLink.Location = new Point(padX, y);
+                licenseLink.Size = new Size(Math.Min(inner, LinkWidth(licenseLink.Text, fontBody)), licNeed.Height);
+                y = licenseLink.Bottom;
+
+                y += U(GapLicenseToCheckbox);
+                int chkBox = U(20);
+                Size boxNeed = MeasureWrap(launchCheckLabel.Text, fontBody, inner - chkBox - U(12));
+                y += LayoutLaunchCheck(padX, y, inner - chkBox - U(12), chkBox, boxNeed);
+                if (!string.IsNullOrEmpty(statusLabel.Text))
+                {
+                    y += U(GapCheckboxToStatus);
+                    Size st = MeasureWrap(statusLabel.Text, fontStatus, inner);
+                    statusLabel.Location = new Point(padX, y);
+                    statusLabel.Size = new Size(inner, st.Height);
+                    statusLabel.Visible = true;
+                    y = statusLabel.Bottom;
+                }
+                else
+                {
+                    statusLabel.Visible = false;
+                    statusLabel.Size = new Size(inner, 0);
+                }
+
+                y += U(GapAbovePrivacy);
+                Size priv = MeasureWrap(privacyLabel.Text, fontPrivacy, inner);
+                privacyLabel.Location = new Point(padX, y);
+                privacyLabel.Size = new Size(inner, priv.Height);
+                y = privacyLabel.Bottom + U(GapPrivacyToFooter);
+
+                int footerPadX = U(FooterPadX);
+                int footerPadTop = U(FooterPadTop);
+                int footerPadBot = U(FooterPadBot);
+                int btnH = U(FooterBtnH);
+                Size checkNeed = MeasureLine(checkButton.Text, fontButton);
+                Size closeNeed = MeasureLine(closeButton.Text, fontButtonBold);
+                int checkW = Math.Max(U(96), checkNeed.Width + U(32));
+                int closeW = Math.Max(U(96), closeNeed.Width + U(32));
+                int footerH = footerPadTop + btnH + footerPadBot;
+                footer.Location = new Point(0, y);
+                footer.Size = new Size(width, footerH);
+                checkButton.Size = new Size(checkW, btnH);
+                closeButton.Size = new Size(closeW, btnH);
+                checkButton.Location = new Point(footerPadX, footerPadTop);
+                closeButton.Location = new Point(width - footerPadX - closeW, footerPadTop);
+
+                SetLayoutClientSize(new Size(width, y + footerH));
+
+                // Keep the previous fonts alive until the form is disposed.
+                // Disposing here can paint a button with a freed Font
+                // (GDI+ "Parameter is not valid") after a DPI change.
+                retiredFonts.AddRange(previous);
+            }
+            finally { layingOut = false; }
+        }
+
+        void StyleLink(LinkLabel label)
+        {
+            label.LinkColor = linkColor;
+            label.ActiveLinkColor = linkActive;
+            label.VisitedLinkColor = linkColor;
+            label.DisabledLinkColor = quiet;
+        }
+
+        void SetStatus(string text)
+        {
+            statusLabel.Text = text ?? "";
+            LayoutContent();
+        }
+
+        Bitmap LoadAppIcon(int px)
+        {
+            try
+            {
+                Stream stream = typeof(AboutForm).Assembly.GetManifestResourceStream("IPbind.app.ico");
+                if (stream != null)
+                {
+                    using (stream)
+                    {
+                        Bitmap frame = LoadBestIconFrame(stream, px);
+                        if (frame != null)
+                            return ScaleIconFrame(frame, px);
                     }
                 }
-                checkButton.FlatStyle = FlatStyle.Flat;
-                checkButton.BackColor = Color.FromArgb(50, 50, 50);
-                checkButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-                statusLabel.BackColor = BackColor;
-                statusLabel.ForeColor = Color.FromArgb(170, 170, 170);
             }
+            catch { }
+            try
+            {
+                Icon src = Icon ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (src != null)
+                {
+                    using (Icon sized = new Icon(src, px, px))
+                    using (Bitmap raw = sized.ToBitmap())
+                        return ScaleIconFrame(new Bitmap(raw), px);
+                }
+            }
+            catch { }
+            return new Bitmap(px, px);
+        }
+
+        Bitmap ScaleIconFrame(Bitmap frame, int px)
+        {
+            if (frame.Width == px && frame.Height == px)
+                return frame;
+            Bitmap dest = new Bitmap(px, px);
+            dest.SetResolution(96f * sc, 96f * sc);
+            using (Graphics g = Graphics.FromImage(dest))
+            {
+                g.Clear(Color.Transparent);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.DrawImage(frame, 0, 0, px, px);
+            }
+            frame.Dispose();
+            return dest;
+        }
+
+        // IPbind's .ico frames are PNG-compressed; System.Drawing Icon often
+        // fails to decode those and returns a generic bitmap instead.
+        static Bitmap LoadBestIconFrame(Stream stream, int px)
+        {
+            byte[] data;
+            using (MemoryStream copy = new MemoryStream())
+            {
+                stream.CopyTo(copy);
+                data = copy.ToArray();
+            }
+            if (data.Length < 6) return null;
+            if (BitConverter.ToUInt16(data, 2) != 1) return null;
+            int count = BitConverter.ToUInt16(data, 4);
+            if (count <= 0) return null;
+
+            int bestOff = 0, bestSize = 0, bestW = -1, bestScore = int.MaxValue;
+            for (int i = 0; i < count; i++)
+            {
+                int dir = 6 + i * 16;
+                if (dir + 16 > data.Length) break;
+                int w = data[dir];
+                if (w == 0) w = 256;
+                int size = BitConverter.ToInt32(data, dir + 8);
+                int off = BitConverter.ToInt32(data, dir + 12);
+                int score = (w >= px) ? (w - px) : (10000 + (px - w));
+                if (score < bestScore || (score == bestScore && w > bestW))
+                {
+                    bestScore = score;
+                    bestW = w;
+                    bestOff = off;
+                    bestSize = size;
+                }
+            }
+            if (bestSize <= 0 || bestOff < 0 || bestOff + bestSize > data.Length)
+                return null;
+
+            byte[] blob = new byte[bestSize];
+            Buffer.BlockCopy(data, bestOff, blob, 0, bestSize);
+            if (blob.Length >= 8 && blob[0] == 0x89 && blob[1] == 0x50
+                && blob[2] == 0x4E && blob[3] == 0x47)
+            {
+                using (MemoryStream png = new MemoryStream(blob))
+                using (Image img = Image.FromStream(png))
+                    return new Bitmap(img);
+            }
+            return null;
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -955,9 +3641,47 @@ namespace IPbind
             WindowTheme.ApplyTitleBar(this, dark);
         }
 
-        int U(int value) { return (int)Math.Round(value * sc); }
-        Point P(int x, int y) { return new Point(U(x), U(y)); }
-        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                foreach (Font font in fonts) font.Dispose();
+                fonts.Clear();
+                foreach (Font font in retiredFonts) font.Dispose();
+                retiredFonts.Clear();
+                if (iconBitmap != null)
+                {
+                    if (iconBox != null) iconBox.Image = null;
+                    iconBitmap.Dispose();
+                    iconBitmap = null;
+                }
+            }
+            base.Dispose(disposing);
+        }
+
+        void StartReleaseMatchCheck()
+        {
+            if (!BuildInfo.IsBeta) return;
+            Thread thread = new Thread(delegate()
+            {
+                bool match;
+                try { match = UpdateChecker.BetaMatchesProdLatest(); }
+                catch { match = false; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed) return;
+                        if (matchLabel.Visible == match) return;
+                        matchLabel.Visible = match;
+                        LayoutContent();
+                    });
+                }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
 
         bool ReadLaunchCheckEnabled()
         {
@@ -981,25 +3705,9 @@ namespace IPbind
             }
             catch (Exception ex)
             {
-                statusLabel.Text = "Could not save the update setting: " + ex.Message;
+                SetStatus("Could not save the update setting: " + ex.Message);
                 return false;
             }
-        }
-
-        // Installed = Inno Setup's uninstaller (unins*.exe + unins*.dat) sits next to
-        // the running exe. Every installed copy (prod or beta, any version) has it,
-        // the in-app updater never touches it, and portable copies never do.
-        static bool IsInstalledCopy()
-        {
-            try
-            {
-                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
-                if (string.IsNullOrEmpty(dir)) return false;
-                foreach (string dat in Directory.GetFiles(dir, "unins*.dat"))
-                    if (File.Exists(Path.ChangeExtension(dat, ".exe"))) return true;
-            }
-            catch { }
-            return false;
         }
 
         void SetLaunchCheckSilently(bool value)
@@ -1009,7 +3717,7 @@ namespace IPbind
             finally { settingLaunchCheck = false; }
         }
 
-        // Portable checkbox: turning checks ON needs consent to the installer's
+        // Update checkbox (installed and portable): turning checks ON needs consent to the installer's
         // privacy text (Cancel reverts); turning them OFF saves "manual" at once.
         void LaunchCheckChanged(object sender, EventArgs e)
         {
@@ -1024,7 +3732,7 @@ namespace IPbind
                     SetLaunchCheckSilently(false);
                     return;
                 }
-                statusLabel.Text = "Updates will now be checked at launch.";
+                SetStatus("Updates will now be checked at launch.");
             }
             else
             {
@@ -1033,67 +3741,8 @@ namespace IPbind
                     SetLaunchCheckSilently(true);
                     return;
                 }
-                statusLabel.Text = "Automatic update checks are off. Use Check for updates any time.";
+                SetStatus("Automatic update checks are off. Use Check for updates any time.");
             }
-        }
-
-        // Installed link. Consent first: the same privacy text the installer shows. "I Agree" saves
-        // "auto" and removes the link immediately; Cancel changes nothing.
-        void EnableLaunchChecks(object sender, LinkLabelLinkClickedEventArgs e)
-        {
-            bool agreed;
-            using (PrivacyConsentForm consent = new PrivacyConsentForm(dark, sc))
-                agreed = consent.ShowDialog(this) == DialogResult.OK;
-            if (!agreed || !WriteLaunchCheckMode("auto")) return;
-
-            enableLaunchLink.Visible = false;
-            statusLabel.Location = P(24, 292);
-            ClientSize = Z(430, 360);
-            statusLabel.Text = "Updates will now be checked at launch.";
-        }
-
-        Label MakeLabel(
-            string text, float size, FontStyle style, int x, int y, int width, int height)
-        {
-            Label label = new Label();
-            label.Text = text;
-            label.Font = new Font("Segoe UI", size, style);
-            label.Location = P(x, y);
-            label.Size = Z(width, height);
-            label.TextAlign = ContentAlignment.MiddleCenter;
-            return label;
-        }
-
-        LinkLabel MakeLink(
-            string text, string linkedText, string url, int x, int y, int width, int height)
-        {
-            LinkLabel label = new LinkLabel();
-            label.Text = text;
-            label.Location = P(x, y);
-            label.Size = Z(width, height);
-            label.TextAlign = ContentAlignment.MiddleCenter;
-            label.LinkColor = Color.FromArgb(25, 90, 160);
-            int start = text.IndexOf(linkedText, StringComparison.Ordinal);
-            label.LinkArea = new LinkArea(start, linkedText.Length);
-            Uri safeUrl;
-            label.Links[0].LinkData = TryGetHttpsUrl(url, out safeUrl)
-                ? safeUrl.AbsoluteUri
-                : null;
-            label.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs e)
-            {
-                try
-                {
-                    Uri destination;
-                    if (!TryGetHttpsUrl(e.Link.LinkData as string, out destination))
-                        return;
-
-                    ProcessStartInfo info = new ProcessStartInfo(destination.AbsoluteUri);
-                    info.UseShellExecute = true;
-                    Process.Start(info);
-                }
-                catch { }
-            };
-            return label;
         }
 
         static bool TryGetHttpsUrl(string value, out Uri uri)
@@ -1113,8 +3762,9 @@ namespace IPbind
 
         void CheckUpdates(object sender, EventArgs e)
         {
+            StartReleaseMatchCheck();
             checkButton.Enabled = false;
-            statusLabel.Text = "Checking...";
+            SetStatus("Checking...");
             Thread thread = new Thread(delegate()
             {
                 UpdateInfo info;
@@ -1135,18 +3785,18 @@ namespace IPbind
                         checkButton.Enabled = true;
                         if (!info.IsNewer)
                         {
-                            statusLabel.Text = string.IsNullOrEmpty(info.Error)
-                                ? "You're on the latest version (" + BuildInfo.Version + ")."
-                                : info.Error;
+                            SetStatus(string.IsNullOrEmpty(info.Error)
+                                ? "You're on the latest version (" + BuildInfo.DisplayVersion + ")."
+                                : info.Error);
                             return;
                         }
 
                         availableUpdate = info;
-                        statusLabel.Text =
-                            "Version " + info.RemoteVersion + " is available.";
+                        SetStatus("Version " + VersionText.ForDisplay(info.RemoteVersion) + " is available.");
                         checkButton.Text = "Update now";
                         checkButton.Click -= CheckUpdates;
                         checkButton.Click += UpdateNow;
+                        LayoutContent();
                     });
                 }
                 catch { }
@@ -1159,7 +3809,7 @@ namespace IPbind
         {
             if (availableUpdate == null) return;
             checkButton.Enabled = false;
-            statusLabel.Text = "Downloading. The app will restart when it is ready.";
+            SetStatus("Downloading. The app will restart when it is ready.");
             Thread thread = new Thread(delegate()
             {
                 try
@@ -1175,7 +3825,7 @@ namespace IPbind
                         BeginInvoke((MethodInvoker)delegate
                         {
                             if (IsDisposed) return;
-                            statusLabel.Text = UpdateChecker.DescribeError(ex);
+                            SetStatus(UpdateChecker.DescribeError(ex));
                             checkButton.Enabled = true;
                         });
                     }
@@ -1196,6 +3846,7 @@ namespace IPbind
 
         public PrivacyConsentForm(bool dark, float scale)
         {
+            DebugLog.WatchForm(this);
             this.dark = dark;
             sc = scale > 0f ? scale : 1f;
             Text = BuildInfo.AppName + " privacy";
@@ -1284,234 +3935,867 @@ namespace IPbind
                 }
             }
             catch { }
-            return "The privacy notice could not be loaded. See the Privacy section at https://github.com/arostad/IPbind";
+            return "The privacy notice could not be loaded. See the Privacy section at https://ipbind.com/#privacy";
         }
+    }
+
+    // Shared main-window button captions. The DHCP reminder popup reads these
+    // so the intro, replica and acknowledgement always match the real buttons.
+    static class UiCopy
+    {
+        public const string ApplyButton = "Apply Static IPs";
+        public const string DhcpButton = "Return to DHCP";
+        public static readonly Color ApplyButtonBack = Color.FromArgb(46, 125, 50);
+        public static readonly Color DhcpButtonBack = Color.FromArgb(25, 90, 160);
     }
 
     // Startup reminder: static addresses stay on the adapter until Return to DHCP.
     // Shown at launch until the user clicks Continue with "Don't show this again"
     // ticked (MainForm then writes dhcp-reminder-dismissed.txt in the settings folder).
-    // Continue (and Enter) stay inactive until "I understand" is ticked. Exit is
-    // always available: Exit, Esc, the title-bar X and Alt+F4 all return Cancel,
+    // Continue (and Enter) stay inactive until the acknowledgement is ticked. Exit is
+    // always available: Exit IPbind, Esc, the title-bar X and Alt+F4 all return Cancel,
     // and MainForm then closes IPbind without touching any adapter or saving the
-    // opt-out. Laid out in code from the DPI scale like AboutForm.
-    sealed class DhcpReminderForm : Form
+    // opt-out. Laid out in code from the real DPI scale; fonts, icons and the replica
+    // are drawn in pixels at that scale. WM_DPICHANGED / DpiChanged re-lays out the
+    // dialog if it moves to a monitor at a different scale. Standard title bar (no
+    // WM_NCCALCSIZE). FixedDialog, so DWMWA_BORDER_COLOR-while-maximized does not apply.
+    sealed class DhcpReminderForm : PerMonitorDialog
     {
-        [System.Runtime.InteropServices.DllImport("comctl32.dll")]
-        static extern int LoadIconWithScaleDown(IntPtr hinst, IntPtr pszName, int cx, int cy, out IntPtr phico);
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        static extern bool DestroyIcon(IntPtr hIcon);
-
-        readonly float sc;
         readonly bool dark;
+        readonly Color bodyBack, footerBack, panelBack, panelBorder, fore, muted, introColor, amber, amberInk;
+        readonly Color primaryBack, primaryFore, primaryDisabledBack, primaryDisabledBorder, primaryDisabledFore;
+        readonly Color secondaryBack, secondaryBorder, secondaryFore;
+
+        readonly VectorIcon warningIcon;
+        readonly Label eyebrow;
+        readonly Label title;
+        readonly RunsLabel intro;
+        readonly Panel card;
+        readonly ButtonReplica replica;
+        readonly Label cardHead;
+        readonly Label cardDesc;
+        readonly Label lead;
+        readonly VectorIcon[] rowIcons;
+        readonly Label[] rowHeads;
+        readonly Label[] rowDescs;
+        readonly Panel footer;
         readonly CheckBox understandBox;
         readonly CheckBox dontShowBox;
+        readonly Label understandLabel;
+        readonly Label dontShowLabel;
         readonly Button continueButton;
         readonly Button exitButton;
-        readonly Bitmap warningBitmap;
+
+        readonly List<Font> fonts = new List<Font>();
+        readonly List<Font> retiredFonts = new List<Font>();
+        Font fontEyebrow, fontTitle, fontIntro, fontIntroBold, fontBody, fontBodyBold, fontSmall, fontButton, fontButtonRegular, fontReplica;
+        bool layingOut;
 
         public bool DontShowAgain { get { return dontShowBox.Checked; } }
 
         public DhcpReminderForm(Form owner, bool dark, float scale)
         {
+            DebugLog.WatchForm(this);
             this.dark = dark;
-            sc = scale > 0f ? scale : 1f;
+            InitScale(scale);
             Text = BuildInfo.AppName;
-            Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
+            KeyPreview = true;
             try { Icon = owner.Icon; } catch { }
-
-            Color fore = dark ? Color.FromArgb(230, 230, 230) : SystemColors.ControlText;
-            Color amber = dark ? Color.FromArgb(242, 179, 61) : Color.FromArgb(156, 92, 0);
-            Font headingBold = new Font("Segoe UI", 12F, FontStyle.Bold);
-            Font headingRegular = new Font("Segoe UI", 12F, FontStyle.Regular);
-            Font bodyBold = new Font("Segoe UI", 9F, FontStyle.Bold);
-
-            int width = U(600);
-            int left = U(24);
-            int textWidth = width - 2 * left;
-            int y = U(20);
-
-            // Heading row: warning icon, then bold amber "Important:" and the regular rest.
-            int iconSize = U(24);
-            warningBitmap = LoadWarningBitmap(iconSize);
-            PictureBox icon = new PictureBox();
-            icon.SizeMode = PictureBoxSizeMode.Zoom;
-            icon.Size = new Size(iconSize, iconSize);
-            icon.Image = warningBitmap;
-            icon.TabStop = false;
-
-            int headingLeft = left + iconSize + U(10);
-            RunsLabel heading = new RunsLabel();
-            heading.AddRun("Important:", headingBold, amber);
-            heading.AddRun(" Return to DHCP when you\u2019re done", headingRegular, fore);
-            heading.Location = new Point(headingLeft, 0);
-            heading.FitWidth(width - headingLeft - left);
-            int rowHeight = Math.Max(iconSize, heading.Height);
-            icon.Location = new Point(left, y + (rowHeight - iconSize) / 2);
-            heading.Top = y + (rowHeight - heading.Height) / 2;
-            Controls.Add(icon);
-            Controls.Add(heading);
-            y += rowHeight + U(14);
-
-            Label intro = WrapLabel(
-                "IPbind gives your Ethernet adapter static IP addresses so you can reach field equipment. " +
-                "They stay in place until you click Return to DHCP.", left, y, textWidth);
-            y += intro.Height + U(12);
-
-            Label leadIn = WrapLabel(
-                "If you plug this adapter into an office, public, or home network while those addresses are still set:",
-                left, y, textWidth);
-            y += leadIn.Height + U(6);
-
-            string[] bullets = new string[]
-            {
-                "One of your addresses may already belong to a device on that network, and you could knock it offline",
-                "Your addresses may fall inside that network\u2019s DHCP pool and clash with addresses it hands out",
-                "You likely won\u2019t have internet or network access",
-                "You could trip network security alarms, which may get your laptop blocked by network admins"
-            };
-            int bulletIndent = U(20);
-            foreach (string item in bullets)
-            {
-                Label dot = new Label();
-                dot.Text = "\u2022";
-                dot.UseMnemonic = false;
-                dot.AutoSize = false;
-                dot.Location = new Point(left + U(4), y);
-                dot.Size = new Size(bulletIndent - U(4), U(20));
-                Controls.Add(dot);
-                Label text = WrapLabel(item, left + bulletIndent, y, textWidth - bulletIndent);
-                y += text.Height + U(4);
-            }
-            y += U(10);
-
-            RunsLabel closing = new RunsLabel();
-            closing.AddRun("Click ", Font, fore);
-            closing.AddRun("Return to DHCP", bodyBold, fore);
-            closing.AddRun(" before plugging this adapter into a non-air-gapped network.", Font, fore);
-            closing.Location = new Point(left, y);
-            closing.FitWidth(textWidth);
-            Controls.Add(closing);
-            y += closing.Height + U(18);
-
-            understandBox = new CheckBox();
-            understandBox.Text = "I understand";
-            understandBox.AutoSize = true;
-            understandBox.Location = new Point(left, y);
-            understandBox.CheckedChanged += delegate { continueButton.Enabled = understandBox.Checked; };
-            Controls.Add(understandBox);
-            y += understandBox.PreferredSize.Height + U(6);
-
-            dontShowBox = new CheckBox();
-            dontShowBox.Text = "Don\u2019t show this again";
-            dontShowBox.AutoSize = true;
-            dontShowBox.Location = new Point(left, y);
-            Controls.Add(dontShowBox);
-            int checkBottom = y + dontShowBox.PreferredSize.Height;
-
-            continueButton = new Button();
-            continueButton.Text = "Continue";
-            continueButton.Size = Z(110, 32);
-            continueButton.Location = new Point(width - left - continueButton.Width,
-                checkBottom - continueButton.Height);
-            continueButton.Enabled = false;
-            continueButton.DialogResult = DialogResult.OK;
-            Controls.Add(continueButton);
-            AcceptButton = continueButton;
-
-            // Way out for anyone who won't tick "I understand": closes IPbind.
-            exitButton = new Button();
-            exitButton.Text = "Exit";
-            exitButton.Size = continueButton.Size;
-            exitButton.Location = new Point(continueButton.Left - U(8) - exitButton.Width, continueButton.Top);
-            exitButton.DialogResult = DialogResult.Cancel;
-            Controls.Add(exitButton);
-            CancelButton = exitButton;
-
-            ClientSize = new Size(width, Math.Max(checkBottom, continueButton.Bottom) + U(20));
 
             if (dark)
             {
-                BackColor = Color.FromArgb(32, 32, 32);
-                ForeColor = fore;
-                foreach (Control control in Controls)
-                    if (!(control is RunsLabel)) control.ForeColor = fore;
-                continueButton.FlatStyle = FlatStyle.Flat;
-                continueButton.BackColor = Color.FromArgb(50, 50, 50);
-                continueButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-                exitButton.FlatStyle = FlatStyle.Flat;
-                exitButton.BackColor = Color.FromArgb(50, 50, 50);
-                exitButton.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
+                // Spec dark palette; replica uses the real main-window button color.
+                bodyBack = Color.FromArgb(0x2B, 0x2B, 0x2B);
+                footerBack = Color.FromArgb(0x20, 0x20, 0x20);
+                panelBack = Color.FromArgb(0x1F, 0x1F, 0x1F);
+                panelBorder = Color.FromArgb(0x3A, 0x3A, 0x3A);
+                fore = Color.White;
+                introColor = Color.FromArgb(0xE4, 0xE4, 0xE4);
+                muted = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                amber = Color.FromArgb(0xFF, 0xC8, 0x3D);
+                amberInk = Color.FromArgb(0x1F, 0x1F, 0x1F);
+                primaryBack = Color.FromArgb(0x60, 0xCD, 0xFF);
+                primaryFore = Color.FromArgb(0x10, 0x10, 0x10);
+                primaryDisabledBack = Color.FromArgb(0x2A, 0x2A, 0x2A);
+                primaryDisabledBorder = Color.FromArgb(0x38, 0x38, 0x38);
+                primaryDisabledFore = Color.FromArgb(0x8C, 0x8C, 0x8C);
+                secondaryBack = Color.FromArgb(0x33, 0x33, 0x33);
+                secondaryBorder = Color.FromArgb(0x4A, 0x4A, 0x4A);
+                secondaryFore = Color.White;
+            }
+            else
+            {
+                // Light variant: app-like light surfaces, darker amber for contrast.
+                bodyBack = Color.FromArgb(0xF5, 0xF5, 0xF5);
+                footerBack = Color.FromArgb(0xEB, 0xEB, 0xEB);
+                panelBack = Color.White;
+                panelBorder = Color.FromArgb(0xC8, 0xC8, 0xC8);
+                fore = Color.FromArgb(0x1A, 0x1A, 0x1A);
+                introColor = Color.FromArgb(0x2A, 0x2A, 0x2A);
+                muted = Color.FromArgb(0x5A, 0x5A, 0x5A);
+                amber = Color.FromArgb(156, 92, 0);
+                amberInk = Color.White;
+                primaryBack = Color.FromArgb(25, 90, 160);
+                primaryFore = Color.White;
+                primaryDisabledBack = Color.FromArgb(0xE0, 0xE0, 0xE0);
+                primaryDisabledBorder = Color.FromArgb(0xC0, 0xC0, 0xC0);
+                primaryDisabledFore = Color.FromArgb(0x8A, 0x8A, 0x8A);
+                secondaryBack = Color.FromArgb(0xF7, 0xF7, 0xF7);
+                secondaryBorder = Color.FromArgb(0xB0, 0xB0, 0xB0);
+                secondaryFore = fore;
             }
 
-            Shown += delegate { understandBox.Focus(); };
+            BackColor = bodyBack;
+            ForeColor = fore;
+            Font = MakeFont(9f, FontStyle.Regular);
+
+            warningIcon = new VectorIcon(VectorIcon.Kind.Warning, amber, amberInk, bodyBack);
+            eyebrow = MakeLabel();
+            eyebrow.Text = "BEFORE YOU START";
+            title = MakeLabel();
+            title.Text = "Return to DHCP before joining a live network";
+            intro = new RunsLabel();
+            Controls.Add(warningIcon);
+            Controls.Add(eyebrow);
+            Controls.Add(title);
+            Controls.Add(intro);
+
+            card = new Panel();
+            card.BackColor = panelBack;
+            card.Paint += PaintCardBorder;
+            replica = new ButtonReplica();
+            cardHead = MakeLabel();
+            cardHead.Text = "Look for this button in the main window";
+            cardDesc = MakeLabel();
+            cardDesc.Text = "Clicking it removes the addresses you bound and returns your selected interface to DHCP, ready for a live network.";
+            card.Controls.Add(replica);
+            card.Controls.Add(cardHead);
+            card.Controls.Add(cardDesc);
+            Controls.Add(card);
+
+            lead = MakeLabel();
+            lead.Text = "If you skip it and plug into a live network (office, home, or public):";
+            Controls.Add(lead);
+
+            string[] heads = new string[]
+            {
+                "Your laptop may not have internet",
+                "You could knock an existing device offline",
+                "You could set off security alerts"
+            };
+            string[] descs = new string[]
+            {
+                "No web, email, or network drives until the addresses are removed.",
+                "One of your addresses may already belong to something on that network.",
+                "Network admins may block your laptop until it\u2019s sorted out."
+            };
+            VectorIcon.Kind[] kinds = new VectorIcon.Kind[]
+            {
+                VectorIcon.Kind.NoInternet,
+                VectorIcon.Kind.Devices,
+                VectorIcon.Kind.Shield
+            };
+            rowIcons = new VectorIcon[3];
+            rowHeads = new Label[3];
+            rowDescs = new Label[3];
+            for (int i = 0; i < 3; i++)
+            {
+                rowIcons[i] = new VectorIcon(kinds[i], amber, amberInk, bodyBack);
+                rowHeads[i] = MakeLabel();
+                rowHeads[i].Text = heads[i];
+                rowDescs[i] = MakeLabel();
+                rowDescs[i].Text = descs[i];
+                Controls.Add(rowIcons[i]);
+                Controls.Add(rowHeads[i]);
+                Controls.Add(rowDescs[i]);
+            }
+
+            footer = new Panel();
+            footer.BackColor = footerBack;
+            footer.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                int y = 0;
+                using (Pen pen = new Pen(dark ? Color.FromArgb(0x1A, 0x1A, 0x1A) : Color.FromArgb(0xD0, 0xD0, 0xD0)))
+                    e.Graphics.DrawLine(pen, 0, y, footer.Width, y);
+            };
+            understandBox = new RoundCheckBox();
+            understandBox.UseMnemonic = false;
+            understandBox.AutoSize = false;
+            understandBox.UseCompatibleTextRendering = false;
+            understandBox.CheckedChanged += delegate { ApplyContinueState(); };
+            understandLabel = MakeLabel();
+            understandLabel.Click += delegate { understandBox.Checked = !understandBox.Checked; };
+            dontShowBox = new RoundCheckBox();
+            dontShowBox.UseMnemonic = false;
+            dontShowBox.AutoSize = false;
+            dontShowBox.UseCompatibleTextRendering = false;
+            dontShowLabel = MakeLabel();
+            dontShowLabel.Text = "Don\u2019t show this again";
+            dontShowLabel.Click += delegate { dontShowBox.Checked = !dontShowBox.Checked; };
+            continueButton = new Button();
+            continueButton.Text = "Continue";
+            continueButton.Enabled = false;
+            continueButton.DialogResult = DialogResult.OK;
+            continueButton.FlatStyle = FlatStyle.Flat;
+            continueButton.FlatAppearance.BorderSize = 1;
+            continueButton.Cursor = Cursors.Hand;
+            exitButton = new Button();
+            exitButton.Text = "Exit IPbind";
+            exitButton.DialogResult = DialogResult.Cancel;
+            exitButton.FlatStyle = FlatStyle.Flat;
+            exitButton.FlatAppearance.BorderSize = 1;
+            exitButton.Cursor = Cursors.Hand;
+            footer.Controls.Add(understandBox);
+            footer.Controls.Add(understandLabel);
+            footer.Controls.Add(dontShowBox);
+            footer.Controls.Add(dontShowLabel);
+            footer.Controls.Add(continueButton);
+            footer.Controls.Add(exitButton);
+            Controls.Add(footer);
+            AcceptButton = continueButton;
+            CancelButton = exitButton;
+
+            LayoutContent();
+            Shown += delegate
+            {
+                FitOnScreen();
+                understandBox.Focus();
+            };
         }
 
-        Label WrapLabel(string text, int x, int y, int width)
+        Label MakeLabel()
         {
             Label label = new Label();
-            label.Text = text;
-            label.UseMnemonic = false;
             label.AutoSize = false;
-            label.Font = Font;
-            label.Padding = Padding.Empty;
-            int height = label.GetPreferredSize(new Size(width, 0)).Height;
-            label.Location = new Point(x, y);
-            label.Size = new Size(width, height + U(2));
-            Controls.Add(label);
+            label.UseMnemonic = false;
+            label.BackColor = Color.Transparent;
             return label;
         }
 
-        static Bitmap LoadWarningBitmap(int size)
+        Font MakeFont(float px, FontStyle style)
         {
-            // Crisp, DPI-sized stock warning icon (IDI_WARNING); falls back to SystemIcons.Warning.
+            // Spec typography is in CSS pixels at 96 DPI. Multiply by sc so a
+            // test scale on a 96-DPI machine and a real system-DPI scale both
+            // render at the intended size (not points, which would be 33% larger).
+            Font font = NewUiFont(px * sc, style, false);
+            fonts.Add(font);
+            return font;
+        }
+
+        Font MakeSemibold(float px)
+        {
+            Font font = NewUiFont(px * sc, FontStyle.Regular, true);
+            fonts.Add(font);
+            return font;
+        }
+
+        void DisposeFonts()
+        {
+            foreach (Font font in fonts) font.Dispose();
+            fonts.Clear();
+            foreach (Font font in retiredFonts) font.Dispose();
+            retiredFonts.Clear();
+        }
+
+        const TextFormatFlags WrapFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl |
+            TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+
+        Size MeasureWrap(string text, Font font, int maxWidth)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(maxWidth, int.MaxValue), WrapFlags);
+                if (size.Width < 1) size.Width = maxWidth;
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        Size MeasureLine(string text, Font font)
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                Size size = TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                if (size.Height < font.Height) size.Height = font.Height;
+                return size;
+            }
+        }
+
+        int MaxClientHeight()
+        {
+            // The real work area of the dialog's monitor, in device pixels. No fixed
+            // pixel cap: a 1040 px cap here made a 4K screen at 175% or 200% look
+            // like a full 1080p one, so the dialog widened when it already fit.
+            Rectangle work = CurrentWorkArea();
+            int chromeH = ChromeSize().Height;
+            return Math.Max(U(360), work.Height - chromeH - 16);
+        }
+
+
+        protected override void LayoutContent()
+        {
+            if (layingOut) return;
+            layingOut = true;
             try
             {
-                IntPtr handle;
-                if (LoadIconWithScaleDown(IntPtr.Zero, new IntPtr(32515), size, size, out handle) == 0 &&
-                    handle != IntPtr.Zero)
+                List<Font> previousFonts = new List<Font>(fonts);
+                fonts.Clear();
+                fontEyebrow = MakeSemibold(12f);
+                fontTitle = MakeSemibold(22f);
+                fontIntro = MakeFont(15f, FontStyle.Regular);
+                fontIntroBold = MakeSemibold(15f);
+                fontBody = MakeSemibold(15f);
+                fontBodyBold = MakeSemibold(15f);
+                fontSmall = MakeFont(13f, FontStyle.Regular);
+                fontButton = MakeSemibold(14f);
+                fontButtonRegular = MakeFont(14f, FontStyle.Regular);
+                fontReplica = MakeFont(15f, FontStyle.Bold);
+                Font = MakeFont(9f, FontStyle.Regular);
+
+                eyebrow.Font = fontEyebrow;
+                eyebrow.ForeColor = amber;
+                title.Font = fontTitle;
+                title.ForeColor = fore;
+                cardHead.Font = fontBody;
+                cardHead.ForeColor = fore;
+                cardDesc.Font = fontSmall;
+                cardDesc.ForeColor = muted;
+                lead.Font = MakeFont(14f, FontStyle.Regular);
+                lead.ForeColor = muted;
+                for (int i = 0; i < 3; i++)
                 {
-                    try
-                    {
-                        using (Icon stock = Icon.FromHandle(handle))
-                            return stock.ToBitmap();
-                    }
-                    finally { DestroyIcon(handle); }
+                    rowHeads[i].Font = fontBody;
+                    rowHeads[i].ForeColor = fore;
+                    rowDescs[i].Font = fontSmall;
+                    rowDescs[i].ForeColor = muted;
                 }
+                Font fontCheck = MakeFont(14f, FontStyle.Regular);
+                understandBox.Font = fontCheck;
+                understandBox.ForeColor = fore;
+                understandBox.BackColor = footerBack;
+                understandBox.Text = "";
+                StyleCheck(understandBox);
+                understandLabel.Font = fontCheck;
+                understandLabel.ForeColor = fore;
+                understandLabel.BackColor = Color.Transparent;
+                understandLabel.Text = "I\u2019ll click " + UiCopy.DhcpButton + " before I plug into a live network";
+                understandBox.AccessibleName = understandLabel.Text;
+                dontShowBox.Font = fontCheck;
+                dontShowBox.ForeColor = muted;
+                dontShowBox.BackColor = footerBack;
+                dontShowBox.Text = "";
+                StyleCheck(dontShowBox);
+                dontShowLabel.Font = fontCheck;
+                dontShowLabel.ForeColor = muted;
+                dontShowLabel.BackColor = Color.Transparent;
+                dontShowLabel.Text = "Don\u2019t show this again";
+                dontShowBox.AccessibleName = dontShowLabel.Text;
+                continueButton.Font = fontButton;
+                exitButton.Font = fontButtonRegular;
+                exitButton.BackColor = secondaryBack;
+                exitButton.ForeColor = secondaryFore;
+                exitButton.FlatAppearance.BorderColor = secondaryBorder;
+                ApplyContinueState();
+
+                intro.Clear();
+                intro.AddRun("The addresses you bind using this app stay on your selected interface until you click the ", fontIntro, introColor);
+                intro.AddRun(UiCopy.DhcpButton, fontIntroBold, fore);
+                intro.AddRun(" button.", fontIntro, introColor);
+
+                replica.SetCaption(UiCopy.DhcpButton, fontReplica, UiCopy.DhcpButtonBack, Color.White, sc);
+
+                // Tighten the spacing first; if it still does not fit the work area
+                // (200% on a 1080p screen), widen the dialog so text wraps less.
+                float tighten = 1f;
+                int extraW = 0;
+                const int maxAttempts = 40;
+                for (int attempt = 0; attempt < maxAttempts; attempt++)
+                {
+                    int padX = LerpPad(32, 20, tighten);
+                    int padY = LerpPad(28, 14, tighten);
+                    int gap = LerpPad(20, 10, tighten);
+                    int listGap = LerpPad(14, 8, tighten);
+                    int footerPadX = LerpPad(32, 20, tighten);
+                    int footerPadTop = LerpPad(18, 10, tighten);
+                    int footerPadBot = LerpPad(22, 12, tighten);
+                    int footerGap = LerpPad(16, 8, tighten);
+                    int cardPadX = LerpPad(18, 12, tighten);
+                    int cardPadY = LerpPad(16, 10, tighten);
+                    int cardGap = LerpPad(18, 12, tighten);
+                    int width = U(640) + extraW;
+                    int maxW = width;
+                    {
+                        Rectangle work = CurrentWorkArea();
+                        int chromeW = ChromeSize().Width;
+                        maxW = Math.Max(U(420), work.Width - chromeW - 4);
+                    }
+                    if (width > maxW) width = maxW;
+                    int inner = width - 2 * padX;
+
+                    int y = padY;
+                    int iconSize = U(36);
+                    warningIcon.SetScale(iconSize, iconSize);
+                    Size eyeSize = MeasureLine(eyebrow.Text, fontEyebrow);
+                    Size titleSize = MeasureWrap(title.Text, fontTitle, inner - iconSize - U(14));
+                    int headTextH = eyeSize.Height + U(2) + titleSize.Height;
+                    int headH = Math.Max(iconSize, headTextH);
+                    warningIcon.Location = new Point(padX, y + (headH - iconSize) / 2);
+                    int textLeft = padX + iconSize + U(14);
+                    int textW = inner - iconSize - U(14);
+                    eyebrow.Location = new Point(textLeft, y + (headH - headTextH) / 2);
+                    eyebrow.Size = new Size(textW, eyeSize.Height);
+                    title.Location = new Point(textLeft, eyebrow.Bottom + U(2));
+                    title.Size = new Size(textW, titleSize.Height);
+                    y += headH + gap;
+
+                    intro.Location = new Point(padX, y);
+                    intro.FitWidth(inner);
+                    y += intro.Height + gap;
+
+                    replica.Recalculate();
+                    Size headNeed = MeasureWrap(cardHead.Text, fontBody, Math.Max(U(80), inner - 2 * cardPadX - replica.Width - cardGap));
+                    Size descNeed = MeasureWrap(cardDesc.Text, fontSmall, Math.Max(U(80), inner - 2 * cardPadX - replica.Width - cardGap));
+                    int cardTextH = headNeed.Height + U(1) + descNeed.Height;
+                    int cardH = Math.Max(replica.Height, cardTextH) + 2 * cardPadY;
+                    card.Location = new Point(padX, y);
+                    card.Size = new Size(inner, cardH);
+                    replica.Location = new Point(cardPadX, cardPadY + (cardH - 2 * cardPadY - replica.Height) / 2);
+                    int cardTextX = cardPadX + replica.Width + cardGap;
+                    int cardTextW = inner - cardTextX - cardPadX;
+                    if (cardTextW < U(80)) cardTextW = U(80);
+                    headNeed = MeasureWrap(cardHead.Text, fontBody, cardTextW);
+                    descNeed = MeasureWrap(cardDesc.Text, fontSmall, cardTextW);
+                    cardTextH = headNeed.Height + U(1) + descNeed.Height;
+                    int cardTextY = cardPadY + Math.Max(0, (cardH - 2 * cardPadY - cardTextH) / 2);
+                    cardHead.Location = new Point(cardTextX, cardTextY);
+                    cardHead.Size = new Size(cardTextW, headNeed.Height);
+                    cardDesc.Location = new Point(cardTextX, cardHead.Bottom + U(1));
+                    cardDesc.Size = new Size(cardTextW, descNeed.Height);
+                    y += cardH + gap;
+
+                    Size leadNeed = MeasureWrap(lead.Text, lead.Font, inner);
+                    lead.Location = new Point(padX, y);
+                    lead.Size = new Size(inner, leadNeed.Height);
+                    y += lead.Height + listGap;
+
+                    int rowIcon = U(22);
+                    int rowTextX = padX + rowIcon + U(14);
+                    int rowTextW = width - padX - rowTextX;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        rowIcons[i].SetScale(rowIcon, rowIcon);
+                        Size rh = MeasureWrap(rowHeads[i].Text, fontBody, rowTextW);
+                        Size rd = MeasureWrap(rowDescs[i].Text, fontSmall, rowTextW);
+                        int rowH = Math.Max(rowIcon, rh.Height + U(1) + rd.Height);
+                        rowIcons[i].Location = new Point(padX, y + U(1));
+                        rowHeads[i].Location = new Point(rowTextX, y);
+                        rowHeads[i].Size = new Size(rowTextW, rh.Height);
+                        rowDescs[i].Location = new Point(rowTextX, rowHeads[i].Bottom + U(1));
+                        rowDescs[i].Size = new Size(rowTextW, rd.Height);
+                        y += rowH + (i == 2 ? padY : listGap);
+                    }
+
+                    int bodyBottom = y;
+                    int chkBox = U(20);
+                    int btnW = U(150);
+                    int btnH = U(40);
+                    int ackTextW = width - 2 * footerPadX - chkBox - U(12);
+                    int ackH = LayoutCheckRow(understandBox, understandLabel, footerPadX, footerPadTop, ackTextW, chkBox);
+                    int againTop = footerPadTop + ackH + U(8);
+                    int againH = LayoutCheckRow(dontShowBox, dontShowLabel, footerPadX, againTop, ackTextW, chkBox);
+                    int footerH = againTop + againH + footerGap + btnH + footerPadBot;
+                    footer.Location = new Point(0, bodyBottom);
+                    footer.Size = new Size(width, footerH);
+                    int btnY = againTop + againH + footerGap;
+                    exitButton.Size = new Size(btnW, btnH);
+                    continueButton.Size = new Size(btnW, btnH);
+                    exitButton.Location = new Point(width - footerPadX - btnW, btnY);
+                    continueButton.Location = new Point(exitButton.Left - U(10) - btnW, btnY);
+
+                    int clientH = bodyBottom + footerH;
+                    int maxH = MaxClientHeight();
+                    // Widen by at most 240 design px (1520 px at 200%).
+                    bool widest = width >= maxW || extraW >= U(240);
+                    if (clientH <= maxH || (tighten <= 0.01f && widest) || attempt == maxAttempts - 1)
+                    {
+                        SetLayoutClientSize(new Size(width, clientH));
+                        break;
+                    }
+                    if (tighten > 0.01f) tighten = Math.Max(0f, tighten - 0.2f);
+                    else extraW += U(40);
+                }
+                // Hold old fonts until Dispose. Freeing them here, while a
+                // button paint is still queued, throws GDI+ "Parameter is not valid".
+                retiredFonts.AddRange(previousFonts);
             }
-            catch { }
-            try
+            finally { layingOut = false; }
+        }
+
+        // Glyph centered on the first line of the label (MiddleLeft when the
+        // text is one line; first-line center when it wraps). The caption lives
+        // on a Label so it uses the same GDI TextRenderer and weight as body text.
+        // The box control is the 20px square plus a focus-ring margin on each side.
+        int LayoutCheckRow(CheckBox box, Label caption, int x, int y, int textW, int chkBox)
+        {
+            Size need = MeasureWrap(caption.Text ?? "", caption.Font, textW);
+            int firstH = MeasureLine(caption.Text ?? "Ag", caption.Font).Height;
+            int rowH = Math.Max(chkBox, need.Height + U(6));
+            caption.Location = new Point(x + chkBox + U(12), y);
+            caption.Size = new Size(textW, rowH);
+            int boxY = y + (firstH - chkBox) / 2;
+            int ring = RoundCheckBox.RingFor(sc);
+            box.Size = new Size(chkBox + 2 * ring, chkBox + 2 * ring);
+            box.Location = new Point(x - ring, boxY - ring);
+            box.CheckAlign = ContentAlignment.MiddleLeft;
+            box.TextAlign = ContentAlignment.MiddleLeft;
+            return rowH;
+        }
+
+        int LerpPad(int full, int min, float tighten)
+        {
+            return U((int)Math.Round(min + (full - min) * tighten));
+        }
+
+        void ApplyContinueState()
+        {
+            bool on = understandBox.Checked;
+            continueButton.Enabled = on;
+            if (on)
             {
-                using (Icon sized = new Icon(SystemIcons.Warning, size, size))
-                    return sized.ToBitmap();
+                continueButton.BackColor = primaryBack;
+                continueButton.ForeColor = primaryFore;
+                continueButton.FlatAppearance.BorderColor = primaryBack;
+                continueButton.Cursor = Cursors.Hand;
             }
-            catch { return SystemIcons.Warning.ToBitmap(); }
+            else
+            {
+                continueButton.BackColor = primaryDisabledBack;
+                continueButton.ForeColor = primaryDisabledFore;
+                continueButton.FlatAppearance.BorderColor = primaryDisabledBorder;
+                continueButton.Cursor = Cursors.Default;
+            }
+        }
+
+        void PaintCardBorder(object sender, PaintEventArgs e)
+        {
+            Rectangle r = new Rectangle(0, 0, card.Width - 1, card.Height - 1);
+            int rad = Math.Max(1, U(6));
+            using (GraphicsPath path = RoundedRect(r, rad))
+            using (Pen pen = new Pen(panelBorder))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.DrawPath(pen, path);
+            }
+        }
+
+        static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            if (d <= 0 || d > r.Width || d > r.Height)
+            {
+                path.AddRectangle(r);
+                return path;
+            }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
+            // Scale stays at the value from the constructor (MainForm's system
+            // DPI, or a test scale). A later move to another monitor is handled
+            // by WM_DPICHANGED; do not overwrite a simulated scale here.
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && warningBitmap != null) warningBitmap.Dispose();
+            if (disposing) DisposeFonts();
             base.Dispose(disposing);
         }
 
-        int U(int value) { return (int)Math.Round(value * sc); }
-        Size Z(int width, int height) { return new Size(U(width), U(height)); }
+        void StyleCheck(CheckBox box)
+        {
+            RoundCheckBox round = box as RoundCheckBox;
+            if (round == null) return;
+            round.ApplyDialogColors(footerBack, fore, primaryBack, primaryFore, dark);
+        }
+
+        // Non-interactive picture of the real Return to DHCP button: same caption,
+        // color and typeface, sized to the text, no focus, hover or click.
+        sealed class ButtonReplica : Control
+        {
+            string caption = "";
+            Font font;
+            Color fill, text;
+            float sc = 1f;
+
+            public ButtonReplica()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                SetStyle(ControlStyles.Selectable, false);
+                TabStop = false;
+                Cursor = Cursors.Default;
+            }
+
+            public void SetCaption(string caption, Font font, Color fill, Color text, float sc)
+            {
+                this.caption = caption;
+                this.font = font;
+                this.fill = fill;
+                this.text = text;
+                this.sc = sc;
+                Recalculate();
+            }
+
+            public void Recalculate()
+            {
+                if (font == null)
+                {
+                    Size = new Size((int)Math.Round(80 * sc), (int)Math.Round(32 * sc));
+                    return;
+                }
+                Size need;
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                    need = TextRenderer.MeasureText(g, caption, font, new Size(int.MaxValue, int.MaxValue),
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                // Mockup: a 176x60 button with 15px bold text, centered.
+                int padX = (int)Math.Round(18 * sc);
+                int padY = (int)Math.Round(10 * sc);
+                Size = new Size(Math.Max(need.Width + 2 * padX, (int)Math.Round(176 * sc)),
+                    Math.Max(need.Height + 2 * padY, (int)Math.Round(60 * sc)));
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                int rad = Math.Max(1, (int)Math.Round(3 * sc));
+                Rectangle r = new Rectangle(0, 0, Width, Height);
+                using (GraphicsPath path = RoundedRect(new Rectangle(r.X, r.Y, r.Width - 1, r.Height - 1), rad))
+                using (SolidBrush brush = new SolidBrush(fill))
+                    e.Graphics.FillPath(brush, path);
+                if (font != null)
+                    TextRenderer.DrawText(e.Graphics, caption, font, ClientRectangle, text,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                const int WM_SETCURSOR = 0x0020, WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201,
+                    WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
+                if (m.Msg == WM_SETCURSOR || m.Msg == WM_MOUSEMOVE || m.Msg == WM_LBUTTONDOWN ||
+                    m.Msg == WM_LBUTTONUP || m.Msg == WM_LBUTTONDBLCLK)
+                {
+                    if (m.Msg == WM_SETCURSOR) { m.Result = (IntPtr)1; return; }
+                    return;
+                }
+                base.WndProc(ref m);
+            }
+        }
+
+        sealed class VectorIcon : Control
+        {
+            public enum Kind { Warning, NoInternet, Devices, Shield }
+
+            readonly Kind kind;
+            readonly Color accent, ink, backdrop;
+
+            public VectorIcon(Kind kind, Color accent, Color ink, Color backdrop)
+            {
+                this.kind = kind;
+                this.accent = accent;
+                this.ink = ink;
+                this.backdrop = backdrop;
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw, true);
+                SetStyle(ControlStyles.Selectable, false);
+                TabStop = false;
+                BackColor = Color.Transparent;
+            }
+
+            public void SetScale(int width, int height)
+            {
+                Size = new Size(width, height);
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                if (Width < 2 || Height < 2) return;
+                float vb = kind == Kind.Warning ? 36f : 22f;
+                g.ScaleTransform(Width / vb, Height / vb);
+                switch (kind)
+                {
+                    case Kind.Warning:
+                        using (GraphicsPath tri = ParseSvgPath("M18 4.5L33 31H3L18 4.5z"))
+                        using (SolidBrush fill = new SolidBrush(accent))
+                        using (Pen stroke = new Pen(accent, 3f) { LineJoin = LineJoin.Round })
+                        {
+                            g.FillPath(fill, tri);
+                            g.DrawPath(stroke, tri);
+                        }
+                        using (Pen stem = new Pen(ink, 3f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                            g.DrawLine(stem, 18f, 14f, 18f, 22f);
+                        using (SolidBrush dot = new SolidBrush(ink))
+                            g.FillEllipse(dot, 18f - 1.8f, 26.5f - 1.8f, 3.6f, 3.6f);
+                        break;
+                    case Kind.NoInternet:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            g.DrawEllipse(pen, 11f - 8f, 11f - 8f, 16f, 16f);
+                            using (GraphicsPath meridians = ParseSvgPath("M3 11h16M11 3c2.6 2.4 2.6 13.6 0 16M11 3c-2.6 2.4-2.6 13.6 0 16"))
+                                g.DrawPath(pen, meridians);
+                            using (Pen knock = new Pen(backdrop, 4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                g.DrawLine(knock, 4f, 4f, 18f, 18f);
+                            g.DrawLine(pen, 4f, 4f, 18f, 18f);
+                        }
+                        break;
+                    case Kind.Devices:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            DrawRoundRect(g, pen, 2.5f, 4f, 7f, 6f, 1f);
+                            DrawRoundRect(g, pen, 12.5f, 4f, 7f, 6f, 1f);
+                            using (GraphicsPath stand = ParseSvgPath("M6 10v4h10v-4M11 14v4M8 18h6"))
+                                g.DrawPath(pen, stand);
+                        }
+                        break;
+                    case Kind.Shield:
+                        using (Pen pen = new Pen(accent, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        {
+                            using (GraphicsPath shield = ParseSvgPath("M11 2.5l7 2.5v5.500c0 4.200-2.900 7.400-7 9-4.100-1.600-7-4.800-7-9V5l7-2.500z"))
+                                g.DrawPath(pen, shield);
+                            using (GraphicsPath bang = ParseSvgPath("M11 7.5v4.500M11 15v.2"))
+                                g.DrawPath(pen, bang);
+                        }
+                        break;
+                }
+            }
+
+            static void DrawRoundRect(Graphics g, Pen pen, float x, float y, float w, float h, float r)
+            {
+                using (GraphicsPath path = new GraphicsPath())
+                {
+                    float d = r * 2f;
+                    path.AddArc(x, y, d, d, 180, 90);
+                    path.AddArc(x + w - d, y, d, d, 270, 90);
+                    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+                    path.AddArc(x, y + h - d, d, d, 90, 90);
+                    path.CloseFigure();
+                    g.DrawPath(pen, path);
+                }
+            }
+        }
+
+        static GraphicsPath ParseSvgPath(string d)
+        {
+            GraphicsPath path = new GraphicsPath();
+            path.FillMode = FillMode.Winding;
+            List<object> tokens = new List<object>();
+            int i = 0;
+            while (i < d.Length)
+            {
+                char c = d[i];
+                if (char.IsWhiteSpace(c) || c == ',') { i++; continue; }
+                if (char.IsLetter(c)) { tokens.Add(c); i++; continue; }
+                int start = i;
+                if (c == '+' || c == '-') i++;
+                bool dot = false;
+                while (i < d.Length)
+                {
+                    char n = d[i];
+                    if (char.IsDigit(n)) { i++; continue; }
+                    if (n == '.' && !dot) { dot = true; i++; continue; }
+                    break;
+                }
+                if (i == start || (i == start + 1 && (d[start] == '+' || d[start] == '-')))
+                { i++; continue; }
+                float value;
+                if (float.TryParse(d.Substring(start, i - start), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out value))
+                    tokens.Add(value);
+            }
+
+            float x = 0, y = 0, sx = 0, sy = 0;
+            char cmd = 'M';
+            int t = 0;
+            while (t < tokens.Count)
+            {
+                if (tokens[t] is char)
+                {
+                    cmd = (char)tokens[t];
+                    t++;
+                    if (cmd == 'z' || cmd == 'Z')
+                    {
+                        path.CloseFigure();
+                        x = sx; y = sy;
+                        continue;
+                    }
+                }
+                bool rel = char.IsLower(cmd);
+                char op = char.ToUpperInvariant(cmd);
+                if (op == 'M' || op == 'L')
+                {
+                    if (t + 1 >= tokens.Count || !(tokens[t] is float)) break;
+                    float nx = (float)tokens[t], ny = (float)tokens[t + 1]; t += 2;
+                    if (rel) { nx += x; ny += y; }
+                    if (op == 'M') { path.StartFigure(); sx = nx; sy = ny; cmd = rel ? 'l' : 'L'; }
+                    else path.AddLine(x, y, nx, ny);
+                    x = nx; y = ny;
+                }
+                else if (op == 'H')
+                {
+                    if (t >= tokens.Count || !(tokens[t] is float)) break;
+                    float nx = (float)tokens[t]; t++;
+                    if (rel) nx += x;
+                    path.AddLine(x, y, nx, y);
+                    x = nx;
+                }
+                else if (op == 'V')
+                {
+                    if (t >= tokens.Count || !(tokens[t] is float)) break;
+                    float ny = (float)tokens[t]; t++;
+                    if (rel) ny += y;
+                    path.AddLine(x, y, x, ny);
+                    y = ny;
+                }
+                else if (op == 'C')
+                {
+                    if (t + 5 >= tokens.Count) break;
+                    float x1 = (float)tokens[t], y1 = (float)tokens[t + 1];
+                    float x2 = (float)tokens[t + 2], y2 = (float)tokens[t + 3];
+                    float x3 = (float)tokens[t + 4], y3 = (float)tokens[t + 5];
+                    t += 6;
+                    if (rel) { x1 += x; y1 += y; x2 += x; y2 += y; x3 += x; y3 += y; }
+                    path.AddBezier(x, y, x1, y1, x2, y2, x3, y3);
+                    x = x3; y = y3;
+                }
+                else break;
+            }
+            return path;
+        }
 
         // A wrapped line made of differently styled runs (e.g. a bold phrase inside
         // a sentence). Words are measured and drawn with GDI TextRenderer, the same
-        // renderer Labels use, so sizes follow the system DPI.
+        // renderer Labels use, so sizes follow the current scale.
         // Measuring MUST use the IDeviceContext overload: on .NET Framework the
         // MeasureText(string, Font, Size, flags) overload drops NoPadding and adds
         // glyph-overhang padding to every word, while DrawText(Graphics, ...) honors
@@ -1542,6 +4826,12 @@ namespace IPbind
                 TabStop = false;
             }
 
+            public void Clear()
+            {
+                words.Clear();
+                pendingSpace = false;
+            }
+
             public void AddRun(string text, Font font, Color color)
             {
                 int i = 0;
@@ -1560,22 +4850,23 @@ namespace IPbind
             }
 
             // Lays the words out within maxWidth and sizes the control to fit.
+            // Never mutate word.Text: a later FitWidth (the tighten loop) may
+            // put a word back on the previous line, and a trimmed leading
+            // space would be gone ("clickthe Return to DHCP").
             public void FitWidth(int maxWidth)
             {
                 int x = 0, y = 0, lineHeight = 0, widest = 0;
-                // Screen DC: same system DPI the dialog paints at.
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                 {
                     foreach (Word word in words)
                     {
-                        int fullWidth = Measure(g, word);
+                        int fullWidth = Measure(g, word.Text, word.Font);
                         if (x > 0 && x + fullWidth > maxWidth)
                         {
                             y += lineHeight;
                             x = 0;
                             lineHeight = 0;
-                            word.Text = word.Text.TrimStart(' ');
-                            fullWidth = Measure(g, word);
+                            fullWidth = Measure(g, DisplayText(word, true), word.Font);
                         }
                         word.Location = new Point(x, y);
                         x += fullWidth;
@@ -1583,27 +4874,709 @@ namespace IPbind
                         lineHeight = Math.Max(lineHeight, word.Font.Height);
                     }
                 }
-                Size = new Size(Math.Min(maxWidth, widest + 2), y + lineHeight + 2);
+                Size = new Size(Math.Min(maxWidth, Math.Max(widest + 2, 1)), y + lineHeight + 2);
             }
 
-            static int Measure(Graphics g, Word word)
+            static string DisplayText(Word word, bool lineStart)
             {
-                return TextRenderer.MeasureText(g, word.Text, word.Font, new Size(int.MaxValue, int.MaxValue), Flags).Width;
+                if (lineStart && word.Text != null && word.Text.Length > 0 && word.Text[0] == ' ')
+                    return word.Text.TrimStart(' ');
+                return word.Text;
+            }
+
+            static int Measure(Graphics g, string text, Font font)
+            {
+                return TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue), Flags).Width;
             }
 
             protected override void OnPaint(PaintEventArgs e)
             {
                 base.OnPaint(e);
                 foreach (Word word in words)
-                    TextRenderer.DrawText(e.Graphics, word.Text, word.Font, word.Location, word.Color, Flags);
+                    TextRenderer.DrawText(e.Graphics, DisplayText(word, word.Location.X == 0),
+                        word.Font, word.Location, word.Color, Flags);
             }
         }
     }
 
+    // Per-area auto-hide for the console and IP-list vertical bars (2.3.138).
+    // Pattern from IXSmon ScrollBarIdleState, implemented as a reserved-gutter
+    // overlay so WinForms never toggles ScrollBars / ShowScrollBar (that would
+    // change the client width and wrap-shift the text).
+    sealed class ScrollBarIdleState
+    {
+        public static readonly TimeSpan HideAfter = TimeSpan.FromSeconds(5);
+        readonly TimeSpan hideAfter;
+
+        public ScrollBarIdleState() : this(DateTime.Now, null) { }
+
+        public ScrollBarIdleState(DateTime now, TimeSpan? hideAfter)
+        {
+            this.hideAfter = hideAfter.HasValue ? hideAfter.Value : HideAfter;
+            Visible = true;
+            HideDueAt = now + this.hideAfter;
+        }
+
+        public bool Visible { get; private set; }
+        public bool PointerOver { get; private set; }
+        // Null-equivalent: DateTime.MinValue means no deadline (hovered or already hidden).
+        public DateTime HideDueAt { get; private set; }
+
+        public void PointerEntered()
+        {
+            PointerOver = true;
+            Visible = true;
+            HideDueAt = DateTime.MinValue;
+        }
+
+        public void PointerMoved()
+        {
+            PointerEntered();
+        }
+
+        public void PointerExited(DateTime now)
+        {
+            PointerOver = false;
+            Visible = true;
+            HideDueAt = now + hideAfter;
+        }
+
+        // Wheel, thumb drag, or keyboard scroll. Does not run for AppendText / auto-scroll.
+        public void Scrolled(DateTime now)
+        {
+            Visible = true;
+            HideDueAt = PointerOver ? DateTime.MinValue : now + hideAfter;
+        }
+
+        public void Deactivated()
+        {
+            PointerOver = false;
+            Visible = false;
+            HideDueAt = DateTime.MinValue;
+        }
+
+        // True when Visible flipped. Callers apply only then, never on every tick.
+        public bool Tick(DateTime now)
+        {
+            if (Visible && !PointerOver && HideDueAt != DateTime.MinValue && now >= HideDueAt)
+            {
+                Visible = false;
+                HideDueAt = DateTime.MinValue;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    static class AutoHideScrollBars
+    {
+        public static readonly TimeSpan CheckEvery = TimeSpan.FromMilliseconds(250);
+        static readonly List<AutoHideScrollBox> areas = new List<AutoHideScrollBox>();
+        static System.Windows.Forms.Timer timer;
+        static bool filterAdded;
+
+        public static void Register(AutoHideScrollBox box)
+        {
+            if (box == null || areas.Contains(box)) return;
+            areas.Add(box);
+            if (timer == null)
+            {
+                timer = new System.Windows.Forms.Timer();
+                timer.Interval = (int)CheckEvery.TotalMilliseconds;
+                timer.Tick += OnTick;
+                timer.Start();
+            }
+            if (!filterAdded)
+            {
+                Application.AddMessageFilter(new WheelFilter());
+                filterAdded = true;
+            }
+            Form form = box.FindForm();
+            if (form != null)
+            {
+                form.Deactivate -= OnDeactivate;
+                form.Deactivate += OnDeactivate;
+                form.FormClosed -= OnFormClosed;
+                form.FormClosed += OnFormClosed;
+            }
+        }
+
+        public static void Unregister(AutoHideScrollBox box)
+        {
+            areas.Remove(box);
+        }
+
+        static void OnTick(object sender, EventArgs e)
+        {
+            DateTime now = DateTime.Now;
+            Point cursor;
+            try { cursor = Cursor.Position; }
+            catch { return; }
+            for (int i = 0; i < areas.Count; i++)
+            {
+                AutoHideScrollBox box = areas[i];
+                if (box.IsDisposed || !box.IsHandleCreated) continue;
+                bool over = box.IsDragging || box.AreaContains(cursor);
+                bool changed = false;
+                if (over && !box.State.PointerOver)
+                {
+                    box.State.PointerEntered();
+                    changed = true;
+                }
+                else if (!over && box.State.PointerOver)
+                {
+                    box.State.PointerExited(now);
+                    changed = true;
+                }
+                if (box.State.Tick(now)) changed = true;
+                if (changed) box.ApplyVisibility();
+            }
+        }
+
+        static void OnDeactivate(object sender, EventArgs e)
+        {
+            for (int i = 0; i < areas.Count; i++)
+            {
+                AutoHideScrollBox box = areas[i];
+                if (box.IsDisposed) continue;
+                box.State.Deactivated();
+                box.ApplyVisibility();
+            }
+        }
+
+        static void OnFormClosed(object sender, EventArgs e)
+        {
+            Form form = sender as Form;
+            if (form == null) return;
+            form.Deactivate -= OnDeactivate;
+            form.FormClosed -= OnFormClosed;
+            for (int i = areas.Count - 1; i >= 0; i--)
+            {
+                if (areas[i].FindForm() == form) areas.RemoveAt(i);
+            }
+        }
+
+        sealed class WheelFilter : IMessageFilter
+        {
+            const int WM_MOUSEWHEEL = 0x020A;
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                if (m.Msg != WM_MOUSEWHEEL) return false;
+                Point cursor;
+                try { cursor = Cursor.Position; }
+                catch { return false; }
+                for (int i = 0; i < areas.Count; i++)
+                {
+                    AutoHideScrollBox box = areas[i];
+                    if (box.IsDisposed || !box.IsHandleCreated) continue;
+                    if (!box.AreaContains(cursor)) continue;
+                    box.HandleWheel(unchecked((int)(m.WParam.ToInt64() & 0xFFFFFFFF)));
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    // Multiline text box with the native vertical bar off and a thin overlay in a
+    // permanently reserved right margin. Hover / wheel / keyboard / thumb-drag are
+    // the only inputs that reset the hide deadline.
+    sealed class AutoHideScrollBox : TextBox
+    {
+        const int WM_KEYDOWN = 0x0100;
+        const int WM_SETREDRAW = 0x000B;
+        const int EM_SETMARGINS = 0x00D3;
+        const int EM_GETRECT = 0x00B2;
+        const int EM_LINESCROLL = 0x00B6;
+        const int EM_GETLINECOUNT = 0x00BA;
+        const int EM_GETFIRSTVISIBLELINE = 0x00CE;
+        const int EC_RIGHTMARGIN = 0x0002;
+        const int GWL_STYLE = -16;
+        const int ES_AUTOVSCROLL = 0x0040;
+        const int WS_VSCROLL = 0x00200000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", EntryPoint = "SendMessage", CharSet = CharSet.Auto)]
+        static extern IntPtr SendMessageRect(IntPtr hWnd, int msg, IntPtr wParam, ref RECT lParam);
+        [DllImport("user32.dll")]
+        static extern int GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+        static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+        static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+        static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+        static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        public readonly ScrollBarIdleState State = new ScrollBarIdleState();
+        readonly OverlayBar overlay;
+        int gutter = 10;
+        int lastPaintedVisible = -1;
+        int lastFirstLine = -1;
+        string areaName = "";
+        public int DebugPaintCount;
+        public bool IsDragging;
+
+        public AutoHideScrollBox()
+        {
+            Multiline = true;
+            ScrollBars = ScrollBars.None;
+            overlay = new OverlayBar(this);
+        }
+
+        public void SetAreaName(string name) { areaName = name ?? ""; }
+
+        public bool BarShown
+        {
+            get { return State.Visible && CanScroll(); }
+        }
+
+        public int GutterWidth { get { return gutter; } }
+
+        public Rectangle OverlayScreenRect
+        {
+            get
+            {
+                if (overlay == null || !overlay.IsHandleCreated)
+                    return Rectangle.Empty;
+                return overlay.RectangleToScreen(overlay.ClientRectangle);
+            }
+        }
+
+        public Rectangle ThumbScreenRect
+        {
+            get
+            {
+                Rectangle local = overlay.ThumbRect();
+                if (local.IsEmpty || !overlay.IsHandleCreated) return Rectangle.Empty;
+                return overlay.RectangleToScreen(local);
+            }
+        }
+
+        public bool AreaContains(Point screen)
+        {
+            if (!IsHandleCreated) return false;
+            if (RectangleToScreen(ClientRectangle).Contains(screen)) return true;
+            if (overlay != null && overlay.IsHandleCreated
+                && overlay.RectangleToScreen(overlay.ClientRectangle).Contains(screen))
+                return true;
+            return false;
+        }
+
+        public bool CanScroll()
+        {
+            return MaxFirstLine() > 0;
+        }
+
+        public int FirstVisibleLine()
+        {
+            if (!IsHandleCreated) return 0;
+            return (int)SendMessage(Handle, EM_GETFIRSTVISIBLELINE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public int LineCount()
+        {
+            if (!IsHandleCreated) return 0;
+            return (int)SendMessage(Handle, EM_GETLINECOUNT, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public int VisibleLineCount()
+        {
+            if (!IsHandleCreated) return 1;
+            RECT r = new RECT();
+            SendMessageRect(Handle, EM_GETRECT, IntPtr.Zero, ref r);
+            int h = r.Bottom - r.Top;
+            int lh = Font != null ? Font.Height : 16;
+            if (lh < 1) lh = 16;
+            return Math.Max(1, h / lh);
+        }
+
+        public int MaxFirstLine()
+        {
+            return Math.Max(0, LineCount() - VisibleLineCount());
+        }
+
+        public void LineScroll(int lines)
+        {
+            if (!IsHandleCreated || lines == 0) return;
+            SendMessage(Handle, EM_LINESCROLL, IntPtr.Zero, (IntPtr)lines);
+            lastFirstLine = FirstVisibleLine();
+        }
+
+        public void ScrollToFirst(int first)
+        {
+            int max = MaxFirstLine();
+            if (first < 0) first = 0;
+            if (first > max) first = max;
+            LineScroll(first - FirstVisibleLine());
+        }
+
+        // Update the thumb after AppendText / auto-scroll / a layout change.
+        // Must not reset the hide deadline.
+        public void SyncThumbOnly()
+        {
+            lastFirstLine = FirstVisibleLine();
+            // Content may flip CanScroll (so the thumb should appear or
+            // disappear) without counting as input. ApplyVisibility paints
+            // that change; it must not be skipped or the bar can get stuck.
+            ApplyVisibility();
+            if (overlay != null)
+            {
+                overlay.BringToFront();
+                if (State.Visible) overlay.Invalidate();
+            }
+        }
+
+        public void HandleWheel(int wParam)
+        {
+            int delta = (short)((wParam >> 16) & 0xFFFF);
+            int notches = delta / 120;
+            if (notches == 0) return;
+            int per = SystemInformation.MouseWheelScrollLines;
+            int lines;
+            if (per <= 0) lines = -notches * VisibleLineCount();
+            else lines = -notches * per;
+            LineScroll(lines);
+            State.Scrolled(DateTime.Now);
+            ApplyVisibility();
+            SyncThumbOnly();
+        }
+
+        public void ApplyVisibility()
+        {
+            bool shown = BarShown;
+            int flag = shown ? 1 : 0;
+            if (flag != lastPaintedVisible)
+            {
+                lastPaintedVisible = flag;
+                if (areaName.Length > 0)
+                    DebugLog.Debug("scrollbar " + areaName + (shown ? " shown" : " hidden"));
+                if (overlay != null)
+                {
+                    overlay.BringToFront();
+                    overlay.Invalidate();
+                }
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ScrollBars = ScrollBars.None;
+            EnsureAutoVScroll();
+            ApplyMargin();
+            AutoHideScrollBars.Register(this);
+            AttachOverlay();
+            ApplyVisibility();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            AutoHideScrollBars.Unregister(this);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void OnParentChanged(EventArgs e)
+        {
+            base.OnParentChanged(e);
+            AttachOverlay();
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            PositionOverlay();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            ApplyMargin();
+            PositionOverlay();
+            SyncThumbOnly();
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            ApplyMargin();
+            PositionOverlay();
+            SyncThumbOnly();
+        }
+
+        protected override void OnBackColorChanged(EventArgs e)
+        {
+            base.OnBackColorChanged(e);
+            if (overlay != null) overlay.Invalidate();
+        }
+
+        void AttachOverlay()
+        {
+            if (overlay == null || Parent == null) return;
+            if (overlay.Parent != Parent) Parent.Controls.Add(overlay);
+            PositionOverlay();
+            overlay.BringToFront();
+            if (IsHandleCreated) AutoHideScrollBars.Register(this);
+        }
+
+        void PositionOverlay()
+        {
+            if (overlay == null || Parent == null) return;
+            int frameX = Math.Max(0, (Width - ClientSize.Width) / 2);
+            int frameY = Math.Max(0, (Height - ClientSize.Height) / 2);
+            int w = Math.Max(1, gutter);
+            overlay.SetBounds(
+                Left + frameX + Math.Max(0, ClientSize.Width - w),
+                Top + frameY,
+                w,
+                Math.Max(1, ClientSize.Height));
+            overlay.BringToFront();
+        }
+
+        void ApplyMargin()
+        {
+            int dpi = 96;
+            try
+            {
+                if (IsHandleCreated) dpi = GetDpiForWindow(Handle);
+            }
+            catch
+            {
+                try { using (Graphics g = CreateGraphics()) dpi = (int)Math.Round(g.DpiX); }
+                catch { dpi = 96; }
+            }
+            if (dpi < 96) dpi = 96;
+            int want = Math.Max(8, (int)Math.Round(10.0 * dpi / 96.0));
+            gutter = want;
+            if (!IsHandleCreated) return;
+            int first = FirstVisibleLine();
+            int sel = SelectionStart;
+            int len = SelectionLength;
+            SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+            SendMessage(Handle, EM_SETMARGINS, (IntPtr)EC_RIGHTMARGIN, (IntPtr)(gutter << 16));
+            int now = FirstVisibleLine();
+            if (now != first) LineScroll(first - now);
+            SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
+            try
+            {
+                SelectionStart = sel;
+                SelectionLength = len;
+            }
+            catch { }
+            Invalidate();
+        }
+
+        void EnsureAutoVScroll()
+        {
+            if (!IsHandleCreated) return;
+            try
+            {
+                long style = GetStyle(Handle);
+                long next = (style | ES_AUTOVSCROLL) & ~WS_VSCROLL;
+                if (next != style) SetStyle(Handle, next);
+            }
+            catch { }
+        }
+
+        static long GetStyle(IntPtr hwnd)
+        {
+            if (IntPtr.Size == 8) return GetWindowLongPtr64(hwnd, GWL_STYLE).ToInt64();
+            return GetWindowLong32(hwnd, GWL_STYLE);
+        }
+
+        static void SetStyle(IntPtr hwnd, long style)
+        {
+            if (IntPtr.Size == 8) SetWindowLongPtr64(hwnd, GWL_STYLE, new IntPtr(style));
+            else SetWindowLong32(hwnd, GWL_STYLE, (int)style);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_KEYDOWN)
+            {
+                int before = FirstVisibleLine();
+                base.WndProc(ref m);
+                int after = FirstVisibleLine();
+                if (after == before)
+                    after = KeyboardScroll((int)m.WParam.ToInt64(), before);
+                if (after != before)
+                {
+                    lastFirstLine = after;
+                    State.Scrolled(DateTime.Now);
+                    ApplyVisibility();
+                    SyncThumbOnly();
+                }
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // Read-only boxes (the console) often swallow PageUp/PageDown/Home/End
+        // without scrolling once the native bar is gone. Do it ourselves when
+        // the base handler left the first visible line unchanged.
+        int KeyboardScroll(int key, int before)
+        {
+            const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24;
+            const int VK_UP = 0x26, VK_DOWN = 0x28;
+            if (key == VK_PRIOR) ScrollToFirst(before - VisibleLineCount());
+            else if (key == VK_NEXT) ScrollToFirst(before + VisibleLineCount());
+            else if (key == VK_HOME) ScrollToFirst(0);
+            else if (key == VK_END) ScrollToFirst(MaxFirstLine());
+            else if (key == VK_UP) LineScroll(-1);
+            else if (key == VK_DOWN) LineScroll(1);
+            else return before;
+            return FirstVisibleLine();
+        }
+
+        sealed class OverlayBar : Control
+        {
+            readonly AutoHideScrollBox box;
+            bool dragging;
+            int dragStartY;
+            int dragStartFirst;
+
+            public OverlayBar(AutoHideScrollBox box)
+            {
+                this.box = box;
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
+                TabStop = false;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                box.DebugPaintCount++;
+                Graphics g = e.Graphics;
+                g.Clear(box.BackColor);
+                if (!box.State.Visible || !box.CanScroll()) return;
+                Rectangle thumb = ThumbRect();
+                if (thumb.IsEmpty) return;
+                Color fill = ThumbColor(false);
+                if (dragging || (box.State.PointerOver && thumb.Contains(PointToClient(Cursor.Position))))
+                    fill = ThumbColor(true);
+                using (SolidBrush br = new SolidBrush(fill))
+                using (GraphicsPath path = Rounded(thumb, Math.Max(2, thumb.Width / 2)))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.FillPath(br, path);
+                }
+            }
+
+            public Rectangle ThumbRect()
+            {
+                int max = box.MaxFirstLine();
+                if (max <= 0 || Height <= 0) return Rectangle.Empty;
+                int pad = Math.Max(2, box.GutterWidth / 5);
+                int track = Height - 2 * pad;
+                if (track <= 0) return Rectangle.Empty;
+                int total = box.LineCount();
+                int vis = box.VisibleLineCount();
+                int thumbH = Math.Max(Math.Max(12, box.GutterWidth), (int)((long)track * vis / Math.Max(1, total)));
+                if (thumbH > track) thumbH = track;
+                int first = box.FirstVisibleLine();
+                int y = pad + (int)((long)(track - thumbH) * first / max);
+                int x = Math.Max(1, (Width - Math.Max(4, Width - 2 * pad)) / 2);
+                int w = Math.Max(4, Width - 2 * pad);
+                return new Rectangle(x, y, w, thumbH);
+            }
+
+            Color ThumbColor(bool hot)
+            {
+                bool dark = box.BackColor.R < 80 && box.BackColor.G < 80 && box.BackColor.B < 80;
+                if (dark) return hot ? Color.FromArgb(0x8E, 0x8E, 0x93) : Color.FromArgb(0x6E, 0x6E, 0x73);
+                return hot ? Color.FromArgb(0x8E, 0x8E, 0x93) : Color.FromArgb(0xC6, 0xC6, 0xC8);
+            }
+
+            static GraphicsPath Rounded(Rectangle r, int radius)
+            {
+                GraphicsPath path = new GraphicsPath();
+                int d = radius * 2;
+                if (d <= 0 || d > r.Width || d > r.Height)
+                {
+                    path.AddRectangle(r);
+                    return path;
+                }
+                path.AddArc(r.X, r.Y, d, d, 180, 90);
+                path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+                path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+                path.CloseFigure();
+                return path;
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                base.OnMouseDown(e);
+                if (e.Button != MouseButtons.Left) return;
+                if (!box.CanScroll()) return;
+                box.State.PointerEntered();
+                box.ApplyVisibility();
+                Rectangle thumb = ThumbRect();
+                if (thumb.Contains(e.Location))
+                {
+                    dragging = true;
+                    box.IsDragging = true;
+                    dragStartY = e.Y;
+                    dragStartFirst = box.FirstVisibleLine();
+                    Capture = true;
+                }
+                else
+                {
+                    // Click in the track pages by one viewport.
+                    int page = box.VisibleLineCount();
+                    if (e.Y < thumb.Top) box.ScrollToFirst(box.FirstVisibleLine() - page);
+                    else box.ScrollToFirst(box.FirstVisibleLine() + page);
+                    box.State.Scrolled(DateTime.Now);
+                    box.ApplyVisibility();
+                    box.SyncThumbOnly();
+                }
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                if (!dragging) { Invalidate(); return; }
+                int max = box.MaxFirstLine();
+                if (max <= 0) return;
+                int pad = Math.Max(2, box.GutterWidth / 5);
+                int track = Height - 2 * pad - ThumbRect().Height;
+                if (track < 1) track = 1;
+                int delta = e.Y - dragStartY;
+                int first = dragStartFirst + (int)Math.Round((double)delta * max / track);
+                box.ScrollToFirst(first);
+                box.State.Scrolled(DateTime.Now);
+                box.ApplyVisibility();
+                Invalidate();
+            }
+
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                base.OnMouseUp(e);
+                if (!dragging) return;
+                dragging = false;
+                box.IsDragging = false;
+                Capture = false;
+                box.State.Scrolled(DateTime.Now);
+                box.ApplyVisibility();
+                Invalidate();
+            }
+
+            protected override void OnMouseWheel(MouseEventArgs e)
+            {
+                box.HandleWheel(e.Delta << 16);
+            }
+        }
+    }
+
+
     class MainForm : Form
     {
-        static readonly string AppVersion = BuildInfo.Version;
-
         static readonly string[] DefaultIPs = new string[] {
             "10.10.10.98/24",   "10.255.255.98/24", "10.255.128.98/24",
             "192.168.0.98/24",  "192.168.1.98/24",  "192.168.2.98/24",
@@ -1639,6 +5612,7 @@ namespace IPbind
         readonly string UpdateCheckFile;
         readonly string GatewayFile;
         readonly string DhcpReminderFile;   // exists once "Don't show this again" was confirmed
+        readonly string KeepDhcpFile;       // "1"/"0": Keep DHCP preference (missing = on)
 
         // Optional Gateway support: one listed address may carry a gateway and DNS.
         // The high metric keeps this route from beating Wi-Fi/corporate default routes.
@@ -1669,7 +5643,17 @@ namespace IPbind
         Button btnUpdateNow, btnUpdateLater;
         Button btnClear;
         Button btnAbout;
-        Label lblVersion;
+        CheckBox chkKeepDhcp;
+        ToolTip keepDhcpTip;
+        bool keepDhcpPref = true;     // what the user chose; the box is forced off where unsupported
+        bool settingKeepDhcp;
+        string coexistNoteFor;        // adapter whose "not available" note was already logged
+        const string KeepDhcpTipOn =
+            "On: DHCP stays on and these addresses are added alongside it.\r\n" +
+            "Off: static addresses only, no DHCP.";
+        const string KeepDhcpTipOff =
+            "Needs Windows 10 version 1703 or later.\r\n" +
+            "Apply uses static addresses only.";
         bool dark;
         bool launchUpdateCheckStarted;
         bool updateDismissed;
@@ -1686,15 +5670,19 @@ namespace IPbind
             UpdateCheckFile = Path.Combine(AppDir, "update-check.txt");
             GatewayFile = Path.Combine(AppDir, "gateway.txt");
             DhcpReminderFile = Path.Combine(AppDir, "dhcp-reminder-dismissed.txt");
+            KeepDhcpFile = Path.Combine(AppDir, "keep-dhcp.txt");
             BuildUi();
+            LoadKeepDhcpPref();
             LoadAdapters();
             LoadList();
             LoadGatewaySettings();
-            Log(BuildInfo.AppName + " v" + AppVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
+            Log(BuildInfo.AppName + " v" + BuildInfo.DisplayVersion + " started. Select an interface, edit the list if needed, then Apply or revert.");
             if (defaultsUpgraded)
                 Log("Default address list updated to the latest defaults.", "INFO");
             if (BuildInfo.IsBeta)
                 Log("Beta build: separate settings (%APPDATA%\\" + BuildInfo.AppName + "), updates only from the beta pre-release.");
+            DebugLog.WatchForm(this);
+            LogAdaptersRaw();
         }
 
         // scale helper: design pixels -> device pixels
@@ -1711,15 +5699,24 @@ namespace IPbind
         void Log(string msg) { Log(msg, "INFO"); }
         void Log(string msg, string level)
         {
+            string fileLevel = level == "ERR" ? "ERROR" : (string.IsNullOrEmpty(level) ? "INFO" : level);
+            DebugLog.Write(fileLevel, msg);
             if (console.InvokeRequired)
             {
-                console.BeginInvoke((Action<string, string>)Log, msg, level);
+                console.BeginInvoke((Action<string, string>)LogConsole, msg, level);
                 return;
             }
+            LogConsole(msg, level);
+        }
+
+        void LogConsole(string msg, string level)
+        {
             string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
             console.AppendText(line);
             console.SelectionStart = console.TextLength;
             console.ScrollToCaret();
+            AutoHideScrollBox box = console as AutoHideScrollBox;
+            if (box != null) box.SyncThumbOnly();
         }
 
         bool TryCidr(string s, out string ip, out int prefix)
@@ -1768,7 +5765,7 @@ namespace IPbind
         {
             EnsureAppDir();
             string[] lines = CanonicalList();
-            File.WriteAllLines(StoreFile, lines);
+            File.WriteAllLines(StoreFile, lines); DebugLog.LogSettingsFile(StoreFile, "save-iplist");
             txtIPs.Lines = lines;
             if (!quiet) Log("Saved " + lines.Length + " address(es) to disk.", "OK");
         }
@@ -1827,6 +5824,7 @@ namespace IPbind
             if (File.Exists(StoreFile))
             {
                 List<string> lines = new List<string>();
+                DebugLog.LogSettingsFile(StoreFile, "load-iplist");
                 foreach (string l in File.ReadAllLines(StoreFile))
                 {
                     string t = (l ?? "").Trim();
@@ -1874,7 +5872,7 @@ namespace IPbind
             Log("Restored defaults (added " + added + " missing; kept custom entries).", "OK");
         }
 
-        void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); }
+        void SaveAdapter(string name) { EnsureAppDir(); File.WriteAllText(AdapterFile, name); DebugLog.LogSettingsFile(AdapterFile, "save-adapter"); }
         string GetSavedAdapter() { return File.Exists(AdapterFile) ? File.ReadAllText(AdapterFile).Trim() : null; }
 
         // update-check.txt is written by the installer: "auto" (default) or "manual".
@@ -1907,6 +5905,7 @@ namespace IPbind
                 {
                     if (File.Exists(GatewayFile))
                     {
+                        DebugLog.LogSettingsFile(GatewayFile, "load-gateway");
                         foreach (string raw in File.ReadAllLines(GatewayFile))
                         {
                             string l = (raw ?? "").Trim();
@@ -1950,7 +5949,7 @@ namespace IPbind
                     "gateway=" + txtGateway.Text.Trim(),
                     "dns1=" + txtDns1.Text.Trim(),
                     "dns2=" + txtDns2.Text.Trim()
-                });
+                }); DebugLog.LogSettingsFile(GatewayFile, "save-gateway");
             }
             catch { }
         }
@@ -2157,7 +6156,7 @@ namespace IPbind
                 return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
             });
             foreach (Adapter a in adapters)
-                combo.Items.Add(a.Name + "   |   " + a.Description + "   [" + a.Status + "]");
+                combo.Items.Add(AdapterDisplay.Format(a.Name, a.Description, a.Status));
 
             // Keep long "Name | Description [Status]" entries readable when the list
             // opens. TextRenderer measures in device pixels; design padding and the
@@ -2189,6 +6188,8 @@ namespace IPbind
             Log("Listed " + adapters.Count + " interface(s)" + (chkAll.Checked ? " (all)" : " (wired only)") + ".");
         }
 
+        // The real Windows connection name. Never parse the dropdown's display
+        // string (that is tidied for reading only and is not an interface ID).
         string GetSelectedAlias()
         {
             if (combo.SelectedIndex < 0 || combo.SelectedIndex >= adapters.Count) return null;
@@ -2213,6 +6214,7 @@ namespace IPbind
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             psi.CreateNoWindow = true;
+            Stopwatch sw = Stopwatch.StartNew();
             try
             {
                 using (Process p = Process.Start(psi))
@@ -2220,11 +6222,19 @@ namespace IPbind
                     string o = p.StandardOutput.ReadToEnd();
                     string e = p.StandardError.ReadToEnd();
                     p.WaitForExit();
+                    sw.Stop();
                     output = (o + e).Trim();
+                    DebugLog.LogProc(file, args, p.ExitCode, o, e, sw.ElapsedMilliseconds);
                     return p.ExitCode;
                 }
             }
-            catch (Exception ex) { output = ex.Message; return -1; }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                output = ex.Message;
+                DebugLog.LogProc(file, args, -1, "", ex.Message, sw.ElapsedMilliseconds);
+                return -1;
+            }
         }
 
         int Netsh(string args, out string output) { return RunProc("netsh", args, out output); }
@@ -2268,6 +6278,563 @@ namespace IPbind
                 string t = raw.Trim();
                 if (t.Length > 0) Log("  " + t);
             }
+            // netsh lists DHCP and static addresses alike; say which is which.
+            AdapterInfo info = GetAdapterInfo(alias);
+            if (info == null || !info.Dhcp) return;
+            List<string> dhcp = new List<string>(), stat = new List<string>();
+            foreach (UnicastIPAddressInformation ua in info.V4)
+            {
+                if (ua.PrefixOrigin == PrefixOrigin.Dhcp) dhcp.Add(ua.Address.ToString());
+                else if (ua.PrefixOrigin == PrefixOrigin.Manual) stat.Add(ua.Address + "/" + ua.PrefixLength);
+            }
+            if (stat.Count > 0)
+                Log("  DHCP on" + (dhcp.Count > 0 ? " (" + string.Join(", ", dhcp.ToArray()) + ")" : "") +
+                    ", plus static: " + string.Join(", ", stat.ToArray()));
+        }
+
+        // ---------------- Keep DHCP (DHCP/static coexistence) ----------------
+        // Windows 10 1703+ can keep DHCP on while static addresses sit alongside it
+        // (netsh "dhcpstaticipcoexistence"). Without it, adding an address silently turns
+        // DHCP off. Support shows up as a line in "netsh interface ipv4 show interface".
+        // IPbind records exactly what it added, so Return to DHCP removes only that:
+        // "set address source=dhcp" does NOT remove statics while coexistence is on, and
+        // "delete address ... gateway=all" would also delete the DHCP default route.
+
+        // BEGIN CoexistParse (self-contained; exercised by a unit test)
+        internal enum CoexistState { Unsupported, Disabled, Enabled }
+
+        internal static CoexistState ParseCoexistence(string showInterfaceOutput)
+        {
+            foreach (string raw in (showInterfaceOutput ?? "").Replace("\r", "").Split('\n'))
+            {
+                string t = raw.Trim();
+                if (!t.StartsWith("DHCP/Static IP coexistence", StringComparison.OrdinalIgnoreCase)) continue;
+                int colon = t.IndexOf(':');
+                string v = colon < 0 ? "" : t.Substring(colon + 1).Trim();
+                return string.Equals(v, "enabled", StringComparison.OrdinalIgnoreCase)
+                    ? CoexistState.Enabled : CoexistState.Disabled;
+            }
+            return CoexistState.Unsupported;
+        }
+        // END CoexistParse
+
+        sealed class AdapterInfo
+        {
+            public string Guid;
+            public int Index;
+            public bool Dhcp;
+            public readonly List<UnicastIPAddressInformation> V4 = new List<UnicastIPAddressInformation>();
+            public readonly List<string> Gateways = new List<string>();
+        }
+
+        void LogAdaptersRaw()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    DebugLog.Debug("adapter raw name='" + ni.Name + "' desc='" + ni.Description
+                        + "' id=" + ni.Id + " type=" + ni.NetworkInterfaceType
+                        + " status=" + ni.OperationalStatus);
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Debug("adapter enumeration failed: " + ex.Message);
+            }
+        }
+
+        string CaptureAdapterState(string alias)
+        {
+            if (string.IsNullOrEmpty(alias)) return "(no adapter)";
+            try
+            {
+                AdapterInfo info = GetAdapterInfo(alias);
+                if (info == null) return alias + ": (not found)";
+                StringBuilder sb = new StringBuilder();
+                sb.Append(alias).Append(" dhcp=").Append(info.Dhcp);
+                sb.Append(" ips=");
+                for (int i = 0; i < info.V4.Count; i++)
+                {
+                    if (i > 0) sb.Append(",");
+                    UnicastIPAddressInformation ua = info.V4[i];
+                    sb.Append(ua.Address).Append("/").Append(ua.PrefixLength).Append("(").Append(ua.PrefixOrigin).Append(")");
+                }
+                sb.Append(" gateway=").Append(info.Gateways.Count == 0 ? "-" : string.Join(",", info.Gateways.ToArray()));
+                string dns = "-";
+                try
+                {
+                    foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (ni.Name != alias) continue;
+                        System.Collections.Generic.List<string> d = new System.Collections.Generic.List<string>();
+                        foreach (System.Net.IPAddress a in ni.GetIPProperties().DnsAddresses)
+                            if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                                d.Add(a.ToString());
+                        if (d.Count > 0) dns = string.Join(",", d.ToArray());
+                        break;
+                    }
+                }
+                catch { }
+                string metric = "?";
+                if (info.Index > 0)
+                {
+                    string outp;
+                    Netsh("interface ipv4 show interface " + info.Index, out outp);
+                    foreach (string raw in (outp ?? "").Split(new char[] { '\n', '\r' }))
+                    {
+                        string line = raw.Trim();
+                        int idx = line.LastIndexOf("Metric", StringComparison.OrdinalIgnoreCase);
+                        if (idx < 0) continue;
+                        string rest = line.Substring(idx + 6).Trim().TrimStart(':').Trim();
+                        int m;
+                        if (int.TryParse(rest.Split(' ')[0], out m)) { metric = m.ToString(); break; }
+                    }
+                }
+                sb.Append(" dns=").Append(dns).Append(" metric=").Append(metric);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return alias + ": (" + ex.Message + ")";
+            }
+        }
+
+        void LogAdapterDiff(string when, string before, string after)
+        {
+            DebugLog.Info("adapter state " + when + " before: " + before);
+            DebugLog.Info("adapter state " + when + " after:  " + after);
+            if (before == after) DebugLog.Info("adapter state " + when + " diff: (unchanged)");
+            else DebugLog.Info("adapter state " + when + " diff: changed");
+        }
+
+        AdapterInfo GetAdapterInfo(string alias)
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.Name != alias) continue;
+                    AdapterInfo a = new AdapterInfo();
+                    a.Guid = ni.Id;
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    try
+                    {
+                        IPv4InterfaceProperties p4 = props.GetIPv4Properties();
+                        if (p4 != null) { a.Index = p4.Index; a.Dhcp = p4.IsDhcpEnabled; }
+                    }
+                    catch { }
+                    foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
+                        if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            a.V4.Add(ua);
+                    foreach (GatewayIPAddressInformation ga in props.GatewayAddresses)
+                        a.Gateways.Add(ga.Address.ToString());
+                    return a;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        CoexistState DetectCoexist(AdapterInfo info)
+        {
+            if (info == null || info.Index <= 0) return CoexistState.Unsupported;
+            string outp;
+            Netsh("interface ipv4 show interface " + info.Index, out outp);
+            return ParseCoexistence(outp);
+        }
+
+        void LoadKeepDhcpPref()
+        {
+            try
+            {
+                if (File.Exists(KeepDhcpFile))
+                {
+                    DebugLog.LogSettingsFile(KeepDhcpFile, "load-keepdhcp");
+                    keepDhcpPref = File.ReadAllText(KeepDhcpFile).Trim() != "0";
+                }
+            }
+            catch { keepDhcpPref = true; }
+            settingKeepDhcp = true;
+            try { chkKeepDhcp.Checked = keepDhcpPref; }
+            finally { settingKeepDhcp = false; }
+        }
+
+        void SaveKeepDhcpPref()
+        {
+            try { EnsureAppDir(); File.WriteAllText(KeepDhcpFile, keepDhcpPref ? "1" : "0"); DebugLog.LogSettingsFile(KeepDhcpFile, "save-keepdhcp"); }
+            catch { }
+        }
+
+        // Enables the box only where Windows supports coexistence for this adapter.
+        void RefreshKeepDhcp(string alias)
+        {
+            if (chkKeepDhcp == null) return;
+            CoexistState st = alias == null ? CoexistState.Unsupported : DetectCoexist(GetAdapterInfo(alias));
+            bool supported = st != CoexistState.Unsupported;
+            settingKeepDhcp = true;
+            try
+            {
+                chkKeepDhcp.Enabled = supported;
+                chkKeepDhcp.Checked = supported && keepDhcpPref;
+            }
+            finally { settingKeepDhcp = false; }
+            keepDhcpTip.SetToolTip(chkKeepDhcp, supported ? KeepDhcpTipOn : KeepDhcpTipOff);
+            if (!supported && alias != null && coexistNoteFor != alias)
+            {
+                coexistNoteFor = alias;
+                Log("Keep DHCP isn't available on '" + alias +
+                    "' (needs Windows 10 version 1703 or later). Apply uses static addresses only.");
+            }
+        }
+
+        // What a Keep DHCP Apply added to one adapter, stored per adapter GUID in the
+        // app's settings folder so Return to DHCP works after a restart.
+        sealed class KeepRecord
+        {
+            public string Adapter;
+            public readonly List<string[]> Addresses = new List<string[]>();   // { ip, prefix }
+            public string Gateway;     // null = none
+            public bool DnsChanged;
+        }
+
+        string RecordPath(string guid)
+        {
+            string safe = Regex.Replace(guid ?? "", "[^0-9A-Fa-f-]", "");
+            if (safe.Length == 0) return null;
+            return Path.Combine(AppDir, "keep-dhcp-" + safe.ToLowerInvariant() + ".txt");
+        }
+
+        // Every value is re-validated, since it ends up in netsh commands.
+        KeepRecord LoadRecord(string guid)
+        {
+            string path = RecordPath(guid);
+            if (path == null || !File.Exists(path)) return null;
+            try
+            {
+                KeepRecord r = new KeepRecord();
+                foreach (string raw in File.ReadAllLines(path))
+                {
+                    string l = (raw ?? "").Trim();
+                    int eq = l.IndexOf('=');
+                    if (eq <= 0 || l.StartsWith("#")) continue;
+                    string k = l.Substring(0, eq).Trim().ToLowerInvariant();
+                    string v = l.Substring(eq + 1).Trim();
+                    if (k == "address")
+                    {
+                        string ip; int pfx;
+                        if (TryCidr(v, out ip, out pfx)) r.Addresses.Add(new string[] { ip, pfx.ToString() });
+                    }
+                    else if (k == "gateway")
+                    {
+                        uint g;
+                        if (TryIPv4(v, out g) && IsUsableHost(g)) r.Gateway = IPv4Text(g);
+                    }
+                    else if (k == "dns") r.DnsChanged = v == "1";
+                    else if (k == "adapter") r.Adapter = v;
+                }
+                return r;
+            }
+            catch (Exception ex)
+            {
+                Log("Could not read the Keep DHCP record: " + ex.Message, "WARN");
+                return null;
+            }
+        }
+
+        bool SaveRecord(string guid, KeepRecord r)
+        {
+            string path = RecordPath(guid);
+            if (path == null) return false;
+            try
+            {
+                EnsureAppDir();
+                List<string> lines = new List<string>();
+                lines.Add("# What IPbind added with Keep DHCP. Return to DHCP removes exactly these.");
+                lines.Add("mode=keepdhcp");
+                lines.Add("adapter=" + (r.Adapter ?? ""));
+                foreach (string[] e in r.Addresses) lines.Add("address=" + e[0] + "/" + e[1]);
+                if (r.Gateway != null) lines.Add("gateway=" + r.Gateway);
+                lines.Add("dns=" + (r.DnsChanged ? "1" : "0"));
+                File.WriteAllLines(path, lines.ToArray());
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("Could not save the Keep DHCP record: " + ex.Message, "WARN");
+                return false;
+            }
+        }
+
+        void DeleteRecord(string guid)
+        {
+            string path = RecordPath(guid);
+            if (path == null) return;
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+
+        // Targeted undo. Route first, by next hop only: never "gateway=all".
+        List<string> RevertCommands(string alias, KeepRecord r)
+        {
+            List<string> c = new List<string>();
+            if (r.Gateway != null)
+                c.Add("interface ipv4 delete route prefix=0.0.0.0/0 interface=\"" + alias + "\" nexthop=" + r.Gateway);
+            foreach (string[] e in r.Addresses)
+                c.Add("interface ipv4 delete address name=\"" + alias + "\" address=" + e[0]);
+            if (r.DnsChanged)
+                c.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
+            return c;
+        }
+
+        static bool InSubnet(uint addr, uint ip, int prefix)
+        {
+            uint mask = prefix <= 0 ? 0u : (0xFFFFFFFFu << (32 - Math.Min(prefix, 32)));
+            return (addr & mask) == (ip & mask);
+        }
+
+        // BEGIN ApplySafety (self-contained; exercised by a unit test)
+        internal enum DhcpOverlapKind { None, SameAsLease, InsideSubnet }
+
+        internal static int ClampPrefix(int prefix)
+        {
+            if (prefix < 0) return 0;
+            if (prefix > 32) return 32;
+            return prefix;
+        }
+
+        internal static DhcpOverlapKind ClassifyDhcpOverlap(uint bindAddr, uint leaseAddr, int leasePrefix)
+        {
+            leasePrefix = ClampPrefix(leasePrefix);
+            if (bindAddr == leaseAddr) return DhcpOverlapKind.SameAsLease;
+            if (InSubnet(bindAddr, leaseAddr, leasePrefix)) return DhcpOverlapKind.InsideSubnet;
+            return DhcpOverlapKind.None;
+        }
+
+        internal static string DhcpNetworkText(uint leaseAddr, int leasePrefix)
+        {
+            leasePrefix = ClampPrefix(leasePrefix);
+            uint mask = leasePrefix == 0 ? 0u : (0xFFFFFFFFu << (32 - leasePrefix));
+            return IPv4Text(leaseAddr & mask) + "/" + leasePrefix;
+        }
+
+        internal static string EqualDhcpAddressLog(string ip)
+        {
+            return ip + " is this adapter's DHCP address. Nothing was applied.";
+        }
+
+        internal static string InsideDhcpNetworkLog(string ip, string network)
+        {
+            return ip + " is inside the DHCP network " + network + ". Another device could be given this address.";
+        }
+
+        internal static string AddressInUseLog(string ip, string mac)
+        {
+            return ip + " is already in use on this network (MAC " + mac + "), skipped.";
+        }
+
+        internal static string AllAddressesInUseLog()
+        {
+            return "Every address was already in use on this network. Nothing was applied.";
+        }
+
+        internal static string FormatMac(byte[] mac, int length)
+        {
+            int n = length < 0 ? 0 : Math.Min(mac == null ? 0 : mac.Length, length);
+            if (n < 1) return "";
+            string[] parts = new string[n];
+            for (int i = 0; i < n; i++) parts[i] = mac[i].ToString("x2");
+            return string.Join("-", parts);
+        }
+        // END ApplySafety
+
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        static extern int SendARP(uint destIP, uint srcIP, byte[] pMacAddr, ref int phyAddrLen);
+
+        static uint ToIpAddr(uint hostOrder)
+        {
+            byte[] b = new byte[]
+            {
+                (byte)((hostOrder >> 24) & 0xFF),
+                (byte)((hostOrder >> 16) & 0xFF),
+                (byte)((hostOrder >> 8) & 0xFF),
+                (byte)(hostOrder & 0xFF)
+            };
+            return BitConverter.ToUInt32(b, 0);
+        }
+
+        sealed class ArpHit
+        {
+            public string Ip;
+            public string Mac;
+        }
+
+        // Probes only the given addresses, in parallel. SendARP is bounded by a
+        // 1s per-address join and a 1.5s overall deadline so Apply stays responsive.
+        // A timeout or error is treated as "not in use" (the address is not skipped).
+        List<ArpHit> ProbeInUse(List<string> ips, Dictionary<string, uint> srcByIp)
+        {
+            List<ArpHit> hits = new List<ArpHit>();
+            if (ips == null || ips.Count == 0) return hits;
+            ArpHit[] found = new ArpHit[ips.Count];
+            Thread[] threads = new Thread[ips.Count];
+            for (int i = 0; i < ips.Count; i++)
+            {
+                int idx = i;
+                string ip = ips[i];
+                uint dest, src = 0;
+                if (!TryIPv4(ip, out dest)) continue;
+                if (srcByIp != null) srcByIp.TryGetValue(ip, out src);
+                threads[idx] = new Thread(delegate()
+                {
+                    try
+                    {
+                        byte[] mac = new byte[8];
+                        int len = 6;
+                        int r = SendARP(ToIpAddr(dest), src == 0 ? 0u : ToIpAddr(src), mac, ref len);
+                        if (r == 0 && len >= 6)
+                        {
+                            ArpHit hit = new ArpHit();
+                            hit.Ip = ip;
+                            hit.Mac = FormatMac(mac, 6);
+                            found[idx] = hit;
+                        }
+                    }
+                    catch { }
+                });
+                threads[idx].IsBackground = true;
+                threads[idx].Start();
+            }
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(1500);
+            for (int i = 0; i < threads.Length; i++)
+            {
+                if (threads[i] == null) continue;
+                int remain = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remain < 1) remain = 1;
+                if (remain > 1000) remain = 1000;
+                threads[i].Join(remain);
+            }
+            for (int i = 0; i < found.Length; i++)
+                if (found[i] != null) hits.Add(found[i]);
+            return hits;
+        }
+
+        // All netsh commands run in ONE netsh process via a script file. Spawning a
+        // separate netsh.exe per address is what made this slow: on a managed machine,
+        // endpoint security inspects every child process as it launches.
+        string RunNetshBatch(List<string> cmds)
+        {
+            string outp = "";
+            string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
+            try
+            {
+                PrivateFile.WriteAllText(
+                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
+                RunProc("netsh", "-f \"" + script + "\"", out outp);
+            }
+            catch (Exception ex) { outp = ex.Message; }
+            finally { try { File.Delete(script); } catch { } }
+            return outp;
+        }
+
+        // netsh prints harmless notes (e.g. "DHCP is already enabled") that are not
+        // failures, so don't judge success by its output. Log real-looking errors as
+        // warnings, everything else as info, then verify against the actual interface.
+        void LogNetshOutput(string outp)
+        {
+            foreach (string raw in (outp ?? "").Replace("\r", "").Split('\n'))
+            {
+                string t = raw.Trim();
+                if (t.Length == 0) continue;
+                string low = t.ToLowerInvariant();
+                bool looksBad = low.Contains("error") || low.Contains("failed")
+                    || low.Contains("cannot") || low.Contains("incorrect") || low.Contains("not found");
+                Log("  netsh: " + t, looksBad ? "WARN" : "INFO");
+            }
+        }
+
+        // Return to DHCP while Keep DHCP is in effect: DHCP is already on, so remove just
+        // what IPbind added (from the record, or, without one, the listed addresses that
+        // are on the interface as manual addresses).
+        bool RevertKeepDhcp(string alias, AdapterInfo info, KeepRecord rec)
+        {
+            KeepRecord undo = rec;
+            if (undo != null)
+            {
+                Log("Removing the addresses IPbind added to '" + alias + "'. DHCP stays on...");
+            }
+            else
+            {
+                Log("No record of what IPbind added to '" + alias +
+                    "'. Removing listed addresses found on it.", "WARN");
+                undo = new KeepRecord();
+                HashSet<string> listed = new HashSet<string>();
+                foreach (string k in CanonicalList())
+                {
+                    string ip; int pfx;
+                    if (TryCidr(k, out ip, out pfx)) listed.Add(ip);
+                }
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    string ip = ua.Address.ToString();
+                    if (ua.PrefixOrigin == PrefixOrigin.Manual && listed.Contains(ip))
+                        undo.Addresses.Add(new string[] { ip, ua.PrefixLength.ToString() });
+                }
+                // The saved Gateway support gateway, only if it serves one of those
+                // addresses and is not on the DHCP address's subnet.
+                uint gw;
+                if (TryIPv4(txtGateway.Text.Trim(), out gw) && IsUsableHost(gw) &&
+                    info.Gateways.Contains(IPv4Text(gw)))
+                {
+                    bool mine = false, dhcpSide = false;
+                    foreach (string[] e in undo.Addresses)
+                    {
+                        uint v; if (TryIPv4(e[0], out v) && InSubnet(gw, v, int.Parse(e[1]))) mine = true;
+                    }
+                    foreach (UnicastIPAddressInformation ua in info.V4)
+                    {
+                        uint v;
+                        if (ua.PrefixOrigin == PrefixOrigin.Dhcp && TryIPv4(ua.Address.ToString(), out v) &&
+                            InSubnet(gw, v, ua.PrefixLength)) dhcpSide = true;
+                    }
+                    if (mine && !dhcpSide) undo.Gateway = IPv4Text(gw);
+                }
+                if (undo.Addresses.Count == 0) Log("  None of the listed addresses are on the interface.");
+            }
+
+            HashSet<string> removing = new HashSet<string>();
+            foreach (string[] e in undo.Addresses) removing.Add(e[0]);
+            int others = 0;
+            foreach (UnicastIPAddressInformation ua in info.V4)
+                if (ua.PrefixOrigin == PrefixOrigin.Manual && !removing.Contains(ua.Address.ToString())) others++;
+
+            List<string> cmds = RevertCommands(alias, undo);
+            if (others == 0)
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+            else
+                Log("  Left " + others + " other static address(es) on '" + alias +
+                    "' alone, so Keep DHCP stays on for it.", "WARN");
+
+            LogNetshOutput(RunNetshBatch(cmds));
+            foreach (string[] e in undo.Addresses) Log("  - " + e[0] + "/" + e[1], "OK");
+            if (undo.Gateway != null) Log("  - gateway " + undo.Gateway, "OK");
+            if (undo.DnsChanged) Log("  DNS back to automatic (DHCP).", "OK");
+            Log("Back to DHCP - verifying:", "OK");
+            ShowCurrentConfig(alias);
+
+            AdapterInfo after = GetAdapterInfo(alias);
+            bool ok = after != null && after.Dhcp;
+            if (after != null && !after.Dhcp) Log("DHCP does not appear to be enabled on the interface.", "WARN");
+            if (after != null)
+                foreach (UnicastIPAddressInformation ua in after.V4)
+                    if (removing.Contains(ua.Address.ToString()))
+                    {
+                        ok = false;
+                        Log("  " + ua.Address + " is still on the interface.", "WARN");
+                    }
+            if (ok)
+            {
+                if (rec != null) DeleteRecord(info.Guid);
+                Log("  DHCP stayed on the whole time.", "OK");
+            }
+            return ok;
         }
 
         // ---------------- actions ----------------
@@ -2320,29 +6887,164 @@ namespace IPbind
                 if (gi > 0) { string[] g = entries[gi]; entries.RemoveAt(gi); entries.Insert(0, g); }
             }
 
-            Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' (single batch)...");
+            AdapterInfo info = GetAdapterInfo(alias);
+            CoexistState coexist = DetectCoexist(info);
+            bool keep = chkKeepDhcp.Checked;
+            if (keep && coexist == CoexistState.Unsupported)
+            {
+                Log("Keep DHCP isn't available on '" + alias +
+                    "' (needs Windows 10 version 1703 or later). Applying static addresses only.", "WARN");
+                keep = false;
+            }
+            KeepRecord old = info != null ? LoadRecord(info.Guid) : null;
 
-            // All netsh commands run in ONE netsh process via a script file. Spawning a
-            // separate netsh.exe per address is what made this slow: on a managed machine,
-            // endpoint security inspects every child process as it launches. One process
-            // = one inspection instead of eight.
-            List<string> cmds = new List<string>();
-            cmds.Add("interface ipv4 set interface \"" + alias + "\" dadtransmits=0");
-            cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
-            bool first = true;
+            // Apply-time safety: never bind the adapter's own DHCP address, warn
+            // when a bind address sits in a DHCP lease subnet, and skip addresses
+            // that already answer ARP on that subnet. Isolated (non-DHCP-subnet)
+            // entries are not probed, so air-gapped use stays fast. Lease info is
+            // read here, before Keep DHCP or static mode changes the adapter.
+            List<string[]> leases = new List<string[]>();
+            if (info != null)
+            {
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                {
+                    if (ua.PrefixOrigin != PrefixOrigin.Dhcp) continue;
+                    uint leaseAddr;
+                    if (!TryIPv4(ua.Address.ToString(), out leaseAddr)) continue;
+                    leases.Add(new string[] { ua.Address.ToString(), ua.PrefixLength.ToString(), DhcpNetworkText(leaseAddr, ua.PrefixLength) });
+                }
+            }
             foreach (string[] e in entries)
             {
-                string ip = e[0];
-                int pfx = int.Parse(e[1]);
-                string mask = MaskFromPrefix(pfx);
-                if (first && gwPlan != null)
-                    cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=static address=" + ip +
-                             " mask=" + mask + " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric);
-                else
-                    cmds.Add(first
-                        ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
-                        : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
-                first = false;
+                uint bindAddr;
+                if (!TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) == DhcpOverlapKind.SameAsLease)
+                    {
+                        Log(EqualDhcpAddressLog(e[0]), "ERR");
+                        return false;
+                    }
+                }
+            }
+            Dictionary<string, uint> probeSrc = new Dictionary<string, uint>();
+            List<string> inside = new List<string>();
+            foreach (string[] e in entries)
+            {
+                uint bindAddr;
+                if (!TryIPv4(e[0], out bindAddr)) continue;
+                foreach (string[] lease in leases)
+                {
+                    uint leaseAddr;
+                    if (!TryIPv4(lease[0], out leaseAddr)) continue;
+                    if (ClassifyDhcpOverlap(bindAddr, leaseAddr, int.Parse(lease[1])) != DhcpOverlapKind.InsideSubnet)
+                        continue;
+                    Log(InsideDhcpNetworkLog(e[0], lease[2]), "WARN");
+                    if (!probeSrc.ContainsKey(e[0]))
+                    {
+                        probeSrc[e[0]] = leaseAddr;
+                        inside.Add(e[0]);
+                    }
+                    break;
+                }
+            }
+            HashSet<string> alreadyHeld = new HashSet<string>(StringComparer.Ordinal);
+            if (info != null)
+                foreach (UnicastIPAddressInformation ua in info.V4)
+                    alreadyHeld.Add(ua.Address.ToString());
+            if (old != null)
+                foreach (string[] e in old.Addresses)
+                    alreadyHeld.Add(e[0]);
+            List<string> toProbe = new List<string>();
+            foreach (string ip in inside)
+                if (!alreadyHeld.Contains(ip)) toProbe.Add(ip);
+            if (toProbe.Count > 0)
+            {
+                List<ArpHit> hits = ProbeInUse(toProbe, probeSrc);
+                if (hits.Count > 0)
+                {
+                    HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (ArpHit hit in hits)
+                    {
+                        used.Add(hit.Ip);
+                        Log(AddressInUseLog(hit.Ip, hit.Mac), "WARN");
+                    }
+                    List<string[]> kept = new List<string[]>();
+                    foreach (string[] e in entries)
+                        if (!used.Contains(e[0])) kept.Add(e);
+                    if (kept.Count == 0)
+                    {
+                        Log(AllAddressesInUseLog(), "ERR");
+                        return false;
+                    }
+                    if (gwPlan != null)
+                    {
+                        bool gwKept = false;
+                        foreach (string[] e in kept)
+                            if (e[0] == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString()) gwKept = true;
+                        if (!gwKept)
+                        {
+                            Log(gwPlan.Ip + " was the Gateway support address, so the gateway was not applied.", "WARN");
+                            gwPlan = null;
+                        }
+                    }
+                    entries = kept;
+                }
+            }
+
+            List<string> cmds = new List<string>();
+            cmds.Add("interface ipv4 set interface \"" + alias + "\" dadtransmits=0");
+            // Undo an earlier Keep DHCP Apply first, so its items never linger.
+            if (old != null) cmds.AddRange(RevertCommands(alias, old));
+            KeepRecord rec = null;
+            if (keep)
+            {
+                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' alongside DHCP (single batch)...");
+                if (!info.Dhcp)
+                {
+                    // Left static (e.g. by Static only): back to DHCP before adding.
+                    Log("  The interface is static; switching it to DHCP first.");
+                    cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
+                    cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
+                }
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=enabled");
+                foreach (string[] e in entries)
+                {
+                    string ip = e[0];
+                    string mask = MaskFromPrefix(int.Parse(e[1]));
+                    string c = "interface ipv4 add address name=\"" + alias + "\" address=" + ip + " mask=" + mask;
+                    if (gwPlan != null && ip == gwPlan.Ip && e[1] == gwPlan.Prefix.ToString())
+                        c += " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric;
+                    cmds.Add(c);
+                }
+                rec = new KeepRecord();
+                rec.Adapter = alias;
+                rec.Addresses.AddRange(entries);
+                rec.Gateway = gwPlan != null ? gwPlan.Gateway : null;
+                rec.DnsChanged = gwPlan != null && gwPlan.Dns1 != null;
+            }
+            else
+            {
+                Log("Applying " + entries.Count + " static IP(s) to '" + alias + "' (single batch)...");
+                if (coexist == CoexistState.Enabled)
+                    cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+                cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
+                bool first = true;
+                foreach (string[] e in entries)
+                {
+                    string ip = e[0];
+                    string mask = MaskFromPrefix(int.Parse(e[1]));
+                    if (first && gwPlan != null)
+                        cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=static address=" + ip +
+                                 " mask=" + mask + " gateway=" + gwPlan.Gateway + " gwmetric=" + GatewayMetric);
+                    else
+                        cmds.Add(first
+                            ? "interface ipv4 set address name=\"" + alias + "\" static " + ip + " " + mask
+                            : "interface ipv4 add address name=\"" + alias + "\" " + ip + " " + mask);
+                    first = false;
+                }
             }
             if (gwPlan != null && gwPlan.Dns1 != null)
             {
@@ -2354,16 +7056,11 @@ namespace IPbind
                              gwPlan.Dns2 + " index=2 validate=no");
             }
 
-            string outp = "";
-            string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
-            try
-            {
-                PrivateFile.WriteAllText(
-                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
-                RunProc("netsh", "-f \"" + script + "\"", out outp);
-            }
-            catch (Exception ex) { outp = ex.Message; }
-            finally { try { File.Delete(script); } catch { } }
+            // Record before running, so a crash mid-batch still leaves a way back.
+            if (rec != null) SaveRecord(info.Guid, rec);
+            else if (old != null) DeleteRecord(info.Guid);
+
+            string outp = RunNetshBatch(cmds);
 
             foreach (string[] e in entries) Log("  + " + e[0] + "/" + e[1], "OK");
             if (gwPlan != null)
@@ -2372,46 +7069,39 @@ namespace IPbind
                     gwPlan.Ip + "/" + gwPlan.Prefix, "OK");
                 if (gwPlan.Dns1 != null)
                     Log("  DNS " + gwPlan.Dns1 + (gwPlan.Dns2 != null ? ", " + gwPlan.Dns2 : ""), "OK");
+                else if (!keep)
+                    Log("No DNS set. Website names may not work through this adapter. " +
+                        "Try your router's address (often the same as the gateway).", "WARN");
             }
-            // netsh prints harmless notes (e.g. "DHCP is already enabled") that are not
-            // failures, so don't judge success by its output. Log real-looking errors as
-            // warnings, everything else as info, then verify against the actual interface.
-            foreach (string raw in (outp ?? "").Replace("\r", "").Split('\n'))
-            {
-                string t = raw.Trim();
-                if (t.Length == 0) continue;
-                string low = t.ToLowerInvariant();
-                bool looksBad = low.Contains("error") || low.Contains("failed")
-                    || low.Contains("cannot") || low.Contains("incorrect") || low.Contains("not found");
-                Log("  netsh: " + t, looksBad ? "WARN" : "INFO");
-            }
+            LogNetshOutput(outp);
 
             Log("Bind complete - verifying:", "OK");
             ShowCurrentConfig(alias);
 
-            // Success = every intended address is actually present on the interface.
+            // Success = every intended address is actually present on the interface
+            // (and, with Keep DHCP, DHCP is still on).
             List<string> want = new List<string>();
             foreach (string[] e in entries) want.Add(e[0]);
             int found = 0;
             bool gwFound = false;
-            try
+            AdapterInfo after = GetAdapterInfo(alias);
+            if (after != null)
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.Name != alias) continue;
-                    IPInterfaceProperties props = ni.GetIPProperties();
-                    foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
-                        if (want.Contains(ua.Address.ToString())) found++;
-                    if (gwPlan != null)
-                        foreach (GatewayIPAddressInformation ga in props.GatewayAddresses)
-                            if (ga.Address.ToString() == gwPlan.Gateway) gwFound = true;
-                }
+                foreach (UnicastIPAddressInformation ua in after.V4)
+                    if (want.Contains(ua.Address.ToString())) found++;
+                if (gwPlan != null && after.Gateways.Contains(gwPlan.Gateway)) gwFound = true;
             }
-            catch { }
             if (gwPlan != null && !gwFound)
                 Log("Gateway " + gwPlan.Gateway + " is not showing on the interface yet.", "WARN");
             bool ok = found >= want.Count;
             if (!ok) Log("Only " + found + " of " + want.Count + " addresses are present on the interface.", "WARN");
+            if (keep && after != null && !after.Dhcp)
+            {
+                ok = false;
+                Log("DHCP turned off on the interface; Keep DHCP did not take effect.", "WARN");
+            }
+            else if (keep && ok)
+                Log("  DHCP is still on.", "OK");
             if (status != "Up") Log("Interface is not connected - addresses will activate once it comes up.", "WARN");
             return ok;
         }
@@ -2422,21 +7112,22 @@ namespace IPbind
             if (alias == null) { Log("No interface selected.", "WARN"); return false; }
             if (!ValidateAdapterAlias(alias)) return false;
             Log("Returning '" + alias + "' to DHCP...");
-            string outp = "";
+
+            AdapterInfo info = GetAdapterInfo(alias);
+            KeepRecord rec = info != null ? LoadRecord(info.Guid) : null;
+            CoexistState coexist = DetectCoexist(info);
+            if (info != null && info.Dhcp && (rec != null || coexist == CoexistState.Enabled))
+                return RevertKeepDhcp(alias, info, rec);
 
             // Same one-process batching as the bind path.
             List<string> cmds = new List<string>();
+            if (rec != null) cmds.AddRange(RevertCommands(alias, rec));
             cmds.Add("interface ipv4 set address name=\"" + alias + "\" source=dhcp");
             cmds.Add("interface ipv4 set dnsservers name=\"" + alias + "\" source=dhcp");
-            string script = Path.Combine(Path.GetTempPath(), "ipbind-" + Guid.NewGuid().ToString("N") + ".netsh");
-            try
-            {
-                PrivateFile.WriteAllText(
-                    script, string.Join("\r\n", cmds.ToArray()) + "\r\n");
-                RunProc("netsh", "-f \"" + script + "\"", out outp);
-            }
-            catch (Exception ex) { outp = ex.Message; }
-            finally { try { File.Delete(script); } catch { } }
+            if (coexist == CoexistState.Enabled)
+                cmds.Add("interface ipv4 set interface \"" + alias + "\" dhcpstaticipcoexistence=disabled");
+            string outp = RunNetshBatch(cmds);
+            if (rec != null && info != null) DeleteRecord(info.Guid);
 
             // Kick off a lease renewal but DON'T wait for it. The interface is already
             // configured for DHCP at this point; blocking on ipconfig /renew waits for the
@@ -2545,7 +7236,7 @@ namespace IPbind
                     {
                         if (IsDisposed || updateDismissed) return;
                         lblUpdateBanner.Text =
-                            "Version " + info.RemoteVersion + " is available.";
+                            "Version " + VersionText.ForDisplay(info.RemoteVersion) + " is available.";
                         updateBanner.Visible = true;
                         ApplyLeftColumnStatusLayout();
                         updateBanner.BringToFront();
@@ -2610,6 +7301,49 @@ namespace IPbind
 
         Font UiFont(float pt, FontStyle style) { return new Font("Segoe UI", pt, style); }
 
+        // Width of a left-box option checkbox: glyph, gap and caption at this scale.
+        int OptionWidth(CheckBox box)
+        {
+            Size text = TextRenderer.MeasureText(box.Text, box.Font);
+            return text.Width + U(24);
+        }
+
+        // Distance from a check box's left edge to the right edge of its drawn text
+        // (glyph, gap and text as Windows actually renders them at this DPI). Drawn
+        // on a stand-alone copy so MainForm's handle is not created early.
+        int TextInkRight(CheckBox box)
+        {
+            try
+            {
+                using (CheckBox probe = new CheckBox())
+                {
+                    probe.Text = box.Text;
+                    probe.Font = box.Font;
+                    probe.Size = box.Size;
+                    probe.CheckAlign = box.CheckAlign;
+                    probe.TextAlign = box.TextAlign;
+                    probe.FlatStyle = box.FlatStyle;
+                    probe.BackColor = Color.White;
+                    probe.ForeColor = Color.Black;
+                    using (Bitmap bmp = new Bitmap(probe.Width, probe.Height))
+                    {
+                        probe.DrawToBitmap(bmp, new Rectangle(Point.Empty, probe.Size));
+                        for (int x = bmp.Width - 1; x >= 0; x--)
+                            for (int y = 0; y < bmp.Height; y++)
+                            {
+                                Color c = bmp.GetPixel(x, y);
+                                // Any pixel clearly darker than the white background
+                                // counts, so the anti-aliased edge of the last letter is
+                                // included, as it is on screen.
+                                if (c.R + c.G + c.B < 765 - 300) return x + 1;
+                            }
+                    }
+                }
+            }
+            catch { }
+            return box.Width - U(6);
+        }
+
         Label MakeRowLabel(string text, int x, int y)
         {
             Label l = new Label();
@@ -2636,31 +7370,58 @@ namespace IPbind
         }
 
         // ---------------- dark mode ----------------
-        // Themes a control's scrollbars/borders. "DarkMode_Explorer" gives dark scrollbars.
-        [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-        static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subId);
-
-        // uxtheme ordinal 135 (Win10 1903+): 0=Default,1=AllowDark,2=ForceDark. Best-effort.
-        [System.Runtime.InteropServices.DllImport("uxtheme.dll", EntryPoint = "#135")]
-        static extern int SetPreferredAppMode(int mode);
-
         static bool IsDarkMode()
         {
-            try
-            {
-                object v = Microsoft.Win32.Registry.GetValue(
-                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                    "AppsUseLightTheme", 1);
-                if (v is int) return ((int)v) == 0;   // 0 = dark, 1 = light
-            }
-            catch { }
-            return false;
+            return WindowTheme.IsAppDark();
         }
+
+        const int WM_DPICHANGED = 0x02E0;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        bool dpiChanging;
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             WindowTheme.ApplyTitleBar(this, dark);
+        }
+
+        const int WM_DISPLAYCHANGE = 0x007E;
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int oldDpi = DpiWindow.WindowDpi(Handle);
+                Size oldSize = Size;
+                if (!dpiChanging)
+                {
+                    dpiChanging = true;
+                    try
+                    {
+                        // The process is system-DPI aware, so this message is
+                        // unusual (tests post it; a future per-monitor switch
+                        // would too). Do not dispose fonts or relayout here.
+                        SuspendLayout();
+                        if (m.LParam != IntPtr.Zero)
+                        {
+                            RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                            Bounds = new Rectangle(suggested.Left, suggested.Top, Width, Height);
+                        }
+                        ResumeLayout(true);
+                    }
+                    finally { dpiChanging = false; }
+                }
+                int newDpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                DebugLog.Info("WM_DPICHANGED main oldDpi=" + oldDpi + " newDpi=" + newDpi
+                    + " oldSize=" + oldSize + " newSize=" + Size + " bounds=" + Bounds);
+                return;
+            }
+            if (m.Msg == WM_DISPLAYCHANGE)
+                DebugLog.Info("WM_DISPLAYCHANGE wParam=" + m.WParam.ToInt64());
+            base.WndProc(ref m);
         }
 
         protected override void OnShown(EventArgs e)
@@ -2670,7 +7431,7 @@ namespace IPbind
             FitToWorkingArea(true);
             if (dark)
             {
-                try { SetPreferredAppMode(1); } catch { }   // AllowDark (best-effort, Win10 1903+)
+                WindowTheme.ApplyPreferredAppMode();
                 DarkenScrollbars(this.Controls);
             }
             CheckForUpdatesOnLaunch();
@@ -2678,7 +7439,7 @@ namespace IPbind
             BeginInvoke((MethodInvoker)ShowDhcpReminderIfNeeded);
         }
 
-        // Shown at every launch until the user clicks Continue with "Don't show this
+        // Shown at every launch until the user clicks Continue with "Don’t show this
         // again" ticked. Anything other than Continue closes IPbind. The flag file is new in 2.3.125, so fresh installs and the first
         // launch after updating from an older version both see it.
         void ShowDhcpReminderIfNeeded()
@@ -2702,7 +7463,7 @@ namespace IPbind
             try
             {
                 EnsureAppDir();
-                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + AppVersion + "\r\n");
+                File.WriteAllText(DhcpReminderFile, "Return to DHCP reminder dismissed in v" + BuildInfo.DisplayVersion + "\r\n"); DebugLog.LogSettingsFile(DhcpReminderFile, "save-reminder");
             }
             catch (Exception ex)
             {
@@ -2736,9 +7497,7 @@ namespace IPbind
             int consoleHeight = Math.Min(U(466), Math.Max(U(140), availableHeight - U(94)));
             console.Size = new Size(consoleWidth, consoleHeight);
             btnClear.Location = new Point(console.Right - U(80), U(14));
-            btnAbout.Location = new Point(console.Left, console.Bottom + U(10));
-            lblVersion.Location =
-                new Point(console.Right - U(160), console.Bottom + U(14));
+            btnAbout.Location = new Point(console.Right - btnAbout.Width, console.Bottom + U(10));
         }
 
         void FitToWorkingArea(bool center)
@@ -2797,13 +7556,21 @@ namespace IPbind
 
         // Give scrollable controls dark scrollbars. WinForms paints scrollbars with the OS
         // theme and ignores BackColor, so this is the only way to darken them.
+        // ComboBoxes use DarkMode_CFD (and ThemedComboBox chrome); Explorer does not
+        // style combo fields, arrows, or the open list.
         void DarkenScrollbars(Control.ControlCollection cc)
         {
             foreach (Control c in cc)
             {
-                if (c is TextBox || c is ComboBox || c is ListBox)
+                if (c is ComboBox)
                 {
-                    try { SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
+                    ThemedComboBox themed = c as ThemedComboBox;
+                    if (themed != null) themed.ApplyDark(true);
+                    else WindowTheme.ApplyCombo((ComboBox)c, true);
+                }
+                else if (c is TextBox || c is ListBox)
+                {
+                    try { WindowTheme.SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
                 }
                 if (c.Controls.Count > 0) DarkenScrollbars(c.Controls);
             }
@@ -2829,7 +7596,7 @@ namespace IPbind
                 back = dark ? Color.FromArgb(70, 70, 70) : SystemColors.Highlight;
                 fore = dark ? FgCol : SystemColors.HighlightText;
             }
-            else if ((e.State & DrawItemState.Disabled) != 0)
+            else if (!combo.Enabled || (e.State & DrawItemState.Disabled) != 0)
             {
                 fore = dark ? SubCol : SystemColors.GrayText;
             }
@@ -2897,9 +7664,11 @@ namespace IPbind
                 }
                 else if (c is ComboBox)
                 {
-                    c.BackColor = PanelCol;
+                    c.BackColor = InputCol;
                     c.ForeColor = FgCol;
-                    ((ComboBox)c).FlatStyle = FlatStyle.Flat;
+                    ThemedComboBox themed = c as ThemedComboBox;
+                    if (themed != null) themed.ApplyDark(true);
+                    else ((ComboBox)c).FlatStyle = FlatStyle.Standard;
                 }
                 else if (c is LinkLabel)
                 {
@@ -2907,7 +7676,12 @@ namespace IPbind
                     ll.ForeColor = SubCol;
                     ll.LinkColor = Color.FromArgb(90, 160, 240);
                 }
-                else if (c is CheckBox) { c.ForeColor = FgCol; }
+                else if (c is CheckBox)
+                {
+                    c.ForeColor = FgCol;
+                    ThemedCheckBox themedBox = c as ThemedCheckBox;
+                    if (themedBox != null) themedBox.ApplyDark(true);
+                }
                 else if (c is Label)
                 {
                     // italic = the subtitle; keep it dimmer for hierarchy. Others full strength.
@@ -2920,7 +7694,7 @@ namespace IPbind
 
         void BuildUi()
         {
-            this.Text = BuildInfo.AppName + " v" + AppVersion;
+            this.Text = BuildInfo.AppName + " v" + BuildInfo.DisplayVersion;
             this.Font = new Font("Segoe UI", 9F);
             this.AutoScaleMode = AutoScaleMode.None;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -2947,8 +7721,10 @@ namespace IPbind
             Label lblTitle = new Label();
             lblTitle.Text = BuildInfo.AppName;
             lblTitle.Font = UiFont(16F, FontStyle.Bold);
-            lblTitle.Location = P(20, 10);
-            lblTitle.Size = Z(520, 28);
+            // 8 to 38, ending exactly where the subtitle starts, so the 16 pt title
+            // is not clipped at 150% and never overlaps the subtitle after rounding.
+            lblTitle.Location = P(20, 8);
+            lblTitle.Size = new Size(U(520), U(38) - U(8));
             lblTitle.TextAlign = ContentAlignment.MiddleCenter;
             Controls.Add(lblTitle);
 
@@ -2967,7 +7743,7 @@ namespace IPbind
             lblAdapter.AutoSize = true;
             Controls.Add(lblAdapter);
 
-            combo = new ComboBox();
+            combo = new ThemedComboBox();
             combo.Location = P(20, 94);
             combo.Size = Z(420, 24);
             combo.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -2979,14 +7755,42 @@ namespace IPbind
             {
                 string a = GetSelectedAlias();
                 if (a != null) { SaveAdapter(a); Log("Interface set to '" + a + "' (remembered)."); }
+                RefreshKeepDhcp(a);
             };
             Controls.Add(combo);
 
+            // Keep DHCP and Gateway support share one row above Refresh, 28 px apart
+            // as before. The pair is placed below, once Refresh exists, so the last
+            // letter of "Gateway support" ends at Refresh's right edge.
+            chkKeepDhcp = new ThemedCheckBox();
+            chkKeepDhcp.Text = "Keep DHCP";
+            chkKeepDhcp.Font = UiFont(8F, FontStyle.Regular);
+            chkKeepDhcp.Size = new Size(OptionWidth(chkKeepDhcp), U(20));
+            chkKeepDhcp.CheckAlign = ContentAlignment.MiddleLeft;
+            chkKeepDhcp.TextAlign = ContentAlignment.MiddleLeft;
+            chkKeepDhcp.Checked = true;
+            chkKeepDhcp.CheckedChanged += delegate
+            {
+                if (settingKeepDhcp) return;
+                keepDhcpPref = chkKeepDhcp.Checked;
+                SaveKeepDhcpPref();
+                Log(keepDhcpPref
+                    ? "Keep DHCP on (remembered). Apply adds the addresses alongside DHCP."
+                    : "Keep DHCP off (remembered). Apply sets static addresses only.");
+            };
+            Controls.Add(chkKeepDhcp);
+            keepDhcpTip = new ToolTip();
+            keepDhcpTip.AutoPopDelay = 10000;
+            keepDhcpTip.InitialDelay = 400;
+            keepDhcpTip.ReshowDelay = 200;
+            keepDhcpTip.ShowAlways = true;
+            keepDhcpTip.SetToolTip(chkKeepDhcp, KeepDhcpTipOn);
+
             Button btnRefresh = MakeButton("Refresh", 448, 93, 92, 26);
-            btnRefresh.Click += delegate { LoadAdapters(); };
+            btnRefresh.Click += delegate { using (DebugLog.Time("Refresh")) LoadAdapters(); };
             Controls.Add(btnRefresh);
 
-            chkAll = new CheckBox();
+            chkAll = new ThemedCheckBox();
             chkAll.Text = "Show all adapters (include virtual / cellular / VPN)";
             chkAll.Font = UiFont(8F, FontStyle.Regular);
             chkAll.Location = P(20, 122);
@@ -2994,13 +7798,12 @@ namespace IPbind
             chkAll.CheckedChanged += delegate { LoadAdapters(); };
             Controls.Add(chkAll);
 
-            chkGateway = new CheckBox();
+            chkGateway = new ThemedCheckBox();
             chkGateway.Text = "Gateway support";
             chkGateway.Font = UiFont(8F, FontStyle.Regular);
-            chkGateway.Location = P(410, 122);
-            chkGateway.Size = Z(130, 20);
-            chkGateway.CheckAlign = ContentAlignment.MiddleRight;
-            chkGateway.TextAlign = ContentAlignment.MiddleRight;
+            chkGateway.Size = new Size(OptionWidth(chkGateway), U(20));
+            chkGateway.CheckAlign = ContentAlignment.MiddleLeft;
+            chkGateway.TextAlign = ContentAlignment.MiddleLeft;
             chkGateway.CheckedChanged += delegate
             {
                 ApplyGatewayLayout();
@@ -3011,6 +7814,10 @@ namespace IPbind
                         : "Gateway support off (remembered). Static IPs only, no gateway or DNS.");
             };
             Controls.Add(chkGateway);
+            // Row y 72-92: under the subtitle (which ends at 72), above Refresh (93),
+            // level with "Select your LAN interface below:".
+            chkGateway.Location = new Point(btnRefresh.Right - TextInkRight(chkGateway), U(72));
+            chkKeepDhcp.Location = new Point(chkGateway.Left - U(28) - chkKeepDhcp.Width, U(72));
 
             // Gateway support is off by default; warn before someone turns it on.
             gatewayTip = new ToolTip();
@@ -3018,9 +7825,7 @@ namespace IPbind
             gatewayTip.InitialDelay = 400;
             gatewayTip.ReshowDelay = 200;
             gatewayTip.ShowAlways = true;
-            gatewayTip.SetToolTip(chkGateway,
-                "Only enable if you know what you're doing!\r\n" +
-                "A gateway or DNS here can change how this PC reaches the internet.");
+            gatewayTip.SetToolTip(chkGateway, "Only enable if you know what you're doing!");
 
             lblIPs = new Label();
             lblIPs.Text = IpLabelPlain;
@@ -3030,19 +7835,25 @@ namespace IPbind
             lblIPs.TextAlign = ContentAlignment.MiddleLeft;
             Controls.Add(lblIPs);
 
-            txtIPs = new TextBox();
+            txtIPs = new AutoHideScrollBox();
             txtIPs.Multiline = true;
-            txtIPs.ScrollBars = ScrollBars.Vertical;
+            txtIPs.ScrollBars = ScrollBars.None;
             txtIPs.Location = P(20, 170);
             txtIPs.Size = Z(520, 196);
             txtIPs.Font = new Font("Consolas", 10F);
-            txtIPs.TextChanged += delegate { RefreshGatewayChoices(); };
+            ((AutoHideScrollBox)txtIPs).SetAreaName("ips");
+            txtIPs.TextChanged += delegate
+            {
+                RefreshGatewayChoices();
+                AutoHideScrollBox ips = txtIPs as AutoHideScrollBox;
+                if (ips != null) ips.SyncThumbOnly();
+            };
             Controls.Add(txtIPs);
 
             // Gateway rows (hidden until Gateway support is on). They sit in the bottom
             // 62px of the IP list's normal area, which the list gives up when shown.
             lblGwOn = MakeRowLabel("Use gateway on:", 20, 310);
-            cboGwIp = new ComboBox();
+            cboGwIp = new ThemedComboBox();
             cboGwIp.Location = P(122, 310);
             cboGwIp.Size = Z(150, 24);
             cboGwIp.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -3075,39 +7886,54 @@ namespace IPbind
             Button btnShow = MakeButton("Show Current", 374, 372, 166, 28);
             btnShow.Click += delegate
             {
-                string a = GetSelectedAlias();
-                if (a == null) { Log("No interface selected.", "WARN"); return; }
-                ShowCurrentConfig(a);
+                using (DebugLog.Time("Show Current"))
+                {
+                    string a = GetSelectedAlias();
+                    if (a == null) { Log("No interface selected.", "WARN"); return; }
+                    ShowCurrentConfig(a);
+                }
             };
             Controls.Add(btnShow);
 
-            btnBind = MakeButton("Apply Static IPs to\r\nLAN Interface", 20, 406, 255, 60);
+            btnBind = MakeButton(UiCopy.ApplyButton, 20, 406, 255, 60);
             btnBind.Font = UiFont(12F, FontStyle.Bold);
-            btnBind.BackColor = Color.FromArgb(46, 125, 50);
+            btnBind.BackColor = UiCopy.ApplyButtonBack;
             btnBind.ForeColor = Color.White;
             btnBind.FlatStyle = FlatStyle.Flat;
             btnBind.FlatAppearance.BorderSize = 0;
             btnBind.Click += delegate
             {
-                SetBusy("Applying static IPs to selected LAN interface...");
-                bool ok = InvokeBind();
-                EndBusy(ok, "Static IPs applied to selected LAN interface",
-                            "Failed to apply static IPs to selected LAN interface");
+                using (DebugLog.Time("Apply"))
+                {
+                    string alias = GetSelectedAlias();
+                    string before = CaptureAdapterState(alias);
+                    SetBusy("Applying static IPs...");
+                    bool ok = InvokeBind();
+                    EndBusy(ok, "Static IPs applied",
+                                "Failed to apply static IPs");
+                    LogAdapterDiff("Apply", before, CaptureAdapterState(alias));
+                }
             };
             Controls.Add(btnBind);
 
-            btnDhcp = MakeButton("Return LAN Interface\r\nto DHCP", 285, 406, 255, 60);
+            btnDhcp = MakeButton(UiCopy.DhcpButton, 285, 406, 255, 60);
             btnDhcp.Font = UiFont(12F, FontStyle.Bold);
-            btnDhcp.BackColor = Color.FromArgb(25, 90, 160);
+            btnDhcp.BackColor = UiCopy.DhcpButtonBack;
             btnDhcp.ForeColor = Color.White;
             btnDhcp.FlatStyle = FlatStyle.Flat;
             btnDhcp.FlatAppearance.BorderSize = 0;
             btnDhcp.Click += delegate
             {
-                SetBusy("Returning selected LAN interface to DHCP...");
-                bool ok = InvokeDhcp();
-                EndBusy(ok, "Selected LAN interface returned to DHCP",
-                            "Failed to return selected LAN interface to DHCP");
+                using (DebugLog.Time("Return to DHCP"))
+                {
+                    string alias = GetSelectedAlias();
+                    string before = CaptureAdapterState(alias);
+                    SetBusy("Returning to DHCP...");
+                    bool ok = InvokeDhcp();
+                    EndBusy(ok, "Returned to DHCP",
+                                "Failed to return to DHCP");
+                    LogAdapterDiff("Return", before, CaptureAdapterState(alias));
+                }
             };
             Controls.Add(btnDhcp);
 
@@ -3127,18 +7953,24 @@ namespace IPbind
             Controls.Add(lblConsole);
 
             btnClear = MakeButton("Clear", 1000, 14, 80, 24);
-            btnClear.Click += delegate { console.Clear(); };
+            btnClear.Click += delegate
+            {
+                console.Clear();
+                AutoHideScrollBox box = console as AutoHideScrollBox;
+                if (box != null) box.SyncThumbOnly();
+            };
             Controls.Add(btnClear);
 
-            console = new TextBox();
+            console = new AutoHideScrollBox();
             console.Multiline = true;
-            console.ScrollBars = ScrollBars.Vertical;
+            console.ScrollBars = ScrollBars.None;
             console.ReadOnly = true;
             console.Location = P(560, 44);
             console.Size = Z(520, 466);
             console.Font = new Font("Consolas", 9F);
             console.BackColor = Color.FromArgb(18, 18, 18);
             console.ForeColor = Color.FromArgb(210, 210, 210);
+            ((AutoHideScrollBox)console).SetAreaName("console");
             Controls.Add(console);
 
             updateBanner = new Panel();
@@ -3164,24 +7996,17 @@ namespace IPbind
             updateBanner.Controls.Add(btnUpdateLater);
             Controls.Add(updateBanner);
 
-            btnAbout = MakeButton("About", 560, 520, 96, 26);
+            // 984 = console left (560) + console width (520) - About width (96),
+            // so the button is right-aligned with the console from the first paint.
+            btnAbout = MakeButton("About", 984, 520, 96, 26);
             btnAbout.Font = UiFont(8F, FontStyle.Regular);
             btnAbout.Click += delegate
             {
+                using (DebugLog.Time("About"))
                 using (AboutForm about = new AboutForm(this, dark, sc, UpdateCheckFile))
                     about.ShowDialog(this);
             };
             Controls.Add(btnAbout);
-
-            lblVersion = new Label();
-            lblVersion.Text = "v" + AppVersion;
-            lblVersion.Font = UiFont(8F, FontStyle.Regular);
-            lblVersion.AutoSize = false;
-            lblVersion.TextAlign = ContentAlignment.MiddleRight;
-            lblVersion.Location = P(920, 524);
-            lblVersion.Size = Z(160, 20);
-            lblVersion.ForeColor = Color.FromArgb(120, 120, 120);
-            Controls.Add(lblVersion);
 
             ApplyTheme();
             this.ResumeLayout(true);
