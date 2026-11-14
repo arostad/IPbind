@@ -8581,7 +8581,7 @@ namespace IPbind
             lblIPs = new TitleNoteLabel();
             lblIPs.TitleText = IpLabelTitle;
             lblIPs.NoteText = IpLabelNote;
-            lblIPs.Font = UiFont(8F, FontStyle.Bold);
+            lblIPs.Font = UiFont(9F, FontStyle.Bold);
             lblIPs.Location = P(20, 146);
             lblIPs.Size = Z(530, 22);
             lblIPs.TextAlign = ContentAlignment.MiddleLeft;
