@@ -17,8 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ci:
+  # WinForms suite: still regression-tests the engine both UIs share.
+  ci-winforms:
     uses: ./.github/workflows/ui-suite.yml
+
+  # WPF suite: the UI this branch ships as IPbind Beta.
+  ci-wpf:
+    uses: ./.github/workflows/ui-suite-wpf.yml
 
   build:
     runs-on: windows-latest
@@ -26,12 +31,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build IPbind Beta exe
+      - name: Build IPbind Beta exe (WPF UI)
         shell: pwsh
         run: |
           Remove-Item -ErrorAction SilentlyContinue .\IPbind.exe
-          powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1 -Channel beta
-          if (-not (Test-Path .\IPbind.exe)) { throw 'Build-Exe.ps1 did not produce IPbind.exe' }
+          # Same asset names as the WinForms Beta, so the in-app updater is unchanged.
+          powershell -ExecutionPolicy Bypass -File .\Build-Wpf.ps1 -Channel beta -OutPath .\IPbind.exe
+          if (-not (Test-Path .\IPbind.exe)) { throw 'Build-Wpf.ps1 did not produce IPbind.exe' }
           $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path)
           if ($info.ProductName -ne 'IPbind Beta') { throw "Expected product 'IPbind Beta', got '$($info.ProductName)'" }
           Write-Host "Built $($info.ProductName) $($info.ProductVersion)"
@@ -86,7 +92,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: [build, ci]
+    needs: [build, ci-winforms, ci-wpf]
     runs-on: ubuntu-latest
     permissions:
       contents: write

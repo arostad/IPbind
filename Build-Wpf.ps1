@@ -6,11 +6,14 @@
 
     Usage:   .\Build-Wpf.ps1
              .\Build-Wpf.ps1 -Channel beta
+             .\Build-Wpf.ps1 -Channel beta -OutPath .\IPbind.exe
 #>
 
 param(
     [ValidateSet('prod', 'beta')]
-    [string]$Channel = 'beta'
+    [string]$Channel = 'beta',
+    # Optional output file (CI builds straight to .\IPbind.exe). Default: dist-wpf\.
+    [string]$OutPath = ''
 )
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -72,6 +75,11 @@ Write-Host "Build version: $Version  (file version $numeric), channel: $Channel 
 
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
 $out = Join-Path $outDir $outName
+if ($OutPath) {
+    $out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutPath)
+    $outParent = Split-Path -Parent $out
+    if ($outParent -and -not (Test-Path $outParent)) { New-Item -ItemType Directory -Path $outParent | Out-Null }
+}
 if (Test-Path $out) {
     try {
         Remove-Item $out -Force -ErrorAction Stop
