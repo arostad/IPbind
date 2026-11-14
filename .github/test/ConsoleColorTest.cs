@@ -6,10 +6,11 @@ using System.Windows.Forms;
 
 namespace IPbindTest
 {
-    // 2.3.143: the console colors WARN (amber), ERR (red) and OK (green) lines.
+    // 2.3.144: the console colors only the level tag (OK green, WARN amber,
+    // ERR red, INFO blue). The stamp and the message stay the normal color.
     // Drives MainForm.LogConsole on the real console control and reads the
     // character colors back. The console stays dark in light mode too, so every
-    // level color must read on its background.
+    // tag color must read on its background.
     internal static class ConsoleColorTest
     {
         const BindingFlags F = BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public;
@@ -84,24 +85,36 @@ namespace IPbindTest
             if (rich == null) return Report();
 
             Color fg = console.ForeColor, bg = console.BackColor;
-            Color ok = ColorAt(rich, "OK  it worked line");
-            Color warn = ColorAt(rich, "WARN  careful line");
-            Color err = ColorAt(rich, "ERR  broken line");
-            Color info = ColorAt(rich, "INFO  plain info line");
-            Color info2 = ColorAt(rich, "INFO  plain again");
+            Color okWant = Color.FromArgb(90, 200, 110);
+            Color warnWant = Color.FromArgb(232, 180, 70);
+            Color errWant = Color.FromArgb(240, 100, 100);
+            Color infoWant = Color.FromArgb(64, 150, 230);
+
+            Color ok = ColorAt(rich, "OK");
+            Color warn = ColorAt(rich, "WARN");
+            Color err = ColorAt(rich, "ERR");
+            Color info = ColorAt(rich, "INFO");
+            Color okMsg = ColorAt(rich, "it worked line");
+            Color warnMsg = ColorAt(rich, "careful line");
+            Color errMsg = ColorAt(rich, "broken line");
+            Color infoMsg = ColorAt(rich, "plain info line");
+            Color info2Msg = ColorAt(rich, "plain again");
             Color stamp = Color.Empty;
             int warnAt = rich.Text.IndexOf("WARN  careful line", StringComparison.Ordinal);
             int lineStart = rich.Text.LastIndexOf('[', Math.Max(0, warnAt));
             if (lineStart >= 0) { rich.Select(lineStart, 10); stamp = rich.SelectionColor; }
 
             Console.WriteLine("fg=" + fg + " ok=" + ok + " warn=" + warn + " err=" + err + " info=" + info + " stamp=" + stamp);
-            Expect(Same(info, fg) && Same(info2, fg), "INFO lines must stay the normal console color");
+            Expect(Same(ok, okWant), "OK tag must be green (90,200,110), got " + ok);
+            Expect(Same(warn, warnWant), "WARN tag must be yellow (232,180,70), got " + warn);
+            Expect(Same(err, errWant), "ERR tag must be red (240,100,100), got " + err);
+            Expect(Same(info, infoWant), "INFO tag must be blue (64,150,230), got " + info);
+            Expect(Same(okMsg, fg) && Same(warnMsg, fg) && Same(errMsg, fg) && Same(infoMsg, fg) && Same(info2Msg, fg),
+                "the message after each tag must stay the normal console color");
             Expect(Same(stamp, fg), "the [hh:mm:ss] stamp on a WARN line must stay the normal console color");
-            Expect(!Same(ok, fg) && ok.G > ok.R && ok.G > ok.B, "OK lines must be green, got " + ok);
-            Expect(!Same(err, fg) && err.R > err.G && err.R > err.B, "ERR lines must be red, got " + err);
-            Expect(!Same(warn, fg) && warn.R > warn.B && warn.G > warn.B && warn.R >= warn.G, "WARN lines must be amber, got " + warn);
-            Expect(!Same(ok, warn) && !Same(ok, err) && !Same(warn, err), "OK, WARN and ERR colors must differ");
-            Color[] all = new Color[] { ok, warn, err, fg };
+            Expect(!Same(ok, warn) && !Same(ok, err) && !Same(ok, info) && !Same(warn, err) && !Same(warn, info) && !Same(err, info),
+                "OK, WARN, ERR and INFO tag colors must differ");
+            Color[] all = new Color[] { ok, warn, err, info };
             string[] names = new string[] { "OK", "WARN", "ERR", "INFO" };
             for (int i = 0; i < all.Length; i++)
             {
