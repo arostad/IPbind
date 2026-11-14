@@ -8,7 +8,7 @@ A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one
 
 By default IPbind sets no gateway and no DNS. Most equipment only needs an address on its own subnet. If you're on a LAN that also has internet, turn on **Gateway support** for one address and enter the router's gateway and up to two DNS servers. You can reach the local devices and stay online. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
-**Keep DHCP** adds the static addresses alongside the adapter's DHCP address instead of replacing it (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
+**Keep DHCP** is on by default. It adds the static addresses alongside the adapter's DHCP address (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
 
 At launch, IPbind reminds you to click **Return to DHCP** before you plug into a live network, since leftover static addresses can conflict with devices there. Tick **I’ll click Return to DHCP before I plug into a live network** to continue, or click **Exit IPbind** to close. Tick **Don’t show this again** to stop the reminder.
 
@@ -29,7 +29,7 @@ Prefer a single file? Download the portable version: [IPbind-Portable.exe](https
 ## Screenshot
 
 <p align="center">
-  <img src="screenshots/ipbind-main.png" alt="IPbind main window — LAN interface selector, static IP list, and console output in dark mode" width="920">
+  <img src="screenshots/ipbind-main.png" alt="IPbind main window in dark mode, with Keep DHCP on, the static IP list, and the console" width="920">
 </p>
 
 ## Privacy
