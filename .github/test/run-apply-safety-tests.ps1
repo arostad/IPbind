@@ -30,6 +30,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Adapter display test compile failed' }
 & .\adapter-display-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Adapter display tests failed' }
 
+# 2.3.143: console colors WARN / ERR / OK lines (real console control + LogConsole).
+$colorArgs = @(
+  '/nologo', '/warnaserror+', '/target:exe', '/out:console-color-tests.exe',
+  '/main:IPbindTest.ConsoleColorTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\ConsoleColorTest.cs'
+)
+& $csc @colorArgs
+if ($LASTEXITCODE -ne 0) { throw 'Console color test compile failed' }
+& .\console-color-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Console color tests failed' }
+
 # Prod-channel compile of the same sources: DebugLog must create no files or folders.
 $prodVer = @'
 using System.Reflection;
