@@ -5339,11 +5339,11 @@ namespace IPbind
     static class AutoHideScrollBars
     {
         public static readonly TimeSpan CheckEvery = TimeSpan.FromMilliseconds(250);
-        static readonly List<AutoHideScrollBox> areas = new List<AutoHideScrollBox>();
+        static readonly List<IAutoHideArea> areas = new List<IAutoHideArea>();
         static System.Windows.Forms.Timer timer;
         static bool filterAdded;
 
-        public static void Register(AutoHideScrollBox box)
+        public static void Register(IAutoHideArea box)
         {
             if (box == null || areas.Contains(box)) return;
             areas.Add(box);
@@ -5369,7 +5369,7 @@ namespace IPbind
             }
         }
 
-        public static void Unregister(AutoHideScrollBox box)
+        public static void Unregister(IAutoHideArea box)
         {
             areas.Remove(box);
         }
@@ -5382,7 +5382,7 @@ namespace IPbind
             catch { return; }
             for (int i = 0; i < areas.Count; i++)
             {
-                AutoHideScrollBox box = areas[i];
+                IAutoHideArea box = areas[i];
                 if (box.IsDisposed || !box.IsHandleCreated) continue;
                 bool over = box.IsDragging || box.AreaContains(cursor);
                 bool changed = false;
@@ -5405,7 +5405,7 @@ namespace IPbind
         {
             for (int i = 0; i < areas.Count; i++)
             {
-                AutoHideScrollBox box = areas[i];
+                IAutoHideArea box = areas[i];
                 if (box.IsDisposed) continue;
                 box.State.Deactivated();
                 box.ApplyVisibility();
@@ -5436,7 +5436,7 @@ namespace IPbind
                 catch { return false; }
                 for (int i = 0; i < areas.Count; i++)
                 {
-                    AutoHideScrollBox box = areas[i];
+                    IAutoHideArea box = areas[i];
                     if (box.IsDisposed || !box.IsHandleCreated) continue;
                     if (!box.AreaContains(cursor)) continue;
                     box.HandleWheel(unchecked((int)(m.WParam.ToInt64() & 0xFFFFFFFF)));
@@ -5447,12 +5447,49 @@ namespace IPbind
         }
     }
 
-    // Multiline text box with the native vertical bar off and a thin overlay in a
-    // permanently reserved right margin. Hover / wheel / keyboard / thumb-drag are
-    // the only inputs that reset the hide deadline.
-    sealed class AutoHideScrollBox : TextBox
+    // What the auto-hide overlay, the registry, and the UI harness need from a
+    // scroll area. The IP list is a TextBox (AutoHideScrollBox) and the console
+    // is a RichTextBox (ConsoleBox, 2.3.143) so it can color WARN / ERR / OK.
+    // Both share AutoHideCore; the Control members below come from the base class.
+    interface IAutoHideArea
     {
-        const int WM_KEYDOWN = 0x0100;
+        ScrollBarIdleState State { get; }
+        bool BarShown { get; }
+        int GutterWidth { get; }
+        Rectangle OverlayScreenRect { get; }
+        Rectangle ThumbScreenRect { get; }
+        bool IsDragging { get; set; }
+        int DebugPaintCount { get; set; }
+        bool AreaContains(Point screen);
+        bool CanScroll();
+        int FirstVisibleLine();
+        int LineCount();
+        int VisibleLineCount();
+        int MaxFirstLine();
+        void LineScroll(int lines);
+        void ScrollToFirst(int first);
+        void SyncThumbOnly();
+        void HandleWheel(int wParam);
+        void ApplyVisibility();
+
+        IntPtr Handle { get; }
+        bool IsHandleCreated { get; }
+        bool IsDisposed { get; }
+        bool Visible { get; }
+        Size ClientSize { get; }
+        Rectangle ClientRectangle { get; }
+        Rectangle Bounds { get; }
+        Color BackColor { get; }
+        Rectangle RectangleToScreen(Rectangle r);
+        bool Focus();
+        Form FindForm();
+    }
+
+    // Shared logic for both scroll areas: native vertical bar off and a thin
+    // overlay in a permanently reserved right margin. Hover / wheel / keyboard /
+    // thumb-drag are the only inputs that reset the hide deadline.
+    sealed class AutoHideCore
+    {
         const int WM_SETREDRAW = 0x000B;
         const int EM_SETMARGINS = 0x00D3;
         const int EM_GETRECT = 0x00B2;
@@ -5482,6 +5519,8 @@ namespace IPbind
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
         static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
+        readonly TextBoxBase host;
+        readonly IAutoHideArea area;
         public readonly ScrollBarIdleState State = new ScrollBarIdleState();
         readonly OverlayBar overlay;
         int gutter = 10;
@@ -5491,11 +5530,11 @@ namespace IPbind
         public int DebugPaintCount;
         public bool IsDragging;
 
-        public AutoHideScrollBox()
+        public AutoHideCore(TextBoxBase host, IAutoHideArea area)
         {
-            Multiline = true;
-            ScrollBars = ScrollBars.None;
-            overlay = new OverlayBar(this);
+            this.host = host;
+            this.area = area;
+            overlay = new OverlayBar(area);
         }
 
         public void SetAreaName(string name) { areaName = name ?? ""; }
@@ -5529,8 +5568,8 @@ namespace IPbind
 
         public bool AreaContains(Point screen)
         {
-            if (!IsHandleCreated) return false;
-            if (RectangleToScreen(ClientRectangle).Contains(screen)) return true;
+            if (!host.IsHandleCreated) return false;
+            if (host.RectangleToScreen(host.ClientRectangle).Contains(screen)) return true;
             if (overlay != null && overlay.IsHandleCreated
                 && overlay.RectangleToScreen(overlay.ClientRectangle).Contains(screen))
                 return true;
@@ -5544,23 +5583,23 @@ namespace IPbind
 
         public int FirstVisibleLine()
         {
-            if (!IsHandleCreated) return 0;
-            return (int)SendMessage(Handle, EM_GETFIRSTVISIBLELINE, IntPtr.Zero, IntPtr.Zero);
+            if (!host.IsHandleCreated) return 0;
+            return (int)SendMessage(host.Handle, EM_GETFIRSTVISIBLELINE, IntPtr.Zero, IntPtr.Zero);
         }
 
         public int LineCount()
         {
-            if (!IsHandleCreated) return 0;
-            return (int)SendMessage(Handle, EM_GETLINECOUNT, IntPtr.Zero, IntPtr.Zero);
+            if (!host.IsHandleCreated) return 0;
+            return (int)SendMessage(host.Handle, EM_GETLINECOUNT, IntPtr.Zero, IntPtr.Zero);
         }
 
         public int VisibleLineCount()
         {
-            if (!IsHandleCreated) return 1;
+            if (!host.IsHandleCreated) return 1;
             RECT r = new RECT();
-            SendMessageRect(Handle, EM_GETRECT, IntPtr.Zero, ref r);
+            SendMessageRect(host.Handle, EM_GETRECT, IntPtr.Zero, ref r);
             int h = r.Bottom - r.Top;
-            int lh = Font != null ? Font.Height : 16;
+            int lh = host.Font != null ? host.Font.Height : 16;
             if (lh < 1) lh = 16;
             return Math.Max(1, h / lh);
         }
@@ -5572,8 +5611,8 @@ namespace IPbind
 
         public void LineScroll(int lines)
         {
-            if (!IsHandleCreated || lines == 0) return;
-            SendMessage(Handle, EM_LINESCROLL, IntPtr.Zero, (IntPtr)lines);
+            if (!host.IsHandleCreated || lines == 0) return;
+            SendMessage(host.Handle, EM_LINESCROLL, IntPtr.Zero, (IntPtr)lines);
             lastFirstLine = FirstVisibleLine();
         }
 
@@ -5633,77 +5672,89 @@ namespace IPbind
             }
         }
 
-        protected override void OnHandleCreated(EventArgs e)
+        // Called from the host's OnHandleCreated (after it turns its own bars off).
+        public void HandleCreated()
         {
-            base.OnHandleCreated(e);
-            ScrollBars = ScrollBars.None;
             EnsureAutoVScroll();
             ApplyMargin();
-            AutoHideScrollBars.Register(this);
+            AutoHideScrollBars.Register(area);
             AttachOverlay();
             ApplyVisibility();
         }
 
-        protected override void OnHandleDestroyed(EventArgs e)
+        public void HandleDestroyed()
         {
-            AutoHideScrollBars.Unregister(this);
-            base.OnHandleDestroyed(e);
+            AutoHideScrollBars.Unregister(area);
         }
 
-        protected override void OnParentChanged(EventArgs e)
-        {
-            base.OnParentChanged(e);
-            AttachOverlay();
-        }
+        public void ParentChanged() { AttachOverlay(); }
 
-        protected override void OnLocationChanged(EventArgs e)
-        {
-            base.OnLocationChanged(e);
-            PositionOverlay();
-        }
+        public void LocationChanged() { PositionOverlay(); }
 
-        protected override void OnSizeChanged(EventArgs e)
+        public void SizeOrFontChanged()
         {
-            base.OnSizeChanged(e);
             ApplyMargin();
             PositionOverlay();
             SyncThumbOnly();
         }
 
-        protected override void OnFontChanged(EventArgs e)
+        public void BackColorChanged()
         {
-            base.OnFontChanged(e);
-            ApplyMargin();
-            PositionOverlay();
-            SyncThumbOnly();
-        }
-
-        protected override void OnBackColorChanged(EventArgs e)
-        {
-            base.OnBackColorChanged(e);
             if (overlay != null) overlay.Invalidate();
+        }
+
+        // Read-only boxes (the console) often swallow PageUp/PageDown/Home/End
+        // without scrolling once the native bar is gone. Do it ourselves when
+        // the base handler left the first visible line unchanged.
+        public void AfterKeyDown(int key, int before)
+        {
+            int after = FirstVisibleLine();
+            if (after == before)
+                after = KeyboardScroll(key, before);
+            if (after != before)
+            {
+                lastFirstLine = after;
+                State.Scrolled(DateTime.Now);
+                ApplyVisibility();
+                SyncThumbOnly();
+            }
+        }
+
+        int KeyboardScroll(int key, int before)
+        {
+            const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24;
+            const int VK_UP = 0x26, VK_DOWN = 0x28;
+            if (key == VK_PRIOR) ScrollToFirst(before - VisibleLineCount());
+            else if (key == VK_NEXT) ScrollToFirst(before + VisibleLineCount());
+            else if (key == VK_HOME) ScrollToFirst(0);
+            else if (key == VK_END) ScrollToFirst(MaxFirstLine());
+            else if (key == VK_UP) LineScroll(-1);
+            else if (key == VK_DOWN) LineScroll(1);
+            else return before;
+            return FirstVisibleLine();
         }
 
         void AttachOverlay()
         {
-            if (overlay == null || Parent == null) return;
-            if (overlay.Parent != Parent) Parent.Controls.Add(overlay);
+            Control parent = host.Parent;
+            if (overlay == null || parent == null) return;
+            if (overlay.Parent != parent) parent.Controls.Add(overlay);
             PositionOverlay();
             overlay.BringToFront();
-            if (IsHandleCreated) AutoHideScrollBars.Register(this);
+            if (host.IsHandleCreated) AutoHideScrollBars.Register(area);
         }
 
         void PositionOverlay()
         {
-            if (overlay == null || Parent == null) return;
-            int frameX = Math.Max(0, (Width - ClientSize.Width) / 2);
-            int frameY = Math.Max(0, (Height - ClientSize.Height) / 2);
+            if (overlay == null || host.Parent == null) return;
+            int frameX = Math.Max(0, (host.Width - host.ClientSize.Width) / 2);
+            int frameY = Math.Max(0, (host.Height - host.ClientSize.Height) / 2);
             int w = Math.Max(1, gutter);
             overlay.SetBounds(
-                Left + frameX + Math.Max(0, ClientSize.Width - w),
-                Top + frameY,
+                host.Left + frameX + Math.Max(0, host.ClientSize.Width - w),
+                host.Top + frameY,
                 w,
-                Math.Max(1, ClientSize.Height));
+                Math.Max(1, host.ClientSize.Height));
             overlay.BringToFront();
         }
 
@@ -5712,42 +5763,42 @@ namespace IPbind
             int dpi = 96;
             try
             {
-                if (IsHandleCreated) dpi = GetDpiForWindow(Handle);
+                if (host.IsHandleCreated) dpi = GetDpiForWindow(host.Handle);
             }
             catch
             {
-                try { using (Graphics g = CreateGraphics()) dpi = (int)Math.Round(g.DpiX); }
+                try { using (Graphics g = host.CreateGraphics()) dpi = (int)Math.Round(g.DpiX); }
                 catch { dpi = 96; }
             }
             if (dpi < 96) dpi = 96;
             int want = Math.Max(8, (int)Math.Round(10.0 * dpi / 96.0));
             gutter = want;
-            if (!IsHandleCreated) return;
+            if (!host.IsHandleCreated) return;
             int first = FirstVisibleLine();
-            int sel = SelectionStart;
-            int len = SelectionLength;
-            SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
-            SendMessage(Handle, EM_SETMARGINS, (IntPtr)EC_RIGHTMARGIN, (IntPtr)(gutter << 16));
+            int sel = host.SelectionStart;
+            int len = host.SelectionLength;
+            SendMessage(host.Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+            SendMessage(host.Handle, EM_SETMARGINS, (IntPtr)EC_RIGHTMARGIN, (IntPtr)(gutter << 16));
             int now = FirstVisibleLine();
             if (now != first) LineScroll(first - now);
-            SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
+            SendMessage(host.Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
             try
             {
-                SelectionStart = sel;
-                SelectionLength = len;
+                host.SelectionStart = sel;
+                host.SelectionLength = len;
             }
             catch { }
-            Invalidate();
+            host.Invalidate();
         }
 
         void EnsureAutoVScroll()
         {
-            if (!IsHandleCreated) return;
+            if (!host.IsHandleCreated) return;
             try
             {
-                long style = GetStyle(Handle);
+                long style = GetStyle(host.Handle);
                 long next = (style | ES_AUTOVSCROLL) & ~WS_VSCROLL;
-                if (next != style) SetStyle(Handle, next);
+                if (next != style) SetStyle(host.Handle, next);
             }
             catch { }
         }
@@ -5764,52 +5815,14 @@ namespace IPbind
             else SetWindowLong32(hwnd, GWL_STYLE, (int)style);
         }
 
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_KEYDOWN)
-            {
-                int before = FirstVisibleLine();
-                base.WndProc(ref m);
-                int after = FirstVisibleLine();
-                if (after == before)
-                    after = KeyboardScroll((int)m.WParam.ToInt64(), before);
-                if (after != before)
-                {
-                    lastFirstLine = after;
-                    State.Scrolled(DateTime.Now);
-                    ApplyVisibility();
-                    SyncThumbOnly();
-                }
-                return;
-            }
-            base.WndProc(ref m);
-        }
-
-        // Read-only boxes (the console) often swallow PageUp/PageDown/Home/End
-        // without scrolling once the native bar is gone. Do it ourselves when
-        // the base handler left the first visible line unchanged.
-        int KeyboardScroll(int key, int before)
-        {
-            const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24;
-            const int VK_UP = 0x26, VK_DOWN = 0x28;
-            if (key == VK_PRIOR) ScrollToFirst(before - VisibleLineCount());
-            else if (key == VK_NEXT) ScrollToFirst(before + VisibleLineCount());
-            else if (key == VK_HOME) ScrollToFirst(0);
-            else if (key == VK_END) ScrollToFirst(MaxFirstLine());
-            else if (key == VK_UP) LineScroll(-1);
-            else if (key == VK_DOWN) LineScroll(1);
-            else return before;
-            return FirstVisibleLine();
-        }
-
         sealed class OverlayBar : Control
         {
-            readonly AutoHideScrollBox box;
+            readonly IAutoHideArea box;
             bool dragging;
             int dragStartY;
             int dragStartFirst;
 
-            public OverlayBar(AutoHideScrollBox box)
+            public OverlayBar(IAutoHideArea box)
             {
                 this.box = box;
                 SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
@@ -5942,6 +5955,230 @@ namespace IPbind
         }
     }
 
+    // The IP list. Plain EDIT control, unchanged look and behavior.
+    sealed class AutoHideScrollBox : TextBox, IAutoHideArea
+    {
+        const int WM_KEYDOWN = 0x0100;
+        readonly AutoHideCore core;
+
+        public AutoHideScrollBox()
+        {
+            Multiline = true;
+            ScrollBars = ScrollBars.None;
+            core = new AutoHideCore(this, this);
+        }
+
+        public void SetAreaName(string name) { core.SetAreaName(name); }
+        public ScrollBarIdleState State { get { return core.State; } }
+        public bool BarShown { get { return core.BarShown; } }
+        public int GutterWidth { get { return core.GutterWidth; } }
+        public Rectangle OverlayScreenRect { get { return core.OverlayScreenRect; } }
+        public Rectangle ThumbScreenRect { get { return core.ThumbScreenRect; } }
+        public bool IsDragging { get { return core.IsDragging; } set { core.IsDragging = value; } }
+        public int DebugPaintCount { get { return core.DebugPaintCount; } set { core.DebugPaintCount = value; } }
+        public bool AreaContains(Point screen) { return core.AreaContains(screen); }
+        public bool CanScroll() { return core.CanScroll(); }
+        public int FirstVisibleLine() { return core.FirstVisibleLine(); }
+        public int LineCount() { return core.LineCount(); }
+        public int VisibleLineCount() { return core.VisibleLineCount(); }
+        public int MaxFirstLine() { return core.MaxFirstLine(); }
+        public void LineScroll(int lines) { core.LineScroll(lines); }
+        public void ScrollToFirst(int first) { core.ScrollToFirst(first); }
+        public void SyncThumbOnly() { core.SyncThumbOnly(); }
+        public void HandleWheel(int wParam) { core.HandleWheel(wParam); }
+        public void ApplyVisibility() { core.ApplyVisibility(); }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ScrollBars = ScrollBars.None;
+            core.HandleCreated();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            core.HandleDestroyed();
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void OnParentChanged(EventArgs e)
+        {
+            base.OnParentChanged(e);
+            if (core != null) core.ParentChanged();
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            if (core != null) core.LocationChanged();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (core != null) core.SizeOrFontChanged();
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            if (core != null) core.SizeOrFontChanged();
+        }
+
+        protected override void OnBackColorChanged(EventArgs e)
+        {
+            base.OnBackColorChanged(e);
+            if (core != null) core.BackColorChanged();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_KEYDOWN && core != null)
+            {
+                int before = core.FirstVisibleLine();
+                base.WndProc(ref m);
+                core.AfterKeyDown((int)m.WParam.ToInt64(), before);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+    }
+
+    // The console (2.3.143). RichTextBox so WARN, ERR and OK lines can be colored.
+    sealed class ConsoleBox : RichTextBox, IAutoHideArea
+    {
+        const int WM_KEYDOWN = 0x0100;
+        readonly AutoHideCore core;
+
+        public ConsoleBox()
+        {
+            Multiline = true;
+            ScrollBars = RichTextBoxScrollBars.None;
+            DetectUrls = false;
+            ContextMenu = new ContextMenu(new MenuItem[] {
+                new MenuItem("Copy", delegate { Copy(); }),
+                new MenuItem("Select All", delegate { SelectAll(); }) });
+            core = new AutoHideCore(this, this);
+        }
+
+        public void SetAreaName(string name) { core.SetAreaName(name); }
+        public ScrollBarIdleState State { get { return core.State; } }
+        public bool BarShown { get { return core.BarShown; } }
+        public int GutterWidth { get { return core.GutterWidth; } }
+        public Rectangle OverlayScreenRect { get { return core.OverlayScreenRect; } }
+        public Rectangle ThumbScreenRect { get { return core.ThumbScreenRect; } }
+        public bool IsDragging { get { return core.IsDragging; } set { core.IsDragging = value; } }
+        public int DebugPaintCount { get { return core.DebugPaintCount; } set { core.DebugPaintCount = value; } }
+        public bool AreaContains(Point screen) { return core.AreaContains(screen); }
+        public bool CanScroll() { return core.CanScroll(); }
+        public int FirstVisibleLine() { return core.FirstVisibleLine(); }
+        public int LineCount() { return core.LineCount(); }
+        public int VisibleLineCount() { return core.VisibleLineCount(); }
+        public int MaxFirstLine() { return core.MaxFirstLine(); }
+        public void LineScroll(int lines) { core.LineScroll(lines); }
+        public void ScrollToFirst(int first) { core.ScrollToFirst(first); }
+        public void SyncThumbOnly() { core.SyncThumbOnly(); }
+        public void HandleWheel(int wParam) { core.HandleWheel(wParam); }
+        public void ApplyVisibility() { core.ApplyVisibility(); }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ScrollBars = RichTextBoxScrollBars.None;
+            core.HandleCreated();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            core.HandleDestroyed();
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void OnParentChanged(EventArgs e)
+        {
+            base.OnParentChanged(e);
+            if (core != null) core.ParentChanged();
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            if (core != null) core.LocationChanged();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (core != null) core.SizeOrFontChanged();
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            if (core != null) core.SizeOrFontChanged();
+        }
+
+        protected override void OnBackColorChanged(EventArgs e)
+        {
+            base.OnBackColorChanged(e);
+            if (core != null) core.BackColorChanged();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_KEYDOWN && core != null)
+            {
+                // Read-only, but RichEdit still takes some Ctrl formatting keys
+                // (alignment, line spacing). Keep copy, select-all and navigation only.
+                if (DropFormattingKey((int)m.WParam.ToInt64())) return;
+                int before = core.FirstVisibleLine();
+                base.WndProc(ref m);
+                core.AfterKeyDown((int)m.WParam.ToInt64(), before);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        static bool DropFormattingKey(int key)
+        {
+            if ((Control.ModifierKeys & Keys.Control) == 0) return false;
+            Keys k = (Keys)key;
+            if (k == Keys.C || k == Keys.A || k == Keys.Insert || k == Keys.ControlKey || k == Keys.ShiftKey) return false;
+            if (k >= Keys.PageUp && k <= Keys.Down) return false;   // PageUp, PageDown, End, Home, arrows
+            return true;
+        }
+
+        // Log levels on the console's dark background (the console stays dark
+        // in light mode too). Same green and red as the dark status label.
+        public static readonly Color OkColor = Color.FromArgb(90, 200, 110);
+        public static readonly Color WarnColor = Color.FromArgb(232, 180, 70);
+        public static readonly Color ErrColor = Color.FromArgb(240, 100, 100);
+
+        public static Color LevelColor(string level, Color fallback)
+        {
+            if (level == "OK") return OkColor;
+            if (level == "WARN") return WarnColor;
+            if (level == "ERR" || level == "ERROR") return ErrColor;
+            return fallback;
+        }
+
+        // "[hh:mm:ss] " stays the normal console gray; the level and message
+        // take the level color. INFO lines are all gray.
+        public void AppendLogLine(string stamp, string level, string msg)
+        {
+            Select(TextLength, 0);
+            SelectionColor = ForeColor;
+            AppendText(stamp);
+            Select(TextLength, 0);
+            SelectionColor = LevelColor(level, ForeColor);
+            AppendText(level + "  " + msg + "\r\n");
+            Select(TextLength, 0);
+            SelectionColor = ForeColor;
+            ScrollToCaret();
+            SyncThumbOnly();
+        }
+    }
+
 
     class MainForm : Form
     {
@@ -6003,7 +6240,7 @@ namespace IPbind
         TextBox txtGateway, txtDns1, txtDns2;
         string gwChoice = "";     // remembered "ip/prefix" that uses the gateway
         bool loadingGateway;
-        TextBox console;
+        ConsoleBox console;
         Label lblStatus;
         Button btnBind, btnDhcp;
         Panel updateBanner;
@@ -6079,12 +6316,7 @@ namespace IPbind
 
         void LogConsole(string msg, string level)
         {
-            string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + level + "  " + msg + "\r\n";
-            console.AppendText(line);
-            console.SelectionStart = console.TextLength;
-            console.ScrollToCaret();
-            AutoHideScrollBox box = console as AutoHideScrollBox;
-            if (box != null) box.SyncThumbOnly();
+            console.AppendLogLine("[" + DateTime.Now.ToString("HH:mm:ss") + "] ", level, msg);
         }
 
         bool TryCidr(string s, out string ip, out int prefix)
@@ -7936,7 +8168,7 @@ namespace IPbind
                     if (themed != null) themed.ApplyDark(true);
                     else WindowTheme.ApplyCombo((ComboBox)c, true);
                 }
-                else if (c is TextBox || c is ListBox)
+                else if (c is TextBoxBase || c is ListBox)
                 {
                     try { WindowTheme.SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
                 }
@@ -8324,21 +8556,20 @@ namespace IPbind
             btnClear.Click += delegate
             {
                 console.Clear();
-                AutoHideScrollBox box = console as AutoHideScrollBox;
-                if (box != null) box.SyncThumbOnly();
+                console.SyncThumbOnly();
             };
             Controls.Add(btnClear);
 
-            console = new AutoHideScrollBox();
+            console = new ConsoleBox();
             console.Multiline = true;
-            console.ScrollBars = ScrollBars.None;
+            console.ScrollBars = RichTextBoxScrollBars.None;
             console.ReadOnly = true;
             console.Location = P(560, 44);
             console.Size = Z(520, 466);
             console.Font = new Font("Consolas", 9F);
             console.BackColor = Color.FromArgb(18, 18, 18);
             console.ForeColor = Color.FromArgb(210, 210, 210);
-            ((AutoHideScrollBox)console).SetAreaName("console");
+            console.SetAreaName("console");
             Controls.Add(console);
 
             updateBanner = new Panel();

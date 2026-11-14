@@ -808,7 +808,7 @@ namespace IPbindTest
             int problems = 0;
             IPbind.MainForm main = new IPbind.MainForm();
             main.Show(); Pump(2000);
-            IPbind.AutoHideScrollBox console = typeof(IPbind.MainForm).GetField("console", F).GetValue(main) as IPbind.AutoHideScrollBox;
+            IPbind.IAutoHideArea console = typeof(IPbind.MainForm).GetField("console", F).GetValue(main) as IPbind.IAutoHideArea;
             IPbind.AutoHideScrollBox ips = typeof(IPbind.MainForm).GetField("txtIPs", F).GetValue(main) as IPbind.AutoHideScrollBox;
             if (console == null || ips == null)
             {
@@ -821,7 +821,7 @@ namespace IPbindTest
             if (log == null) log = typeof(IPbind.MainForm).GetMethod("Log", F);
             for (int i = 0; i < 80; i++)
             {
-                if (log != null) log.Invoke(main, new object[] { "scroll test line " + i + " " + new string('x', 40), "INFO" });
+                if (log != null) log.Invoke(main, new object[] { "scroll test line " + i + " " + new string('x', 40), ScrollLevels[i % ScrollLevels.Length] });
             }
             StringBuilder ipText = new StringBuilder();
             for (int i = 0; i < 40; i++) ipText.AppendLine("10.10." + (i % 250) + ".98/24");
@@ -846,7 +846,7 @@ namespace IPbindTest
         }
 
 
-        static int CountGutterThumb(string png, IPbind.MainForm main, IPbind.AutoHideScrollBox box, List<string> lines, string tag)
+        static int CountGutterThumb(string png, IPbind.MainForm main, IPbind.IAutoHideArea box, List<string> lines, string tag)
         {
             if (!File.Exists(png) || !box.IsHandleCreated) { lines.Add("gutter thumb " + tag + " missing shot"); return 0; }
             Rectangle win = WinRect(main.Handle);
@@ -870,7 +870,10 @@ namespace IPbindTest
             return mid;
         }
 
-        static int CheckGutter(IPbind.AutoHideScrollBox box, string name, List<string> lines)
+        // Mixed levels so the scroll shots also show the 2.3.143 console colors.
+        static readonly string[] ScrollLevels = new string[] { "INFO", "OK", "WARN", "ERR" };
+
+        static int CheckGutter(IPbind.IAutoHideArea box, string name, List<string> lines)
         {
             RECT r = new RECT();
             SendMessageRect(box.Handle, 0x00B2, IntPtr.Zero, ref r);
@@ -886,7 +889,7 @@ namespace IPbindTest
             return 0;
         }
 
-        static int ScrollHideOne(IPbind.MainForm main, IPbind.AutoHideScrollBox box, string name,
+        static int ScrollHideOne(IPbind.MainForm main, IPbind.IAutoHideArea box, string name,
             Point away, string outPrefix, List<string> lines, MethodInfo log, bool full)
         {
             int problems = 0;
@@ -1015,8 +1018,9 @@ namespace IPbindTest
         static bool GutterOverlayPair(Control a, Control b)
         {
             string an = a.GetType().Name, bn = b.GetType().Name;
-            return (an == "OverlayBar" && bn == "AutoHideScrollBox")
-                || (bn == "OverlayBar" && an == "AutoHideScrollBox");
+            bool aBox = an == "AutoHideScrollBox" || an == "ConsoleBox";
+            bool bBox = bn == "AutoHideScrollBox" || bn == "ConsoleBox";
+            return (an == "OverlayBar" && bBox) || (bn == "OverlayBar" && aBox);
         }
 
         static int CheckUncheckedBoxes(Form form, string png, List<string> lines)
@@ -1071,7 +1075,7 @@ namespace IPbindTest
                 }
             }
             Button about = (Button)typeof(IPbind.MainForm).GetField("btnAbout", F).GetValue(main);
-            TextBox console = (TextBox)typeof(IPbind.MainForm).GetField("console", F).GetValue(main);
+            Control console = (Control)typeof(IPbind.MainForm).GetField("console", F).GetValue(main);
             float sc = (float)typeof(IPbind.MainForm).GetField("sc", F).GetValue(main);
             int gap = (int)Math.Round(10 * sc);
             int wantW = (int)Math.Round(96 * sc);
