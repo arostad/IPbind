@@ -8,7 +8,7 @@ A compiled .NET WinForms tool that binds a set of static IPv4 addresses onto one
 
 By default IPbind sets no gateway and no DNS. Most equipment only needs an address on its own subnet. If you're on a LAN that also has internet, turn on **Gateway support** for one address and enter the router's gateway and up to two DNS servers. You can reach the local devices and stay online. The gateway gets a high route metric, so it won't take over internet traffic from your Wi-Fi or office network. IPbind remembers the setting, and Return to DHCP clears it from the interface.
 
-In IPbind Beta, **Keep DHCP** adds the static addresses alongside the adapter's DHCP address instead of replacing it (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
+**Keep DHCP** adds the static addresses alongside the adapter's DHCP address instead of replacing it (Windows 10 version 1703 or later). Return to DHCP removes only what IPbind added. Untick it for static addresses only.
 
 At launch, IPbind reminds you to click **Return to DHCP** before you plug into a live network, since leftover static addresses can conflict with devices there. Tick **I’ll click Return to DHCP before I plug into a live network** to continue, or click **Exit IPbind** to close. Tick **Don’t show this again** to stop the reminder.
 
@@ -16,11 +16,11 @@ App created by [Andy Rostad](https://github.com/arostad).  Released under the [M
 
 <br clear="all">
 
-Current version: **2.3.140**
+Current version: **2.3.141**
 
 ## Download
 
-### Download installer: [IPbind-Installer-v2.3.140.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.140.exe)
+### Download installer: [IPbind-Installer-v2.3.141.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Installer-v2.3.141.exe)
 
 The installer is recommended. It installs per-user under LocalAppData. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
