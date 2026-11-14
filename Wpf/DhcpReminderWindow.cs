@@ -56,13 +56,16 @@ namespace IPbind
             exitButton.Click += delegate { window.DialogResult = false; };
             window.Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
-                if (window.DialogResult == null) window.DialogResult = false;
+                if (modal && window.DialogResult == null) window.DialogResult = false;
             };
             ApplyContinueState();
         }
 
+        bool modal;
+
         public bool? ShowDialog()
         {
+            modal = true;
             return window.ShowDialog();
         }
 

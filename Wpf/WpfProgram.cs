@@ -248,8 +248,12 @@ namespace IPbind
                 if (!(el is TextBlock) && !(el is Button) && !(el is CheckBox)) return;
                 if (el.RenderSize.Width < 1 || el.RenderSize.Height < 1) return;
                 if (el.DesiredSize.Width <= 0 && el.DesiredSize.Height <= 0) return;
-                if (el.DesiredSize.Width > el.RenderSize.Width + tol
-                    || el.DesiredSize.Height > el.RenderSize.Height + tol)
+                // DesiredSize includes Margin; RenderSize does not.
+                Thickness m = el.Margin;
+                double wantW = el.DesiredSize.Width - m.Left - m.Right;
+                double wantH = el.DesiredSize.Height - m.Top - m.Bottom;
+                if (wantW > el.RenderSize.Width + tol
+                    || wantH > el.RenderSize.Height + tol)
                 {
                     string who = string.IsNullOrEmpty(el.Name) ? el.GetType().Name : el.Name;
                     string text = "";
@@ -262,7 +266,7 @@ namespace IPbind
                     }
                     if (text.Length > 60) text = text.Substring(0, 60);
                     fails.Add("FAIL " + who + " text trimmed desired "
-                        + Fmt(el.DesiredSize.Width) + "x" + Fmt(el.DesiredSize.Height)
+                        + Fmt(wantW) + "x" + Fmt(wantH)
                         + " render " + Fmt(el.RenderSize.Width) + "x" + Fmt(el.RenderSize.Height)
                         + " \"" + text + "\"");
                 }
