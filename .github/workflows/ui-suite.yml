@@ -330,8 +330,7 @@ jobs:
       - name: 128 to current in-app update then new uninstall prompt
         shell: pwsh
         run: |
-          $script = Get-Content -Raw .\Build-Exe.ps1
-          $version = [regex]::Match($script, "(?m)^\$Version\s*=\s*'([^']+)'").Groups[1].Value
+          $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path .\IPbind.exe).Path).ProductVersion
           $installer = (Resolve-Path ".\dist\IPbind-Installer-v$version.exe").Path
           New-Item -ItemType Directory shots\upgrade-uninstaller -Force | Out-Null
           powershell -ExecutionPolicy Bypass -File .\.github\test\run-upgrade-uninstaller.ps1 `
