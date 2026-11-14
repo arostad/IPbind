@@ -20,10 +20,17 @@ function L([string]$s) { $line = "[$((Get-Date).ToString('HH:mm:ss.fff'))] $s"; 
 $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 function Cond($prop, $val) { New-Object System.Windows.Automation.PropertyCondition($prop, $val) }
+# Top-level windows plus the windows they own (UIA lists a WPF window's owned dialogs as its children).
+function TopWins {
+  foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+    $w
+    try { $w.FindAll($TS::Children, (Cond $AE::ControlTypeProperty $CT::Window)) } catch { }
+  }
+}
 function FindWin([string]$name, [int]$sec = 15, [switch]$Like) {
   $end = (Get-Date).AddSeconds($sec)
   while ((Get-Date) -lt $end) {
-    foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+    foreach ($w in (TopWins)) {
       $n = $w.Current.Name
       if (($Like -and $n -like $name) -or (-not $Like -and $n -eq $name)) { return $w }
     }
@@ -78,7 +85,10 @@ function Click($el) {
   if (-not $el) { L 'click: no element'; return $false }
   $h = [IntPtr]$el.Current.NativeWindowHandle
   if ($h -eq [IntPtr]::Zero) {
-    try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); return $true } catch { L "click failed: $_"; return $false }
+    $p = $null
+    if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { try { $p.Invoke(); return $true } catch { L "click failed: $_"; return $false } }
+    if ($el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) { try { $p.Toggle(); return $true } catch { L "click failed: $_"; return $false } }
+    L "click failed: no Invoke or Toggle pattern on '$($el.Current.Name)'"; return $false
   }
   [W]::PostMessage($h, 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; return $true
 }
@@ -118,7 +128,7 @@ $rem = FindWin 'IPbind Beta' 30
 Start-Sleep -Seconds 3
 ShotScreen 'first-launch-screen'
 $rem = $null
-foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+foreach ($w in (TopWins)) {
   if ($w.Current.Name -eq 'IPbind Beta' -and (Checks $w).Count -ge 2 -and (Btn $w 'Continue')) { $rem = $w }
 }
 if ($rem) {
