@@ -61,6 +61,12 @@ namespace IPbind
                 if (UpdateChecker.TryRunApplyUpdate(args)) return;
                 UpdateChecker.BeginHelperCleanup(args);
                 InstalledVersionSync.Run();
+                // Older in-app updates only replaced IPbind.exe, so a 2.3.128
+                // (or 2.3.141) install can already be running this build while
+                // still using the original unins000.exe. Refresh that before
+                // the main window appears. Returns true when a helper was
+                // started and this process should exit.
+                if (UpdateChecker.TryStartUninstallerRefresh()) return;
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -874,6 +880,37 @@ namespace IPbind
 
         // currentDisplay is the Apps & Features value (may be numeric or end in b).
         // runningNumeric is BuildInfo.Version; runningDisplay is BuildInfo.DisplayVersion.
+        public static bool TryReadUninstallString(string installDirectory, out string uninstallString)
+        {
+            uninstallString = "";
+            if (string.IsNullOrEmpty(installDirectory)) return false;
+            string dir;
+            try { dir = Path.GetFullPath(installDirectory).TrimEnd('\\'); }
+            catch { return false; }
+            string keyPath = string.Format(
+                UninstallKeyFormat, BuildInfo.IsBeta ? BetaAppId : ProdAppId);
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key =
+                    Microsoft.Win32.Registry.CurrentUser.OpenSubKey(keyPath, false))
+                {
+                    if (key == null) return false;
+                    string location = key.GetValue("InstallLocation") as string;
+                    if (string.IsNullOrEmpty(location)
+                        || !string.Equals(
+                            Path.GetFullPath(location).TrimEnd('\\'), dir,
+                            StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    uninstallString = key.GetValue("UninstallString") as string ?? "";
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static bool ShouldWrite(string currentDisplay, string runningNumeric, string runningDisplay, out string writeValue)
         {
             writeValue = runningDisplay;
@@ -1007,9 +1044,71 @@ namespace IPbind
             };
 
         static readonly HttpClient Http = CreateClient();
+        // sha256sum format: "<hash>  <filename>". Filename is IPbind.exe for
+        // in-app exe updates and IPbind-Installer-v*.exe for installer updates.
         static readonly Regex ChecksumPattern = new Regex(
-            @"\A(?<hash>[0-9a-fA-F]{64})  IPbind\.exe[ \t]*(?:\r?\n)?\z",
+            @"\A(?<hash>[0-9a-fA-F]{64})  \S+[ \t]*(?:\r?\n)?\z",
             RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        public static bool IsInstallerManaged(string installDirectory)
+        {
+            return !string.IsNullOrEmpty(installDirectory)
+                && File.Exists(Path.Combine(installDirectory, "unins000.exe"));
+        }
+
+        public static string InstallerFileName(string version)
+        {
+            return InstallerFileName(version, BuildInfo.IsBeta);
+        }
+
+        public static string InstallerFileName(string version, bool isBeta)
+        {
+            Version parsed;
+            if (string.IsNullOrEmpty(version) || !Version.TryParse(version, out parsed))
+                throw new ArgumentException("version");
+            if (isBeta)
+                return "IPbind-Installer-v" + version + "-beta.exe";
+            return "IPbind-Installer-v" + version + ".exe";
+        }
+
+        public static string InstallerUrl(string version)
+        {
+            string fileName = InstallerFileName(version);
+            // Prod uses the permanent v<version> release so a first-launch
+            // uninstaller refresh for this build still works after a later
+            // Latest publish. Beta keeps using the moving beta tag.
+            if (BuildInfo.IsBeta)
+                return ReleaseBaseUrl + fileName;
+            return "https://github.com/arostad/IPbind/releases/download/v"
+                + version + "/" + fileName;
+        }
+
+        public static bool TryParseChecksum(string text, out string hash)
+        {
+            hash = "";
+            if (string.IsNullOrEmpty(text)) return false;
+            Match match = ChecksumPattern.Match(text);
+            if (!match.Success) return false;
+            hash = match.Groups["hash"].Value.ToUpperInvariant();
+            return true;
+        }
+
+        public static bool UninstallStringIsCurrent(string uninstallString)
+        {
+            return !string.IsNullOrEmpty(uninstallString)
+                && uninstallString.IndexOf(
+                    "/IPBINDPROMPT", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        public static bool UninstallerNeedsRefresh(string installDirectory)
+        {
+            if (!IsInstallerManaged(installDirectory)) return false;
+            string uninstallString;
+            if (!InstalledVersionSync.TryReadUninstallString(
+                    installDirectory, out uninstallString))
+                return true;
+            return !UninstallStringIsCurrent(uninstallString);
+        }
 
         static HttpClient CreateClient()
         {
@@ -1183,7 +1282,12 @@ namespace IPbind
 
         static string ReadChecksum()
         {
-            using (HttpResponseMessage response = GetTrusted(ChecksumUrl))
+            return ReadChecksum(ChecksumUrl);
+        }
+
+        static string ReadChecksum(string url)
+        {
+            using (HttpResponseMessage response = GetTrusted(url))
             {
                 response.EnsureSuccessStatusCode();
                 using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
@@ -1196,18 +1300,23 @@ namespace IPbind
                         throw new InvalidOperationException(
                             "The update checksum was not readable.");
 
-                    Match match = ChecksumPattern.Match(new string(buffer, 0, count));
-                    if (!match.Success)
+                    string hash;
+                    if (!TryParseChecksum(new string(buffer, 0, count), out hash))
                         throw new InvalidOperationException(
                             "The update checksum was not readable.");
-                    return match.Groups["hash"].Value.ToUpperInvariant();
+                    return hash;
                 }
             }
         }
 
         static void DownloadExe(string destination)
         {
-            using (HttpResponseMessage response = GetTrusted(ExeUrl))
+            DownloadTrustedFile(ExeUrl, destination);
+        }
+
+        static void DownloadTrustedFile(string url, string destination)
+        {
+            using (HttpResponseMessage response = GetTrusted(url))
             {
                 response.EnsureSuccessStatusCode();
                 long? contentLength = response.Content.Headers.ContentLength;
@@ -1524,15 +1633,7 @@ namespace IPbind
                 throw new ArgumentException("The update helper arguments were invalid.");
             }
 
-            try
-            {
-                using (Process parent = Process.GetProcessById(parentPid))
-                    parent.WaitForExit();
-            }
-            catch (ArgumentException)
-            {
-                // The parent already exited before the helper queried it.
-            }
+            WaitForParent(parentPid);
 
             FileInfo downloaded = new FileInfo(pending);
             if (!downloaded.Exists || downloaded.Length < MinExeBytes
@@ -1553,28 +1654,117 @@ namespace IPbind
                 throw new InvalidOperationException("The updated executable is missing.");
         }
 
+        static void WaitForParent(int parentPid)
+        {
+            try
+            {
+                using (Process parent = Process.GetProcessById(parentPid))
+                    parent.WaitForExit();
+            }
+            catch (ArgumentException)
+            {
+                // The parent already exited before the helper queried it.
+            }
+        }
+
+        static void ApplyInstallerUpdate(string[] args)
+        {
+            if (args.Length != 5)
+                throw new ArgumentException("The update helper arguments were invalid.");
+
+            if (string.IsNullOrEmpty(args[1]) || string.IsNullOrEmpty(args[2]))
+                throw new ArgumentException("The update helper arguments were invalid.");
+            string pending = Path.GetFullPath(args[1]);
+            string installDir = Path.GetFullPath(args[2]);
+            string expectedHash = args[3];
+            int parentPid;
+            if (!Regex.IsMatch(expectedHash ?? "", @"\A[0-9a-fA-F]{64}\z")
+                || !int.TryParse(args[4], out parentPid) || parentPid <= 0
+                || string.Equals(pending, installDir, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("The update helper arguments were invalid.");
+            }
+
+            WaitForParent(parentPid);
+
+            FileInfo downloaded = new FileInfo(pending);
+            if (!downloaded.Exists || downloaded.Length < MinExeBytes
+                || downloaded.Length > MaxExeBytes)
+            {
+                throw new InvalidOperationException(
+                    "The downloaded update has an unexpected size.");
+            }
+            if (!string.Equals(
+                Sha256(pending), expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The downloaded update failed its integrity check.");
+            }
+
+            ProcessStartInfo setup = new ProcessStartInfo();
+            setup.FileName = pending;
+            setup.Arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART "
+                + "/NORESTARTAPPLICATIONS /DIR=" + QuoteArgument(installDir);
+            setup.UseShellExecute = false;
+            setup.CreateNoWindow = true;
+            using (Process process = Process.Start(setup))
+            {
+                if (process == null)
+                    throw new InvalidOperationException("Could not start the installer.");
+                process.WaitForExit();
+                if (process.ExitCode != 0)
+                    throw new InvalidOperationException(
+                        "The installer exited with code "
+                        + process.ExitCode.ToString() + ".");
+            }
+
+            string target = Path.Combine(installDir, ExeFileName);
+            if (!File.Exists(target))
+                throw new InvalidOperationException("The updated executable is missing.");
+        }
+
         public static bool TryRunApplyUpdate(string[] args)
         {
-            if (args == null || args.Length == 0
-                || !string.Equals(args[0], "--apply-update", StringComparison.Ordinal))
+            if (args == null || args.Length == 0)
+                return false;
+            bool installerUpdate = string.Equals(
+                args[0], "--apply-installer-update", StringComparison.Ordinal);
+            if (!installerUpdate
+                && !string.Equals(args[0], "--apply-update", StringComparison.Ordinal))
                 return false;
 
-            string target = args.Length > 2 ? args[2] : "";
             string pending = args.Length > 1 ? args[1] : "";
             string helperPath = Application.ExecutablePath;
             string errorFile = "";
+            string target = "";
             try
             {
-                if (!string.IsNullOrEmpty(target))
+                if (installerUpdate)
                 {
-                    target = Path.GetFullPath(target);
-                    string directory = Path.GetDirectoryName(target);
-                    if (!string.IsNullOrEmpty(directory))
-                        errorFile = Path.Combine(directory, "update-error.txt");
+                    if (args.Length > 2)
+                    {
+                        string installDir = Path.GetFullPath(args[2]);
+                        target = Path.Combine(installDir, ExeFileName);
+                        errorFile = Path.Combine(installDir, "update-error.txt");
+                    }
+                    ApplyInstallerUpdate(args);
+                    DebugLog.Info(
+                        "update helper ApplyInstallerUpdate completed target=" + target);
                 }
+                else
+                {
+                    target = args.Length > 2 ? args[2] : "";
+                    if (!string.IsNullOrEmpty(target))
+                    {
+                        target = Path.GetFullPath(target);
+                        string directory = Path.GetDirectoryName(target);
+                        if (!string.IsNullOrEmpty(directory))
+                            errorFile = Path.Combine(directory, "update-error.txt");
+                    }
 
-                ApplyUpdate(args);
-                DebugLog.Info("update helper ApplyUpdate completed target=" + target);
+                    ApplyUpdate(args);
+                    DebugLog.Info("update helper ApplyUpdate completed target=" + target);
+                }
                 if (!string.IsNullOrEmpty(errorFile))
                     try { File.Delete(errorFile); } catch { }
             }
@@ -1634,6 +1824,174 @@ namespace IPbind
             cleanup.Start();
         }
 
+        static string ReadReleaseVersion()
+        {
+            // Read GitHub version.txt (latest or beta), never the Worker.
+            string remoteText;
+            Version remote;
+            string error;
+            if (!TryReadVersion(VersionUrl, out remoteText, out remote, out error)
+                || string.IsNullOrEmpty(remoteText))
+            {
+                throw new InvalidOperationException(
+                    string.IsNullOrEmpty(error)
+                        ? "Could not read the latest version."
+                        : error);
+            }
+            return remoteText;
+        }
+
+        static string DownloadVerifiedInstaller(
+            string version, string installDirectory, out string expectedHash)
+        {
+            string url = InstallerUrl(version);
+            expectedHash = ReadChecksum(url + ".sha256");
+            string stagingDirectory = ChooseStagingDirectory(installDirectory);
+            string fileName = InstallerFileName(version);
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                string pending = Path.Combine(
+                    stagingDirectory,
+                    fileName + "." + Guid.NewGuid().ToString("N") + ".new");
+                try
+                {
+                    DownloadTrustedFile(url, pending);
+                    long size = new FileInfo(pending).Length;
+                    if (size < MinExeBytes)
+                        throw new InvalidOperationException("Download failed.");
+                    string actual = Sha256(pending);
+                    DebugLog.Info(
+                        "updater installer sha256 expected=" + expectedHash
+                        + " actual=" + actual
+                        + (string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase)
+                            ? " ok" : " MISMATCH"));
+                    if (string.Equals(
+                        actual, expectedHash, StringComparison.OrdinalIgnoreCase))
+                        return pending;
+
+                    try { File.Delete(pending); } catch { }
+                    if (attempt == 1)
+                        throw new InvalidOperationException(
+                            "The downloaded update failed its integrity check.");
+                }
+                catch
+                {
+                    try { File.Delete(pending); } catch { }
+                    throw;
+                }
+            }
+
+            throw new InvalidOperationException(
+                "The downloaded update failed its integrity check.");
+        }
+
+        static void StartInstallerHelper(
+            string pending, string installDirectory, string expectedHash)
+        {
+            string stagingDirectory = ChooseStagingDirectory(installDirectory);
+            string helper = Path.Combine(
+                stagingDirectory,
+                ".IPbind-update-helper-" + Guid.NewGuid().ToString("N") + ".exe");
+            try
+            {
+                PrivateFile.CopyExecutable(Application.ExecutablePath, helper);
+
+                ProcessStartInfo start = new ProcessStartInfo();
+                start.FileName = helper;
+                start.Arguments = "--apply-installer-update " + QuoteArgument(pending)
+                    + " " + QuoteArgument(installDirectory) + " "
+                    + QuoteArgument(expectedHash) + " "
+                    + Process.GetCurrentProcess().Id.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture);
+                start.CreateNoWindow = true;
+                start.UseShellExecute = false;
+                if (Process.Start(start) == null)
+                    throw new InvalidOperationException("Could not start the update helper.");
+            }
+            catch
+            {
+                try { File.Delete(helper); } catch { }
+                try { File.Delete(pending); } catch { }
+                throw;
+            }
+        }
+
+        static Form CreateFinishingUpdateForm()
+        {
+            Form form = new Form();
+            form.Text = BuildInfo.AppName;
+            form.FormBorderStyle = FormBorderStyle.FixedDialog;
+            form.StartPosition = FormStartPosition.CenterScreen;
+            form.ControlBox = false;
+            form.MaximizeBox = false;
+            form.MinimizeBox = false;
+            form.ShowInTaskbar = true;
+            form.ClientSize = new System.Drawing.Size(360, 72);
+            Label label = new Label();
+            label.Text = "Finishing the IPbind update...";
+            label.AutoSize = false;
+            label.Dock = DockStyle.Fill;
+            label.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+            form.Controls.Add(label);
+            return form;
+        }
+
+        // Called on startup when this install still has an older Inno
+        // uninstaller (no /IPBINDPROMPT). Downloads this build's installer
+        // and lets a helper run it silently after this process exits.
+        // Returns true when the helper was started and Main should return.
+        public static bool TryStartUninstallerRefresh()
+        {
+            string directory;
+            try
+            {
+                string exe = ResolveInstalledExe();
+                directory = Path.GetDirectoryName(exe);
+            }
+            catch
+            {
+                return false;
+            }
+            if (string.IsNullOrEmpty(directory) || !UninstallerNeedsRefresh(directory))
+                return false;
+
+            Form status = null;
+            try
+            {
+                try
+                {
+                    status = CreateFinishingUpdateForm();
+                    status.Show();
+                    Application.DoEvents();
+                }
+                catch
+                {
+                    status = null;
+                }
+
+                string expectedHash;
+                string pending = DownloadVerifiedInstaller(
+                    BuildInfo.Version, directory, out expectedHash);
+                StartInstallerHelper(pending, directory, expectedHash);
+                DebugLog.Info(
+                    "uninstaller refresh helper started version=" + BuildInfo.Version);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Exception("uninstaller refresh", ex);
+                return false;
+            }
+            finally
+            {
+                if (status != null)
+                {
+                    try { status.Close(); } catch { }
+                    try { status.Dispose(); } catch { }
+                }
+            }
+        }
+
         public static void DownloadAndRestart()
         {
             string exe = ResolveInstalledExe();
@@ -1641,6 +1999,16 @@ namespace IPbind
             if (string.IsNullOrEmpty(directory))
                 throw new InvalidOperationException("Could not resolve the install directory.");
             Directory.CreateDirectory(directory);
+
+            if (IsInstallerManaged(directory))
+            {
+                string version = ReadReleaseVersion();
+                string installerHash;
+                string installerPending = DownloadVerifiedInstaller(
+                    version, directory, out installerHash);
+                StartInstallerHelper(installerPending, directory, installerHash);
+                return;
+            }
 
             string expectedHash;
             string pending = DownloadVerifiedExe(directory, out expectedHash);

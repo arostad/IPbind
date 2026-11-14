@@ -90,6 +90,17 @@ jobs:
           $hash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path ".\dist\$installer.sha256" -Value "$hash  $installer" -NoNewline
 
+      # 128 install + exe-only swap + new installer helper must refresh
+      # unins000.exe/.dat and write /IPBINDPROMPT. File/registry assertions
+      # here; the UI suite checks the pre-uninstall prompt itself.
+      - name: Upgrade-then-uninstall regression (2.3.128 in-app update)
+        shell: pwsh
+        run: |
+          $version = Get-Content -Raw .\version.txt
+          $installer = ".\dist\IPbind-Installer-v$version.exe"
+          powershell -ExecutionPolicy Bypass -File .\.github\test\run-upgrade-uninstaller.ps1 `
+            -NewExe .\IPbind.exe -NewInstaller $installer -SkipPrompt
+
       - name: Upload release files
         uses: actions/upload-artifact@v4
         with:
