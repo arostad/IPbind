@@ -99,3 +99,19 @@ $logBetaArgs = @(
 if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test compile failed' }
 & .\debug-log-batch-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test failed' }
+
+# 128 -> current in-app update must refresh the uninstaller (unit checks).
+$upgradeArgs = @(
+  '/nologo', '/warnaserror+', '/target:exe', '/out:upgrade-uninstaller-tests.exe',
+  '/main:IPbindTest.UpgradeUninstallerTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\UpgradeUninstallerTest.cs'
+)
+if (-not (Test-Path .\Version.cs)) {
+  powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
+}
+& $csc @upgradeArgs
+if ($LASTEXITCODE -ne 0) { throw 'Upgrade-uninstaller unit test compile failed' }
+& .\upgrade-uninstaller-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Upgrade-uninstaller unit tests failed' }
