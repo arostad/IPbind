@@ -113,6 +113,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test compile failed' }
 & .\debug-log-batch-tests.exe
 if ($LASTEXITCODE -ne 0) { throw 'Beta debug-log batch test failed' }
 
+# WPF Beta feature helpers (validator, bound dots, banner headline, site lists).
+$wpfFeatArgs = @(
+  '/nologo', '/target:exe', '/out:wpf-feature-tests.exe',
+  '/main:IPbindTest.WpfFeatureTest',
+  '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
+  '/r:System.Net.Http.dll', '/r:System.Windows.Forms.dll',
+  'IPbind.cs', 'Version.cs', '.github\test\WpfFeatureTest.cs'
+)
+& $csc @wpfFeatArgs
+if ($LASTEXITCODE -ne 0) { throw 'WPF feature test compile failed' }
+& .\wpf-feature-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'WPF feature tests failed' }
+
 # 128 -> current in-app update must refresh the uninstaller (unit checks).
 $upgradeArgs = @(
   '/nologo', '/warnaserror+', '/target:exe', '/out:upgrade-uninstaller-tests.exe',

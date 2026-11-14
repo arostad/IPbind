@@ -107,6 +107,19 @@
     <SolidColorBrush x:Key="TimestampBrush" Color="#9A9A9A"/>
   </ResourceDictionary>
 
+  <!-- Keyboard-only focus ring (Tab). WPF draws FocusVisualStyle for keyboard
+       navigation, not mouse clicks. Offset outside the control. -->
+  <Style x:Key="KbFocusVisual">
+    <Setter Property="Control.Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Rectangle Margin="-4" StrokeThickness="2" Stroke="{DynamicResource LinkBrush}"
+                     RadiusX="6" RadiusY="6" SnapsToDevicePixels="True"/>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
   <Style TargetType="Window">
     <Setter Property="Background" Value="{DynamicResource BgBrush}"/>
     <Setter Property="Foreground" Value="{DynamicResource FgBrush}"/>
@@ -149,6 +162,7 @@
     <Setter Property="CaretBrush" Value="{DynamicResource FgBrush}"/>
     <Setter Property="Padding" Value="4,2"/>
     <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource KbFocusVisual}"/>
   </Style>
 
   <!-- Themed ComboBox: the stock Aero2 template ignores Background, so the
@@ -180,6 +194,7 @@
     <Setter Property="Foreground" Value="{DynamicResource FgBrush}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushKey}"/>
     <Setter Property="Padding" Value="6,3"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource KbFocusVisual}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="ComboBox">
@@ -236,13 +251,15 @@
     <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushKey}"/>
     <Setter Property="Padding" Value="10,4"/>
     <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource KbFocusVisual}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="Button">
           <Border Background="{TemplateBinding Background}"
                   BorderBrush="{TemplateBinding BorderBrush}"
                   BorderThickness="1" CornerRadius="4" Padding="{TemplateBinding Padding}">
-            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                              RecognizesAccessKey="True"/>
           </Border>
         </ControlTemplate>
       </Setter.Value>
@@ -265,6 +282,7 @@
   <Style TargetType="CheckBox">
     <Setter Property="Foreground" Value="{DynamicResource FgBrush}"/>
     <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource KbFocusVisual}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="CheckBox">

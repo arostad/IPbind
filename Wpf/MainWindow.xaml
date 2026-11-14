@@ -51,16 +51,16 @@
                        Text="Choose a LAN interface below."/>
           </StackPanel>
           <Button x:Name="btnShow" Grid.Column="2" Content="Show Current" MinWidth="112" MinHeight="32"
-                  VerticalAlignment="Center" Padding="12,6"/>
+                  VerticalAlignment="Center" Padding="12,6" TabIndex="1"/>
         </Grid>
       </Border>
 
       <!-- Columns: console is as tall as the whole left column -->
-      <Grid Grid.Row="1">
+      <Grid x:Name="columnsGrid" Grid.Row="1">
         <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="1.4*" MinWidth="420"/>
-          <ColumnDefinition Width="18"/>
-          <ColumnDefinition Width="1*" MinWidth="240"/>
+          <ColumnDefinition x:Name="colLeft" Width="1.4*" MinWidth="420"/>
+          <ColumnDefinition x:Name="colGap" Width="18"/>
+          <ColumnDefinition x:Name="colRight" Width="1*" MinWidth="240"/>
         </Grid.ColumnDefinitions>
 
         <Grid x:Name="leftColumn" Grid.Column="0">
@@ -86,8 +86,8 @@
                 <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <ComboBox x:Name="combo" IsEditable="False" MinHeight="28" VerticalAlignment="Center"/>
-              <Button x:Name="btnRefresh" Grid.Column="2" Content="Refresh" MinWidth="88" MinHeight="28" Padding="12,4"/>
+              <ComboBox x:Name="combo" IsEditable="False" MinHeight="28" VerticalAlignment="Center" TabIndex="2"/>
+              <Button x:Name="btnRefresh" Grid.Column="2" Content="Refresh" MinWidth="88" MinHeight="28" Padding="12,4" TabIndex="3"/>
             </Grid>
             <Grid>
               <Grid.ColumnDefinitions>
@@ -95,11 +95,11 @@
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <CheckBox x:Name="chkAll" Content="Show all adapters (include virtual / cellular / VPN)"
-                        FontSize="12" VerticalAlignment="Center" HorizontalAlignment="Left"/>
+                        FontSize="12" VerticalAlignment="Center" HorizontalAlignment="Left" TabIndex="4"/>
               <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                 <CheckBox x:Name="chkKeepDhcp" Content="Keep DHCP" IsChecked="True" FontSize="12"
-                          Margin="0,0,16,0" VerticalAlignment="Center"/>
-                <CheckBox x:Name="chkGateway" Content="Gateway support" FontSize="12" VerticalAlignment="Center"/>
+                          Margin="0,0,16,0" VerticalAlignment="Center" TabIndex="5"/>
+                <CheckBox x:Name="chkGateway" Content="Gateway support" FontSize="12" VerticalAlignment="Center" TabIndex="6"/>
               </StackPanel>
             </Grid>
           </StackPanel>
@@ -107,6 +107,7 @@
           <!-- 2. IP list (+ gateway fields when enabled) -->
           <Grid Grid.Row="2">
             <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="*" MinHeight="60"/>
               <RowDefinition Height="Auto"/>
@@ -117,7 +118,6 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Border Grid.Column="0" Style="{DynamicResource SectionBadge}">
                 <TextBlock Text="2" FontSize="11" HorizontalAlignment="Center" VerticalAlignment="Center"/>
@@ -125,25 +125,33 @@
               <TextBlock Grid.Column="1" Text="IP addresses to bind" FontSize="14" FontWeight="SemiBold"
                          VerticalAlignment="Center" Margin="0,0,8,0"/>
               <TextBlock x:Name="lblIPs" Grid.Column="2" FontSize="11.5" VerticalAlignment="Center"
-                         Foreground="{DynamicResource SubBrush}" TextWrapping="Wrap" Margin="0,0,8,0"
+                         Foreground="{DynamicResource SubBrush}" TextWrapping="Wrap"
                          Text="One per line, CIDR (e.g. 192.168.1.98/24)"/>
-              <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button x:Name="btnSaveList" Content="Save List" Padding="10,4" MinWidth="76"/>
-                <Button x:Name="btnRestore" Content="Restore Defaults" Margin="8,0,0,0" Padding="10,4"/>
-              </StackPanel>
             </Grid>
-            <Grid x:Name="ipsHost" Grid.Row="1">
+            <WrapPanel Grid.Row="1" Margin="0,0,0,6" Orientation="Horizontal">
+              <Button x:Name="btnSaveList" Content="Save List" Padding="10,4" MinWidth="76" MinHeight="28"
+                      Margin="0,0,8,4" TabIndex="7"/>
+              <ComboBox x:Name="cboSites" MinWidth="120" MinHeight="28" Margin="0,0,8,4"
+                        VerticalAlignment="Center" TabIndex="8"/>
+              <Button x:Name="btnSaveAs" Content="Save as" Padding="10,4" MinHeight="28" Margin="0,0,8,4" TabIndex="9"/>
+              <Button x:Name="btnRename" Content="Rename" Padding="10,4" MinHeight="28" Margin="0,0,8,4" TabIndex="10"/>
+              <Button x:Name="btnDeleteList" Content="Delete" Padding="10,4" MinHeight="28" Margin="0,0,8,4" TabIndex="11"/>
+              <Button x:Name="btnRestore" Content="Restore Defaults" Padding="10,4" MinHeight="28" Margin="0,0,0,4" TabIndex="12"/>
+            </WrapPanel>
+            <Grid x:Name="ipsHost" Grid.Row="2">
               <TextBox x:Name="txtIPs" AcceptsReturn="True" TextWrapping="NoWrap"
-                       FontFamily="Consolas" FontSize="13"
+                       FontFamily="Consolas" FontSize="13" Padding="38,4,12,4"
                        VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Disabled"
-                       VerticalContentAlignment="Top"/>
+                       VerticalContentAlignment="Top" TabIndex="13"/>
+              <Canvas x:Name="ipGutter" Width="36" HorizontalAlignment="Left" ClipToBounds="True"
+                      Background="Transparent"/>
               <Border x:Name="ipsTrack" Width="10" HorizontalAlignment="Right" Background="Transparent">
                 <Border x:Name="ipsThumb" Width="6" Height="24" HorizontalAlignment="Center"
                         VerticalAlignment="Top" CornerRadius="3"
                         Background="{DynamicResource ThumbBrush}" Visibility="Collapsed"/>
               </Border>
             </Grid>
-            <Grid x:Name="gatewayRow1" Grid.Row="2" Margin="0,8,0,0" Visibility="Collapsed">
+            <Grid x:Name="gatewayRow1" Grid.Row="3" Margin="0,8,0,0" Visibility="Collapsed">
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*" MinWidth="70"/>
@@ -152,11 +160,11 @@
                 <ColumnDefinition Width="*" MinWidth="70"/>
               </Grid.ColumnDefinitions>
               <TextBlock x:Name="lblGwOn" Text="Use gateway on" VerticalAlignment="Center" Margin="0,0,8,0"/>
-              <ComboBox x:Name="cboGwIp" Grid.Column="1" IsEditable="False" MinHeight="26"/>
+              <ComboBox x:Name="cboGwIp" Grid.Column="1" IsEditable="False" MinHeight="26" TabIndex="14"/>
               <TextBlock x:Name="lblGateway" Grid.Column="3" Text="Gateway" VerticalAlignment="Center" Margin="0,0,8,0"/>
-              <TextBox x:Name="txtGateway" Grid.Column="4" MaxLength="15" MinHeight="26"/>
+              <TextBox x:Name="txtGateway" Grid.Column="4" MaxLength="15" MinHeight="26" TabIndex="15"/>
             </Grid>
-            <Grid x:Name="gatewayRow2" Grid.Row="3" Margin="0,6,0,0" Visibility="Collapsed">
+            <Grid x:Name="gatewayRow2" Grid.Row="4" Margin="0,6,0,0" Visibility="Collapsed">
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*" MinWidth="70"/>
@@ -165,9 +173,9 @@
                 <ColumnDefinition Width="*" MinWidth="70"/>
               </Grid.ColumnDefinitions>
               <TextBlock x:Name="lblDns1" Text="DNS 1" VerticalAlignment="Center" Margin="0,0,8,0"/>
-              <TextBox x:Name="txtDns1" Grid.Column="1" MaxLength="15" MinHeight="26"/>
+              <TextBox x:Name="txtDns1" Grid.Column="1" MaxLength="15" MinHeight="26" TabIndex="16"/>
               <TextBlock x:Name="lblDns2" Grid.Column="3" Text="DNS 2" VerticalAlignment="Center" Margin="0,0,8,0"/>
-              <TextBox x:Name="txtDns2" Grid.Column="4" MaxLength="15" MinHeight="26"/>
+              <TextBox x:Name="txtDns2" Grid.Column="4" MaxLength="15" MinHeight="26" TabIndex="17"/>
             </Grid>
           </Grid>
 
@@ -185,10 +193,43 @@
                 <ColumnDefinition Width="10"/>
                 <ColumnDefinition Width="*"/>
               </Grid.ColumnDefinitions>
-              <Button x:Name="btnBind" Style="{DynamicResource AccentButton}" MinHeight="48"
-                      Background="{DynamicResource AccentApply}" Content="Apply Static IPs"/>
-              <Button x:Name="btnDhcp" Grid.Column="2" Style="{DynamicResource AccentButton}" MinHeight="48"
-                      Background="{DynamicResource AccentDhcp}" Content="Return to DHCP"/>
+              <Grid>
+                <Button x:Name="btnBind" Style="{DynamicResource AccentButton}" MinHeight="48"
+                        Background="{DynamicResource AccentApply}" Content="Apply Static IPs" TabIndex="18"/>
+                <Border x:Name="bindBusyOverlay" IsHitTestVisible="False" Visibility="Collapsed"
+                        CornerRadius="4" Opacity="0.45">
+                  <Border.Background>
+                    <LinearGradientBrush StartPoint="0,0.5" EndPoint="1,0.5">
+                      <GradientStop Color="#00FFFFFF" Offset="0"/>
+                      <GradientStop Color="#A0FFFFFF" Offset="0.45"/>
+                      <GradientStop Color="#00FFFFFF" Offset="0.9"/>
+                      <LinearGradientBrush.RelativeTransform>
+                        <TranslateTransform x:Name="bindShimmerX" X="-1"/>
+                      </LinearGradientBrush.RelativeTransform>
+                    </LinearGradientBrush>
+                  </Border.Background>
+                </Border>
+                <Border x:Name="bindFocusRing" IsHitTestVisible="False" Visibility="Collapsed"
+                        BorderBrush="{DynamicResource LinkBrush}" BorderThickness="2" CornerRadius="6"
+                        Margin="-4"/>
+              </Grid>
+              <Grid Grid.Column="2">
+                <Button x:Name="btnDhcp" Style="{DynamicResource AccentButton}" MinHeight="48"
+                        Background="{DynamicResource AccentDhcp}" Content="Return to DHCP" TabIndex="19"/>
+                <Border x:Name="dhcpBusyOverlay" IsHitTestVisible="False" Visibility="Collapsed"
+                        CornerRadius="4" Opacity="0.45">
+                  <Border.Background>
+                    <LinearGradientBrush StartPoint="0,0.5" EndPoint="1,0.5">
+                      <GradientStop Color="#00FFFFFF" Offset="0"/>
+                      <GradientStop Color="#A0FFFFFF" Offset="0.45"/>
+                      <GradientStop Color="#00FFFFFF" Offset="0.9"/>
+                      <LinearGradientBrush.RelativeTransform>
+                        <TranslateTransform x:Name="dhcpShimmerX" X="-1"/>
+                      </LinearGradientBrush.RelativeTransform>
+                    </LinearGradientBrush>
+                  </Border.Background>
+                </Border>
+              </Grid>
             </Grid>
           </StackPanel>
         </Grid>
@@ -198,10 +239,18 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*" MinHeight="80"/>
           </Grid.RowDefinitions>
-          <Grid MinHeight="28" Margin="0,0,0,8">
-            <TextBlock Text="Console output" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
-            <Button x:Name="btnClear" Content="Clear" HorizontalAlignment="Right" MinWidth="72" MinHeight="28" Padding="10,4"/>
-          </Grid>
+          <StackPanel Margin="0,0,0,8">
+            <TextBlock Text="Console output" FontSize="14" FontWeight="SemiBold"
+                       VerticalAlignment="Center" Margin="0,0,0,6"/>
+            <WrapPanel Orientation="Horizontal">
+              <ComboBox x:Name="cboConsoleFilter" MinWidth="148" MinHeight="28" Margin="0,0,8,4"
+                        VerticalAlignment="Center" TabIndex="20"/>
+              <Button x:Name="btnCopy" Content="Copy" MinWidth="72" MinHeight="28" Padding="10,4"
+                      Margin="0,0,8,4" TabIndex="21"/>
+              <Button x:Name="btnClear" Content="Clear" MinWidth="72" MinHeight="28" Padding="10,4"
+                      Margin="0,0,0,4" TabIndex="22"/>
+            </WrapPanel>
+          </StackPanel>
           <Grid x:Name="consoleHost" Grid.Row="1">
             <RichTextBox x:Name="console" AutomationProperties.Name="Console" IsReadOnly="True" IsUndoEnabled="False"
                          FontFamily="Consolas" FontSize="12"
@@ -224,9 +273,13 @@
     <Border Grid.Row="1" Background="{DynamicResource BottomBarBrush}"
             BorderBrush="{DynamicResource BottomBarLine}" BorderThickness="0,1,0,0" Padding="16,8,16,10">
       <Grid MinHeight="34">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
         <TextBlock x:Name="lblStatus" Text="Ready." FontWeight="Bold" FontSize="13"
-                   VerticalAlignment="Center" HorizontalAlignment="Left" TextWrapping="Wrap" Margin="0,0,110,0"/>
-        <Border x:Name="updateBanner" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,110,0"
+                   VerticalAlignment="Center" HorizontalAlignment="Left" TextWrapping="Wrap" Margin="0,0,12,0"/>
+        <Border x:Name="updateBanner" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,12,0"
                 Background="Transparent">
           <Grid>
             <Grid.ColumnDefinitions>
@@ -239,8 +292,11 @@
             <Button x:Name="btnUpdateLater" Grid.Column="2" Content="Later" MinWidth="72" Padding="8,3"/>
           </Grid>
         </Border>
-        <Button x:Name="btnAbout" Content="About" HorizontalAlignment="Right" VerticalAlignment="Center"
-                MinWidth="88" Padding="12,4"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="btnCompact" Content="_Hide console" MinWidth="118" Padding="12,4"
+                  Margin="0,0,8,0" TabIndex="23"/>
+          <Button x:Name="btnAbout" Content="About" MinWidth="88" Padding="12,4" TabIndex="24"/>
+        </StackPanel>
       </Grid>
     </Border>
   </Grid>

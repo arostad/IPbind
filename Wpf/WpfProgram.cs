@@ -120,9 +120,12 @@ namespace IPbind
         {
             List<string> lines = new List<string>();
             List<string> fails = new List<string>();
+            string tmpSettings = Path.Combine(Path.GetTempPath(), "ipbind-uicheck-" + Guid.NewGuid().ToString("N"));
             try
             {
                 Directory.CreateDirectory(outDir);
+                Directory.CreateDirectory(tmpSettings);
+                MainWindow.SettingsFolderOverride = tmpSettings;
                 RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
                 WindowTheme.ApplyPreferredAppMode();
                 Application app = new Application();
@@ -137,7 +140,7 @@ namespace IPbind
                     try
                     {
                         main.Window.UpdateLayout();
-                        Inspect(main.Window, lines, fails);
+                        Inspect(main.Window, lines, fails, false);
                         RenderPng(main.Window, Path.Combine(outDir, "main.png"));
                         AboutWindow about = new AboutWindow(main.Window, WindowTheme.IsAppDark(),
                             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -145,10 +148,16 @@ namespace IPbind
                         ShowRenderClose(about.Window, Path.Combine(outDir, "about.png"));
                         DhcpReminderWindow popup = new DhcpReminderWindow(main.Window, WindowTheme.IsAppDark());
                         ShowRenderClose(popup.Window, Path.Combine(outDir, "popup.png"));
+                        CaptureFeatureStates(main, outDir, lines, fails);
                     }
                     catch (Exception ex)
                     {
                         fails.Add("FAIL " + ex.Message);
+                    }
+                    finally
+                    {
+                        MainWindow.SettingsFolderOverride = null;
+                        try { Directory.Delete(tmpSettings, true); } catch { }
                     }
                     WriteReport(outDir, lines, fails);
                     Environment.ExitCode = fails.Count == 0 ? 0 : 1;
@@ -207,7 +216,97 @@ namespace IPbind
             w.Close();
         }
 
+        static void CaptureFeatureStates(MainWindow main, string outDir, List<string> lines, List<string> fails)
+        {
+            Window w = main.Window;
+            double fullWidth = main.UiCheckWidth;
+
+            main.UiCheckResetVisuals();
+            main.UiCheckSimulateBanner(1, BannerHeadline.FormatSafe("Ethernet"),
+                "Safe to plug into a live network.");
+            CaptureNamed(w, outDir, "banner-green", lines, fails, false);
+
+            main.UiCheckSimulateBanner(2, BannerHeadline.FormatStatic("Ethernet", 8, true),
+                "Click Return to DHCP before you plug into a live network.");
+            lines.Add("SIMULATED banner-amber " + BannerHeadline.FormatStatic("Ethernet", 8, true));
+            CaptureNamed(w, outDir, "banner-amber", lines, fails, false);
+
+            main.UiCheckSimulateBanner(3, "Couldn't apply static IPs", "See the console, then try again.");
+            CaptureNamed(w, outDir, "banner-red", lines, fails, false);
+
+            main.UiCheckSimulateValidation(
+                "10.10.10.98/24\r\n256.1.1.1/24\r\n192.168.1.98/24\r\n10.10.10.98/24");
+            lines.Add("SIMULATED validation Apply enabled=" + main.UiCheckApplyEnabled);
+            if (main.UiCheckApplyEnabled)
+                fails.Add("FAIL validation Apply still enabled with invalid lines");
+            else
+                lines.Add("SIMULATED validation Apply disabled");
+            CaptureNamed(w, outDir, "validation", lines, fails, false);
+
+            main.UiCheckSimulateValidation(
+                "10.10.10.98/24\r\n192.168.1.98/24\r\n10.0.0.1/8\r\n192.168.0.98/24");
+            main.UiCheckSimulateBound(new string[] { "10.10.10.98", "10.0.0.1" });
+            lines.Add("SIMULATED bound-dots present 10.10.10.98,10.0.0.1");
+            CaptureNamed(w, outDir, "bound-dots", lines, fails, false);
+
+            main.UiCheckSimulateSiteLists(new string[] { "Default", "Lab", "Office" });
+            main.UiCheckOpenSiteDropDown();
+            Pump(w);
+            lines.Add("SIMULATED sitelists Default, Lab, Office");
+            CaptureNamed(w, outDir, "sitelists", lines, fails, false);
+            main.UiCheckResetVisuals();
+
+            main.UiCheckSimulateConsoleFilter();
+            lines.Add("SIMULATED console-filter Warnings and errors");
+            CaptureNamed(w, outDir, "console-filter", lines, fails, false);
+
+            main.UiCheckSetCompact(true);
+            Pump(w);
+            lines.Add("SIMULATED compact consoleVisible=" + main.UiCheckConsoleVisible
+                + " width=" + Fmt(main.UiCheckWidth) + " full=" + Fmt(fullWidth));
+            if (main.UiCheckConsoleVisible)
+                fails.Add("FAIL compact: console still visible");
+            if (main.UiCheckWidth + 40 >= fullWidth)
+                fails.Add("FAIL compact window not narrower: " + Fmt(main.UiCheckWidth)
+                    + " vs " + Fmt(fullWidth));
+            CaptureNamed(w, outDir, "compact", lines, fails, true);
+            main.UiCheckSetCompact(false);
+            Pump(w);
+
+            main.UiCheckSimulateBusy();
+            Pump(w);
+            lines.Add("SIMULATED busy Applying...");
+            CaptureNamed(w, outDir, "busy", lines, fails, false);
+            main.UiCheckResetVisuals();
+
+            main.UiCheckSimulateFocusApply();
+            Pump(w);
+            lines.Add("SIMULATED focus ring on Apply");
+            CaptureNamed(w, outDir, "focus", lines, fails, false);
+            main.UiCheckResetVisuals();
+        }
+
+        static void CaptureNamed(Window w, string outDir, string name, List<string> lines, List<string> fails, bool skipConsoleHeight)
+        {
+            Pump(w);
+            lines.Add("--- " + name + " ---");
+            Inspect(w, lines, fails, skipConsoleHeight);
+            RenderPng(w, Path.Combine(outDir, name + ".png"));
+        }
+
+        static void Pump(Window w)
+        {
+            w.UpdateLayout();
+            w.Dispatcher.Invoke(DispatcherPriority.Background, new Action(delegate { }));
+            w.UpdateLayout();
+        }
+
         static void Inspect(Window window, List<string> lines, List<string> fails)
+        {
+            Inspect(window, lines, fails, false);
+        }
+
+        static void Inspect(Window window, List<string> lines, List<string> fails, bool skipConsoleHeight)
         {
             Rect client = new Rect(0, 0, window.ActualWidth, window.ActualHeight);
             const double tol = 2.0;
@@ -277,6 +376,10 @@ namespace IPbind
             if (left == null || console == null)
             {
                 fails.Add("FAIL console or left column is missing");
+            }
+            else if (skipConsoleHeight)
+            {
+                lines.Add("console height check skipped (compact mode)");
             }
             else
             {

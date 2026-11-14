@@ -7634,25 +7634,37 @@ namespace IPbind
                 return b;
             }
             KeepRecord rec = LoadRecord(info.Guid);
-            bool manual = false;
+            int manualCount = 0;
             if (info.V4 != null)
             {
                 foreach (UnicastIPAddressInformation ua in info.V4)
                 {
-                    if (ua.PrefixOrigin == PrefixOrigin.Manual) { manual = true; break; }
+                    if (ua.PrefixOrigin == PrefixOrigin.Manual) manualCount++;
                 }
             }
-            if (rec != null || !info.Dhcp || manual)
+            if (rec != null || !info.Dhcp || manualCount > 0)
             {
                 b.Kind = 2;
-                b.Headline = "Static addresses applied on " + alias;
+                b.Headline = BannerHeadline.FormatStatic(alias, manualCount, info.Dhcp);
                 b.Detail = "Click Return to DHCP before you plug into a live network.";
                 return b;
             }
             b.Kind = 1;
-            b.Headline = "No static addresses on " + alias;
+            b.Headline = BannerHeadline.FormatSafe(alias);
             b.Detail = "Safe to plug into a live network.";
             return b;
+        }
+
+        // Read-only IPv4 addresses currently on the adapter (no netsh).
+        public string[] ReadPresentIPv4(string alias)
+        {
+            if (string.IsNullOrEmpty(alias)) return new string[0];
+            AdapterInfo info = GetAdapterInfo(alias);
+            if (info == null || info.V4 == null) return new string[0];
+            List<string> list = new List<string>();
+            foreach (UnicastIPAddressInformation ua in info.V4)
+                list.Add(ua.Address.ToString());
+            return list.ToArray();
         }
 
         public void CheckForUpdatesOnLaunch()
@@ -8993,5 +9005,423 @@ namespace IPbind
         }
         void IBindHost.CloseHost() { Close(); }
 
+    }
+
+    // Per-line result of IpListValidator.Validate. Blank/whitespace lines are
+    // Ignored (Valid stays false, Reason is empty). Apply uses the same CIDR
+    // rules via BindEngine.TryCidr; duplicates are extra and block Apply in WPF.
+    public sealed class IpLineResult
+    {
+        public bool Ignored;
+        public bool Valid;
+        public string Reason;
+        public string Ip;
+        public int Prefix;
+        public int LineNumber;
+    }
+
+    public static class IpListValidator
+    {
+        public static IpLineResult[] Validate(string[] lines)
+        {
+            if (lines == null) lines = new string[0];
+            IpLineResult[] results = new IpLineResult[lines.Length];
+            Dictionary<string, int> first = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                IpLineResult r = ParseOne(lines[i]);
+                r.LineNumber = i + 1;
+                if (!r.Ignored && r.Valid && r.Ip != null)
+                {
+                    string key = r.Ip + "/" + r.Prefix;
+                    int prev;
+                    if (first.TryGetValue(key, out prev))
+                    {
+                        r.Valid = false;
+                        r.Reason = "duplicate of line " + prev;
+                    }
+                    else first[key] = r.LineNumber;
+                }
+                results[i] = r;
+            }
+            return results;
+        }
+
+        public static int InvalidCount(IpLineResult[] results)
+        {
+            if (results == null) return 0;
+            int n = 0;
+            for (int i = 0; i < results.Length; i++)
+            {
+                if (results[i] == null || results[i].Ignored) continue;
+                if (!results[i].Valid) n++;
+            }
+            return n;
+        }
+
+        public static string InvalidStatus(int count)
+        {
+            if (count <= 0) return "";
+            if (count == 1) return "1 line is invalid.";
+            return count.ToString() + " lines are invalid.";
+        }
+
+        // Same rules as BindEngine.TryCidr / Apply, plus a reason string.
+        static IpLineResult ParseOne(string line)
+        {
+            IpLineResult r = new IpLineResult();
+            if (line == null || line.Trim().Length == 0)
+            {
+                r.Ignored = true;
+                r.Reason = "";
+                return r;
+            }
+            Match m = MainForm.CidrRe.Match(line);
+            if (!m.Success)
+            {
+                r.Reason = "not an IPv4 address";
+                return r;
+            }
+            int[] o = new int[4];
+            for (int i = 0; i < 4; i++)
+            {
+                o[i] = int.Parse(m.Groups[i + 1].Value);
+                if (o[i] > 255)
+                {
+                    r.Reason = "octet out of range";
+                    return r;
+                }
+            }
+            int prefix = m.Groups[6].Success ? int.Parse(m.Groups[6].Value) : 24;
+            if (prefix < 0 || prefix > 32)
+            {
+                r.Reason = "bad CIDR prefix";
+                return r;
+            }
+            r.Valid = true;
+            r.Ip = o[0] + "." + o[1] + "." + o[2] + "." + o[3];
+            r.Prefix = prefix;
+            r.Reason = "";
+            return r;
+        }
+    }
+
+    public static class BoundState
+    {
+        public static bool[] Compute(string[] lines, string[] presentAddresses)
+        {
+            HashSet<string> have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (presentAddresses != null)
+            {
+                foreach (string a in presentAddresses)
+                {
+                    if (string.IsNullOrEmpty(a)) continue;
+                    have.Add(a.Trim());
+                }
+            }
+            if (lines == null) return new bool[0];
+            bool[] flags = new bool[lines.Length];
+            for (int i = 0; i < lines.Length; i++)
+            {
+                IpLineResult parsed = IpListValidator.Validate(new string[] { lines[i] })[0];
+                if (parsed.Ignored || parsed.Ip == null) continue;
+                flags[i] = have.Contains(parsed.Ip);
+            }
+            return flags;
+        }
+    }
+
+    public static class BannerHeadline
+    {
+        public static string FormatStatic(string alias, int count, bool dhcpKept)
+        {
+            string name = string.IsNullOrEmpty(alias) ? "this interface" : alias;
+            string head;
+            if (count == 1) head = "1 static address on " + name;
+            else head = count.ToString() + " static addresses on " + name;
+            return head + (dhcpKept ? ", DHCP kept" : ", DHCP off");
+        }
+
+        public static string FormatSafe(string alias)
+        {
+            string name = string.IsNullOrEmpty(alias) ? "this interface" : alias;
+            return "No static addresses on " + name;
+        }
+    }
+
+    // Named IP lists for the WPF Beta UI. Lives under a caller-supplied folder
+    // (normally %APPDATA%\IPbind Beta). WinForms and BindEngine.SaveList/LoadList
+    // keep using ip-list.txt unchanged.
+    public sealed class SiteListStore
+    {
+        readonly string root;
+        readonly string listsDir;
+        readonly string indexPath;
+        readonly List<string> names = new List<string>();
+        string current;
+
+        public SiteListStore(string folderPath)
+        {
+            if (string.IsNullOrEmpty(folderPath))
+                throw new ArgumentException("folderPath");
+            root = folderPath;
+            listsDir = Path.Combine(root, "site-lists");
+            indexPath = Path.Combine(listsDir, "index.txt");
+        }
+
+        public string CurrentName { get { return current; } }
+        public string[] Names { get { return names.ToArray(); } }
+
+        public void Initialize()
+        {
+            if (File.Exists(indexPath)) LoadIndex();
+            else Migrate();
+        }
+
+        public string[] LoadCurrent()
+        {
+            if (string.IsNullOrEmpty(current)) return new string[0];
+            return ReadList(current);
+        }
+
+        public string[] LoadNamed(string name)
+        {
+            return ReadList(name);
+        }
+
+        public void SaveCurrent(string[] lines)
+        {
+            if (string.IsNullOrEmpty(current)) return;
+            WriteList(current, lines ?? new string[0]);
+        }
+
+        public bool SaveAs(string name, string[] lines, out string error)
+        {
+            name = (name ?? "").Trim();
+            if (!TryValidateName(name, null, out error)) return false;
+            EnsureListsDir();
+            WriteList(name, lines ?? new string[0]);
+            if (!ContainsName(name)) names.Add(name);
+            current = ExistingName(name) ?? name;
+            SaveIndex();
+            error = null;
+            return true;
+        }
+
+        public bool SwitchTo(string name, out string[] lines, out string error)
+        {
+            lines = new string[0];
+            string match = ExistingName(name);
+            if (match == null)
+            {
+                error = "No list named '" + (name ?? "") + "'.";
+                return false;
+            }
+            current = match;
+            lines = ReadList(match);
+            SaveIndex();
+            error = null;
+            return true;
+        }
+
+        public bool Rename(string oldName, string newName, out string error)
+        {
+            newName = (newName ?? "").Trim();
+            string match = ExistingName(oldName);
+            if (match == null)
+            {
+                error = "No list named '" + (oldName ?? "") + "'.";
+                return false;
+            }
+            if (!TryValidateName(newName, match, out error)) return false;
+            if (string.Equals(match, newName, StringComparison.Ordinal))
+            {
+                error = null;
+                return true;
+            }
+            string from = ListPath(match);
+            string to = ListPath(newName);
+            EnsureListsDir();
+            if (string.Equals(match, newName, StringComparison.OrdinalIgnoreCase))
+            {
+                string tmp = ListPath(match + ".rename-tmp");
+                if (File.Exists(from)) File.Move(from, tmp);
+                if (File.Exists(tmp)) File.Move(tmp, to);
+            }
+            else
+            {
+                if (File.Exists(from)) File.Move(from, to);
+            }
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (string.Equals(names[i], match, StringComparison.OrdinalIgnoreCase))
+                    names[i] = newName;
+            }
+            if (string.Equals(current, match, StringComparison.OrdinalIgnoreCase))
+                current = newName;
+            SaveIndex();
+            error = null;
+            return true;
+        }
+
+        public bool Delete(string name, out string error)
+        {
+            string match = ExistingName(name);
+            if (match == null)
+            {
+                error = "No list named '" + (name ?? "") + "'.";
+                return false;
+            }
+            try
+            {
+                string path = ListPath(match);
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+            for (int i = names.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(names[i], match, StringComparison.OrdinalIgnoreCase))
+                    names.RemoveAt(i);
+            }
+            if (string.Equals(current, match, StringComparison.OrdinalIgnoreCase))
+                current = names.Count > 0 ? names[0] : null;
+            if (names.Count == 0)
+            {
+                EnsureListsDir();
+                WriteList("Default", MainForm.DefaultIPs);
+                names.Add("Default");
+                current = "Default";
+            }
+            SaveIndex();
+            error = null;
+            return true;
+        }
+
+        public bool TryValidateName(string name, string ignoreName, out string error)
+        {
+            if (name == null || name.Trim().Length == 0)
+            {
+                error = "Name cannot be empty.";
+                return false;
+            }
+            name = name.Trim();
+            if (name == "." || name == "..")
+            {
+                error = "Name cannot contain path characters.";
+                return false;
+            }
+            char[] bad = Path.GetInvalidFileNameChars();
+            if (name.IndexOfAny(bad) >= 0)
+            {
+                error = "Name cannot contain path characters.";
+                return false;
+            }
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (ignoreName != null && string.Equals(names[i], ignoreName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (string.Equals(names[i], name, StringComparison.OrdinalIgnoreCase))
+                {
+                    error = "A list named '" + names[i] + "' already exists.";
+                    return false;
+                }
+            }
+            error = null;
+            return true;
+        }
+
+        void Migrate()
+        {
+            EnsureListsDir();
+            string[] lines;
+            string ipList = Path.Combine(root, "ip-list.txt");
+            if (File.Exists(ipList))
+                lines = File.ReadAllLines(ipList);
+            else
+                lines = MainForm.DefaultIPs;
+            WriteList("Default", lines);
+            names.Clear();
+            names.Add("Default");
+            current = "Default";
+            SaveIndex();
+        }
+
+        void LoadIndex()
+        {
+            names.Clear();
+            current = null;
+            string[] raw = File.ReadAllLines(indexPath);
+            for (int i = 0; i < raw.Length; i++)
+            {
+                string t = (raw[i] ?? "").Trim();
+                if (t.Length == 0) continue;
+                if (t.StartsWith("current=", StringComparison.OrdinalIgnoreCase))
+                {
+                    current = t.Substring(8).Trim();
+                    continue;
+                }
+                if (!ContainsName(t)) names.Add(t);
+            }
+            if (names.Count == 0)
+            {
+                Migrate();
+                return;
+            }
+            if (ExistingName(current) == null) current = names[0];
+            else current = ExistingName(current);
+        }
+
+        void SaveIndex()
+        {
+            EnsureListsDir();
+            List<string> lines = new List<string>();
+            lines.Add("current=" + (current ?? ""));
+            foreach (string n in names) lines.Add(n);
+            File.WriteAllLines(indexPath, lines.ToArray());
+        }
+
+        void EnsureListsDir()
+        {
+            if (!Directory.Exists(root)) Directory.CreateDirectory(root);
+            if (!Directory.Exists(listsDir)) Directory.CreateDirectory(listsDir);
+        }
+
+        string ListPath(string name)
+        {
+            return Path.Combine(listsDir, name + ".txt");
+        }
+
+        string[] ReadList(string name)
+        {
+            string path = ListPath(name);
+            if (!File.Exists(path)) return new string[0];
+            return File.ReadAllLines(path);
+        }
+
+        void WriteList(string name, string[] lines)
+        {
+            EnsureListsDir();
+            File.WriteAllLines(ListPath(name), lines ?? new string[0]);
+        }
+
+        bool ContainsName(string name)
+        {
+            return ExistingName(name) != null;
+        }
+
+        string ExistingName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (string.Equals(names[i], name, StringComparison.OrdinalIgnoreCase))
+                    return names[i];
+            }
+            return null;
+        }
     }
 }
