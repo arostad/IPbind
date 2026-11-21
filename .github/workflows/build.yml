@@ -89,6 +89,10 @@ jobs:
           if (-not (Test-Path ".\dist\$installer")) { throw "Missing dist\$installer" }
           $hash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path ".\dist\$installer.sha256" -Value "$hash  $installer" -NoNewline
+          $setup = "IPbind-Setup.exe"
+          if (-not (Test-Path ".\dist\$setup")) { throw "Missing dist\$setup" }
+          $setupHash = (Get-FileHash -Path ".\dist\$setup" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ".\dist\$setup.sha256" -Value "$setupHash  $setup" -NoNewline
 
       # 128 install + exe-only swap + new installer helper must refresh
       # unins000.exe/.dat and write /IPBINDPROMPT. File/registry assertions
@@ -114,6 +118,7 @@ jobs:
             dist/IPbind-Installer-v*.exe
             dist/IPbind-Installer-v*.exe.sha256
             dist/IPbind-Setup.exe
+            dist/IPbind-Setup.exe.sha256
           if-no-files-found: error
           retention-days: 1
 
@@ -192,6 +197,7 @@ jobs:
             release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe
             release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe.sha256
             release/dist/IPbind-Setup.exe
+            release/dist/IPbind-Setup.exe.sha256
           fail_on_unmatched_files: true
           make_latest: true
 
