@@ -15,6 +15,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Andy's rule: the installer download is always versioned. Fail if any
+      # upload list in this workflow would publish a generic installer name.
+      - name: Reject generic installer names in upload lists
+        shell: pwsh
+        run: |
+          $wfPath = '.\.github\workflows\build.yml'
+          $lines = Get-Content $wfPath
+          $errors = @()
+          $inList = $false
+          $listIndent = 0
+          $forbidden = 'IPbind-Setup'
+          foreach ($line in $lines) {
+            if ($line -match '^(?<pad>\s+)(?:path|files):\s*\|') {
+              $inList = $true
+              $listIndent = $Matches['pad'].Length
+              continue
+            }
+            if ($inList) {
+              if ($line -match '^\s*$') { continue }
+              $indent = ($line -replace '^(\s*).*','$1').Length
+              if ($indent -le $listIndent) {
+                $inList = $false
+              } elseif ($line -match [regex]::Escape($forbidden)) {
+                $errors += "Upload list names $($line.Trim())"
+              }
+            }
+          }
+          $joined = $lines -join "`n"
+          foreach ($m in [regex]::Matches($joined, '(?s)gh release create\b.*?(?=\n\s+- name:|\n\s+if:|\z)')) {
+            if ($m.Value -match [regex]::Escape($forbidden)) {
+              $errors += 'gh release create names a generic installer file'
+            }
+          }
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+          Write-Host 'Upload lists do not name a generic installer.'
+
       - name: Build IPbind.exe
         shell: pwsh
         run: |
@@ -89,10 +128,6 @@ jobs:
           if (-not (Test-Path ".\dist\$installer")) { throw "Missing dist\$installer" }
           $hash = (Get-FileHash -Path ".\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path ".\dist\$installer.sha256" -Value "$hash  $installer" -NoNewline
-          $setup = "IPbind-Setup.exe"
-          if (-not (Test-Path ".\dist\$setup")) { throw "Missing dist\$setup" }
-          $setupHash = (Get-FileHash -Path ".\dist\$setup" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path ".\dist\$setup.sha256" -Value "$setupHash  $setup" -NoNewline
 
       # 128 install + exe-only swap + new installer helper must refresh
       # unins000.exe/.dat and write /IPBINDPROMPT. File/registry assertions
@@ -117,8 +152,6 @@ jobs:
             IPbind-Portable.exe.sha256
             dist/IPbind-Installer-v*.exe
             dist/IPbind-Installer-v*.exe.sha256
-            dist/IPbind-Setup.exe
-            dist/IPbind-Setup.exe.sha256
           if-no-files-found: error
           retention-days: 1
 
@@ -186,8 +219,7 @@ jobs:
             The Installer is recommended. IPbind asks for administrator approval when it starts, because Windows requires it to change adapter settings.
 
             <sub>Prefer a single file? Portable: [IPbind-Portable.exe](https://github.com/arostad/IPbind/releases/download/latest/IPbind-Portable.exe)</sub>
-          # IPbind.exe, IPbind.exe.sha256 and version.txt are the in-app updater's
-          # assets; IPbind-Setup.exe is a legacy unversioned installer name.
+          # IPbind.exe, IPbind.exe.sha256 and version.txt are the in-app updater's assets.
           files: |
             release/IPbind.exe
             release/IPbind.exe.sha256
@@ -196,15 +228,13 @@ jobs:
             release/IPbind-Portable.exe.sha256
             release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe
             release/dist/IPbind-Installer-v${{ steps.ver.outputs.version }}.exe.sha256
-            release/dist/IPbind-Setup.exe
-            release/dist/IPbind-Setup.exe.sha256
           fail_on_unmatched_files: true
           make_latest: true
 
       # The latest tag is reused, so remove installers from older versions (and any
       # stray versioned portable) after the new files are up. Same-named assets such
-      # as IPbind-Portable.exe are overwritten by the upload above. Updater and
-      # legacy assets are never touched.
+      # as IPbind-Portable.exe are overwritten by the upload above. Updater assets
+      # are never deleted by this step.
       - name: Remove previous versioned downloads
         if: steps.guard.outputs.skip != 'true'
         shell: pwsh
